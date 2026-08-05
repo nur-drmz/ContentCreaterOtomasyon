@@ -1,0 +1,849 @@
+"""Console application core: configuration, job execution and view models.
+
+WHY THIS EXISTS
+---------------
+`api.py` speaks HTTP, `pipeline_service.py` speaks pipeline. This module is the
+bit in between: it owns configuration, builds an ownership-scoped service per
+request, maps a job type to exactly one canonical pipeline call, and builds the
+VIEW MODELS the browser renders.
+
+View models are built here, on the server, on purpose: the frontend must not
+re-derive pipeline state (that is how notebook logic leaks into a UI). The
+browser receives already-decided booleans and already-formatted reasons.
+"""
+from __future__ import annotations
+
+import os
+import re as _re
+import sys
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from local_pipeline import google_ai, narration_presets, source_strategy
+
+from . import APP_NAME, __version__
+from .audit import AuditLog
+from .automation import AutomationEngine
+from .ids import Ownership, new_id, validate_id
+from .jobs import (
+    ACTIVE_STATUSES,
+    JOB_TYPES,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_REVIEW_REQUIRED,
+    InlineJobRunner,
+    JobConflict,
+    JobError,
+    JobNotFound,
+    JobStore,
+    ThreadJobRunner,
+)
+from .pipeline_service import ArtifactProblem, PipelineService, PipelineServiceError
+from .secrets_ref import SecretResolver
+from .progress import ACTIVITIES as PROGRESS_ACTIVITIES
+from .progress import (
+    ProgressTracker,
+    load_progress,
+    mark_interrupted,
+)
+from .status import build_workflow_map, run_preflight
+from .storage import LocalFilesystemStorage, StorageViolation
+
+#: Pre-alpha is single-user. These are REAL ownership values, not placeholders:
+#: swapping them for session-derived ones is the only change authentication needs.
+DEFAULT_USER_ID = "usr_local"
+DEFAULT_WORKSPACE_ID = "wsp_local"
+
+#: Capabilities that exist in the roadmap but NOT in this build. The UI renders
+#: them as "planned" so pre-alpha never fakes production behaviour.
+PLANNED_NOT_IMPLEMENTED = (
+    {"key": "multi_user_auth", "label": "Kimlik dogrulama ve RBAC", "milestone": "M1.1"},
+    {"key": "multi_tenant", "label": "Gercek cok kiracili calisma", "milestone": "M2.0"},
+    {"key": "billing", "label": "Abonelik ve faturalandirma", "milestone": "M2.0"},
+    {"key": "public_deploy", "label": "Public internet dagitimi", "milestone": "M2.0"},
+    {"key": "youtube_publish", "label": "Otomatik YouTube yayini", "milestone": "M0.7"},
+    {"key": "object_storage", "label": "Nesne depolamaya gecis", "milestone": "M1.0"},
+)
+
+
+#: How often a running job renews its lease. Must be comfortably shorter than
+#: `jobs.DEFAULT_LEASE_SECONDS` so one missed beat does not expire the lease.
+HEARTBEAT_INTERVAL_SEC = 20.0
+
+
+class _Heartbeat:
+    """Renews a job lease while its worker is genuinely alive.
+
+    Stops on its own if the job is no longer ours (another worker took over, or
+    the job finished), so a stale heartbeat can never keep a dead job alive.
+    """
+
+    def __init__(self, store, job_id, worker_id, interval=HEARTBEAT_INTERVAL_SEC):
+        self.store, self.job_id, self.worker_id = store, job_id, worker_id
+        self.interval = interval
+        self.beats = 0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                         name=f"heartbeat-{self.job_id}")
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self.store.heartbeat(self.job_id, self.worker_id)
+                self.beats += 1
+            except Exception:  # noqa: BLE001 - job finished or taken over
+                return
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
+@dataclass
+class ConsoleConfig:
+    storage_root: Path
+    user_id: str = DEFAULT_USER_ID
+    workspace_id: str = DEFAULT_WORKSPACE_ID
+    host: str = "127.0.0.1"
+    port: int = 8765
+    inline_jobs: bool = False
+    secret_getter: object = None
+    google_client_factory: object = None
+    openai_client_factory: object = None
+    anthropic_client_factory: object = None
+    elevenlabs_client_factory: object = None
+    probe_fn: object = None
+    ffmpeg_bin: str | None = None
+    ffprobe_bin: str | None = None
+    max_upload_bytes: int = 4 * 1024 * 1024 * 1024
+    extra: dict = field(default_factory=dict)
+
+
+
+#: Anything that looks like a host filesystem path. Artifacts legitimately hold
+#: absolute paths internally (ffmpeg needs them); the BROWSER must never see one.
+_HOST_PATH_RE = _re.compile(r"(?:[A-Za-z]:[\/]|\\|/(?:Users|home|mnt|var|tmp|opt)/)")
+HOST_PATH_PLACEHOLDER = "<host-path-hidden>"
+
+
+def scrub_host_paths(value, storage, ownership):
+    """Rewrite absolute host paths out of an outgoing view model.
+
+    A path inside the project namespace becomes namespace-relative (so the media
+    route can serve it); anything else is replaced by a placeholder. Applied once
+    at the API boundary, so no artifact writer has to remember this rule and a
+    newly added field cannot quietly leak the operator's directory layout.
+    """
+    if isinstance(value, str):
+        if not _HOST_PATH_RE.search(value):
+            return value
+        try:
+            return storage.relative_to_namespace(ownership, value)
+        except Exception:  # noqa: BLE001 - outside the namespace, or not a path
+            return HOST_PATH_PLACEHOLDER
+    if isinstance(value, dict):
+        return {k: scrub_host_paths(v, storage, ownership) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub_host_paths(v, storage, ownership) for v in value]
+    if isinstance(value, tuple):
+        return [scrub_host_paths(v, storage, ownership) for v in value]
+    return value
+
+
+class ConsoleApp:
+    """Everything the HTTP layer needs, with no HTTP knowledge of its own."""
+
+    def __init__(self, config: ConsoleConfig):
+        self.config = config
+        self.storage = LocalFilesystemStorage(config.storage_root)
+        self.secrets = SecretResolver(config.secret_getter)
+        runner_cls = InlineJobRunner if config.inline_jobs else ThreadJobRunner
+        self.runner = runner_cls(self._execute_job)
+        # A worker process must NOT run startup recovery: it would reclaim jobs
+        # belonging to other live workers.
+        self._recovered_on_start = (
+            [] if config.extra.get("skip_startup_recovery") else self.recover_all_projects())
+
+    # ------------------------------------------------------------ ownership
+    def ownership(self, project_id: str | None = None) -> Ownership:
+        return Ownership(self.config.user_id, self.config.workspace_id, project_id)
+
+    def service(self, ownership: Ownership) -> PipelineService:
+        return PipelineService(
+            self.storage, ownership, self.secrets,
+            google_client_factory=self.config.google_client_factory,
+            openai_client_factory=self.config.openai_client_factory,
+            anthropic_client_factory=self.config.anthropic_client_factory,
+            elevenlabs_client_factory=self.config.elevenlabs_client_factory,
+            probe_fn=self.config.probe_fn,
+            ffmpeg_bin=self.config.ffmpeg_bin, ffprobe_bin=self.config.ffprobe_bin,
+        )
+
+    def job_store(self, ownership: Ownership) -> JobStore:
+        return JobStore(self.storage, ownership)
+
+    def automation(self, ownership: Ownership) -> AutomationEngine:
+        """The PERSISTED automatic flow for one project.
+
+        State lives in `results/automation.json`, so a refresh or a backend
+        restart resumes exactly where the flow was.
+        """
+        return AutomationEngine(self, ownership)
+
+    def automation_action(self, ownership: Ownership, action: str, *,
+                          actor: str = "console") -> dict:
+        engine = self.automation(ownership)
+        if action == "start":
+            engine.start(actor=actor)
+            engine.tick(actor=f"{actor}:auto")
+        elif action == "pause":
+            engine.pause(actor=actor)
+        elif action == "resume":
+            engine.resume(actor=actor)
+            engine.tick(actor=f"{actor}:auto")
+        elif action == "cancel":
+            engine.cancel(actor=actor)
+        elif action == "tick":
+            engine.tick(actor=f"{actor}:auto")
+        else:
+            raise JobError(f"bilinmeyen otomasyon eylemi: {action!r}")
+        return engine.view()
+
+    # ------------------------------------------------------------- projects
+    def project_ids(self) -> list:
+        base = self.storage.workspace_root(self.ownership()) / self.storage.PROJECTS_DIR
+        if not base.is_dir():
+            return []
+        return sorted(p.name for p in base.iterdir() if p.is_dir())
+
+    def create_project(self, *, title: str, created_by: str) -> dict:
+        ownership = self.ownership(new_id("project"))
+        service = self.service(ownership)
+        record = service.create_project(title=title, created_by=created_by)
+        return record
+
+    def _assert_lifecycle_idle(self, ownership: Ownership) -> None:
+        active = [job for job in self.job_store(ownership).list(limit=200)
+                  if job.get("status") in ACTIVE_STATUSES]
+        if active:
+            kinds = ", ".join(sorted({str(job.get("job_type")) for job in active}))
+            raise JobConflict(
+                f"proje degistirilemez; aktif isler tamamlanmali veya durdurulmali: {kinds}")
+
+    def rewind_project(self, ownership: Ownership, *, target: str,
+                       actor: str = "console") -> dict:
+        self._assert_lifecycle_idle(ownership)
+        auto = self.automation(ownership)
+        if auto.view().get("can_cancel"):
+            auto.cancel(actor=actor)
+        return self.service(ownership).rewind_project(target=target, actor=actor)
+
+    def reset_project(self, ownership: Ownership, *, keep_source: bool,
+                      confirmation: str, actor: str = "console") -> dict:
+        self._assert_lifecycle_idle(ownership)
+        loaded = self.service(ownership).load_artifact("project", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        title = str((loaded["data"] or {}).get("title") or "").strip()
+        if str(confirmation or "").strip() != title:
+            raise PipelineServiceError(
+                "projeyi sifirlamak icin proje adini birebir yazmalisin")
+        auto = self.automation(ownership)
+        if auto.view().get("can_cancel"):
+            auto.cancel(actor=actor)
+        return self.service(ownership).reset_project(
+            keep_source=bool(keep_source), actor=actor)
+
+    def delete_project(self, ownership: Ownership, *, confirmation: str,
+                       actor: str = "console") -> dict:
+        self._assert_lifecycle_idle(ownership)
+        service = self.service(ownership)
+        loaded = service.load_artifact("project", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        title = str((loaded["data"] or {}).get("title") or "").strip()
+        if str(confirmation or "").strip() != title:
+            raise PipelineServiceError(
+                "projeyi silmek icin proje adini birebir yazmalisin")
+        service.audit.record("project.deleted", actor=actor,
+                             detail={"title": title, "recoverable": True})
+        recovery_token = self.storage.trash_namespace(ownership)
+        return {"deleted": True, "project_id": ownership.project_id,
+                "recoverable": True, "recovery_token": recovery_token}
+
+    def update_script_text(self, ownership: Ownership, *, script_text: str,
+                           updated_by: str, notes: str = "") -> dict:
+        self._assert_lifecycle_idle(ownership)
+        return self.service(ownership).update_script_text(
+            script_text=script_text, updated_by=updated_by, notes=notes)
+
+    def assert_owned(self, project_id: str) -> Ownership:
+        """Resolve a project id from the request, or refuse.
+
+        A project that does not exist under THIS user's workspace is reported as
+        not-found. That is deliberate: a cross-workspace id must not be
+        distinguishable from a non-existent one.
+        """
+        ownership = self.ownership(validate_id(project_id, field="project_id"))
+        root = self.storage.namespace_root(ownership)
+        if not root.is_dir():
+            raise LookupError(f"proje bulunamadi: {project_id}")
+        return ownership
+
+    # ----------------------------------------------------------------- jobs
+    #: job_type -> (phase gate, PipelineService method, terminal status builder)
+    JOB_EXECUTORS = {
+        "source_assessment": "run_source_assessment",
+        "video_analysis": "run_video_analysis",
+        "script_generation": "run_script_generation",
+        "tts": "run_tts",
+        "render": "run_render",
+    }
+
+    def submit_job(self, ownership: Ownership, job_type: str, *, params=None,
+                   submitted_by="console", run_request_id: str | None = None) -> tuple:
+        if job_type not in JOB_TYPES:
+            raise JobError(f"bilinmeyen is turu: {job_type!r}")
+        store = self.job_store(ownership)
+        store.recover_abandoned()
+        key = self._idempotency_key(
+            ownership, job_type, params, run_request_id=run_request_id)
+        record, created = store.submit(job_type, idempotency_key=key, params=params,
+                                        submitted_by=submitted_by)
+        audit = AuditLog(self.storage, ownership)
+        audit.record("job.submitted" if created else "job.deduplicated",
+                     actor=submitted_by, job_id=record["job_id"],
+                     detail={"job_type": job_type, "idempotency_key": key,
+                              "existing_status": record.get("status")})
+        if created:
+            self.runner.submit(store, record["job_id"])
+        return store.get(record["job_id"]), created
+
+    def _idempotency_key(self, ownership: Ownership, job_type: str, params,
+                         *, run_request_id: str | None = None) -> str:
+        """Stable across identical submissions, different across real changes.
+
+        Includes the current plan decision hash so that changing the strategy
+        legitimately produces a NEW job instead of returning the old one.
+        """
+        service = self.service(ownership)
+        plan = service.load_artifact("processing_plan")["data"] or {}
+        decision = plan.get("decision") or {}
+        return google_ai.sha256_text({
+            "project": ownership.project_id,
+            "job_type": job_type,
+            "params": params or {},
+            "decision": decision,
+            # A new UI click may intentionally rerun the same phase. Reusing
+            # the same request id (double click / HTTP retry) still deduplicates.
+            "run_request_id": str(run_request_id or "")[:160],
+        })
+
+    def automatic_next_step(self, ownership: Ownership, *, submit=False) -> dict:
+        """Find or submit the next safe pipeline step.
+
+        Automation never chooses a strategy, a moment, or an approval. It runs
+        deterministic/provider phases until the next human gate and reports
+        that gate explicitly. Calling it again after approval resumes the flow.
+        """
+        service = self.service(ownership)
+        store = self.job_store(ownership)
+        active = store.list(statuses=ACTIVE_STATUSES, limit=20)
+        if active:
+            return {"state": "running", "job": _job_view(active[0]),
+                    "message": "Bir faz halen calisiyor; bitince otomasyon devam edecek."}
+
+        project = service.load_artifact("project")
+        source = (project.get("data") or {}).get("source")
+        if not source:
+            return {"state": "blocked", "blocker": "source_video",
+                    "message": "Once Faz 0 sekmesinden kaynak video yukle."}
+
+        assessment = service.load_artifact("source_assessment")
+        if not assessment["data"]:
+            return self._automatic_job(
+                ownership, "source_assessment", {}, submit=submit,
+                message="Kaynak degerlendirmesi baslatildi.")
+
+        plan = service.load_artifact("processing_plan")
+        if plan["problem"]:
+            return {"state": "blocked", "blocker": "processing_plan",
+                    "message": plan["problem"]}
+        if not plan["data"]:
+            return {"state": "blocked", "blocker": "plan_selection",
+                    "message": "Faz 0'da isleme turunu sec, plani olustur ve onayla."}
+        allowed, reason = service.plan_gate("video_analysis")
+        if not allowed:
+            return {"state": "blocked", "blocker": "plan_approval", "message": reason}
+
+        hot = service.load_artifact("hot_moments")
+        if not hot["data"]:
+            return self._automatic_job(
+                ownership, "video_analysis",
+                {"whisper_model_size": "small", "clip_duration_sec": 240, "top_n": 5},
+                submit=submit, message="Video analizi baslatildi.")
+        if not (hot["data"].get("hot_moments") or []):
+            return {"state": "blocked", "blocker": "no_hot_moments",
+                    "message": "Analiz aday moment uretmedi. Moment Explorer'da ayarlari degistirip yeniden calistir."}
+
+        selection = service.load_artifact("moment_selection")
+        if not selection["data"] or selection["problem"]:
+            return {"state": "blocked", "blocker": "moment_selection",
+                    "message": "Moment Explorer'da adaylari izle ve bir moment sec."}
+
+        decision = plan["data"].get("decision") or {}
+        mode = decision.get("mode")
+        approvals = service.approval_chain()
+        if mode == source_strategy.MODE_NARRATED_THEORY:
+            script = service.load_artifact("selected_script")
+            script_state = approvals.get("script") or {}
+            if (not script["data"] or script["problem"] or
+                    (script["data"].get("status") == "failed") or
+                    (script_state.get("approved") and not script_state.get("effective_valid"))):
+                return self._automatic_job(
+                    ownership, "script_generation", {}, submit=submit,
+                    message="Script uretimi baslatildi.")
+            if not script_state.get("effective_valid"):
+                return {"state": "blocked", "blocker": "script_approval",
+                        "message": "Script Studio'da scripti incele ve onayla."}
+
+            voice = service.load_artifact("selected_voiceover")
+            voice_state = approvals.get("voiceover") or {}
+            if (not voice["data"] or voice["problem"] or
+                    voice["data"].get("status") in ("failed", "insufficient_data") or
+                    (voice_state.get("approved") and not voice_state.get("effective_valid"))):
+                return self._automatic_job(
+                    ownership, "tts", {"voice": "Kore", "language_code": "tr-TR"},
+                    submit=submit, message="Seslendirme baslatildi.")
+            if not voice_state.get("effective_valid"):
+                return {"state": "blocked", "blocker": "voiceover_approval",
+                        "message": "Voice Studio'da sesi dinle ve onayla."}
+
+        render = service.load_artifact("render_manifest")
+        if not render["data"] or render["problem"]:
+            render_config = dict(decision.get("render") or {})
+            params = {
+                "render_mode": render_config.get("render_mode", "blurred_background"),
+                "preview_mode": render_config.get("preview_mode", True),
+                "subtitle_whisper_model_size": render_config.get(
+                    "subtitle_whisper_model_size", "small"),
+                "subtitle_language": render_config.get("subtitle_language", "auto"),
+                "caption_style": render_config.get("caption_style", "active_word_yellow"),
+                "caption_theme": render_config.get("caption_theme", "auto"),
+            }
+            return self._automatic_job(
+                ownership, "render", params, submit=submit,
+                message="Render baslatildi.")
+
+        render_state = approvals.get("render") or {}
+        if render_state.get("effective_valid"):
+            return {"state": "completed", "message": "Akis tamamlandi; render onayi gecerli."}
+        return {"state": "blocked", "blocker": "render_approval",
+                "message": "Render Studio'da videoyu izle ve final onayi ver."}
+
+    def _automatic_job(self, ownership, job_type, params, *, submit, message) -> dict:
+        if not submit:
+            return {"state": "ready", "next_job_type": job_type, "message": message}
+        record, created = self.submit_job(
+            ownership, job_type, params=params, submitted_by="console:auto")
+        if not created:
+            return {"state": "blocked", "blocker": "deduplicated_job",
+                    "job": _job_view(record),
+                    "message": "Bu faz daha once ayni girdilerle calistirildi. Faz sekmesinden manuel yeniden calistir."}
+        return {"state": "submitted", "next_job_type": job_type,
+                "job": _job_view(record), "message": message}
+
+    def log_error(self, error) -> None:
+        """Server-side ONLY. The scrubbed detail lands here; the client gets a code.
+
+        Written to stderr so it is captured by whatever supervises the process,
+        and correlated to the response by `debug_id`.
+        """
+        try:
+            print(f"[console:error] {error.log_line()}", file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001 - logging must never break a response
+            pass
+
+    def _execute_job(self, store: JobStore, job_id: str, worker_id: str = "worker") -> None:
+        record = store.get(job_id)
+        ownership = Ownership(record["user_id"], record["workspace_id"], record["project_id"])
+        audit = AuditLog(self.storage, ownership)
+        audit.record("job.started", job_id=job_id, actor=record.get("submitted_by", "console"),
+                     detail={"job_type": record["job_type"], "attempt": record.get("attempts")})
+        service = self.service(ownership)
+        method = getattr(service, self.JOB_EXECUTORS[record["job_type"]])
+        # Analysis and render can run for many minutes. Without a heartbeat the
+        # lease expires mid-run and a recovery pass would declare the job
+        # abandoned while its worker is very much alive.
+        heartbeat = _Heartbeat(store, job_id, worker_id)
+        heartbeat.start()
+        try:
+            result = method(job_id=job_id, **(record.get("params") or {}))
+        except (PipelineServiceError, ArtifactProblem) as exc:
+            store.finish(job_id, STATUS_FAILED, error=str(exc),
+                         error_kind="pipeline_precondition", recoverable=True)
+            # A precondition failure happens BEFORE the phase starts tracking,
+            # so record it here or the panel would show nothing at all.
+            self._fail_progress(ownership, record, str(exc))
+            audit.record("job.failed", job_id=job_id, detail={"reason": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001
+            store.finish(job_id, STATUS_FAILED, error=f"{type(exc).__name__}: {exc}",
+                         error_kind="pipeline_error", recoverable=True)
+            self._fail_progress(ownership, record, f"{type(exc).__name__}: {exc}")
+            audit.record("job.failed", job_id=job_id,
+                         detail={"reason": f"{type(exc).__name__}: {exc}"})
+            return
+        finally:
+            heartbeat.stop()
+
+        artifact_status = (result or {}).get("status")
+        # Execution succeeded; the ARTIFACT still decides whether a human is
+        # needed. A clean run that produced insufficient_data is not "completed".
+        if artifact_status in ("review_required", "experimental"):
+            job_status = STATUS_REVIEW_REQUIRED
+        elif artifact_status in ("failed", "insufficient_data"):
+            job_status = STATUS_FAILED
+        else:
+            job_status = STATUS_COMPLETED
+        store.finish(job_id, job_status, artifact_status=artifact_status,
+                     result=_summarize(result),
+                     error=None if job_status != STATUS_FAILED
+                     else (result or {}).get("status_reason") or "artefakt kullanima hazir degil",
+                     error_kind=None if job_status != STATUS_FAILED else "artifact_not_usable",
+                     recoverable=job_status == STATUS_FAILED)
+        audit.record("job.succeeded" if job_status != STATUS_FAILED else "job.failed",
+                     job_id=job_id, detail={"artifact_status": artifact_status})
+
+    def _fail_progress(self, ownership: Ownership, record, error: str) -> None:
+        activity = record.get("job_type")
+        if activity not in PROGRESS_ACTIVITIES:
+            return
+        tracker = ProgressTracker(self.storage, ownership, activity,
+                                   job_id=record.get("job_id"),
+                                   attempt=int(record.get("attempts") or 1))
+        tracker.attach()
+        existing = load_progress(self.storage, ownership).get(activity)
+        if existing and existing.get("state") == "failed":
+            return          # the phase already recorded a more specific failure
+        tracker.fail(error)
+
+    def retry_job(self, ownership: Ownership, job_id: str, *, requested_by="console") -> dict:
+        store = self.job_store(ownership)
+        record = store.request_retry(job_id, requested_by=requested_by)
+        # Mark the retry BEFORE the worker starts, so the panel flips out of the
+        # failed state the moment the user clicks rather than after the phase
+        # gets around to its first stage.
+        activity = record.get("job_type")
+        if activity in PROGRESS_ACTIVITIES:
+            tracker = ProgressTracker(self.storage, ownership, activity, job_id=job_id,
+                                       attempt=int(record.get("attempts") or 1) + 1)
+            tracker.start(f"{int(record.get('attempts') or 1) + 1}. deneme kuyruga alindi")
+        AuditLog(self.storage, ownership).record(
+            "job.retry_requested", actor=requested_by, job_id=job_id,
+            detail={"attempt": record.get("attempts")})
+        self.runner.submit(store, job_id)
+        return store.get(job_id)
+
+    def recover_all_projects(self) -> list:
+        """On startup, no job may be left `running` by a dead process.
+
+        Recovery is OWNER-AWARE, not blanket: a job is reclaimed only when its
+        recorded owner process is provably dead on this host, or its lease has
+        expired. That distinction matters now that `creator_console.worker` can
+        run as a separate process -- a restarting server must not kill a healthy
+        external worker's job.
+        """
+        recovered = []
+        for project_id in self.project_ids():
+            try:
+                ownership = self.ownership(project_id)
+                store = self.job_store(ownership)
+                for record in store.recover_abandoned():
+                    recovered.append(record)
+                    # Its worker is gone; a bar left at `running` would spin
+                    # forever and imply work is still happening.
+                    if record.get("job_type") in PROGRESS_ACTIVITIES:
+                        mark_interrupted(self.storage, ownership, record["job_type"],
+                                          reason="is kurtarma sirasinda calisir bulundu")
+                    AuditLog(self.storage, ownership).record(
+                        "job.recovered", job_id=record["job_id"],
+                        detail={"job_type": record.get("job_type"),
+                                 "recoverable": record.get("recoverable")})
+            except (JobError, StorageViolation, ValueError):
+                continue
+        return recovered
+
+    # ---------------------------------------------------------- view models
+    def preflight(self, ownership=None) -> dict:
+        """Local capability probe. Never reads a secret value, never calls out."""
+        return run_preflight(self, ownership)
+
+    def run_diagnostics(self, *, only=None) -> dict:
+        """Exercise every capability in a THROWAWAY fixture and report.
+
+        Deliberately slow and deliberately explicit: it runs real ffmpeg work.
+        The user's own projects are neither read nor written -- see
+        `diagnostics._Fixture`, which builds its own storage root.
+        """
+        from . import diagnostics
+
+        return diagnostics.run_diagnostics(self, only=only)
+
+    def last_diagnostics(self) -> dict:
+        from . import diagnostics
+
+        return diagnostics.load_last_report(self) or diagnostics.empty_report()
+
+    def workspace_view(self) -> dict:
+        projects = []
+        for project_id in self.project_ids():
+            ownership = self.ownership(project_id)
+            record = self.service(ownership).load_artifact("project")
+            projects.append({
+                "project_id": project_id,
+                "title": (record["data"] or {}).get("title") or "(okunamadi)",
+                "notes": (record["data"] or {}).get("notes") or "",
+                "problem": record["problem"],
+                "created_at": (record["data"] or {}).get("created_at"),
+                "updated_at": ((record["data"] or {}).get("updated_at")
+                               or (record["data"] or {}).get("created_at")),
+                "status": (record["data"] or {}).get("status"),
+                "source_name": (((record["data"] or {}).get("source") or {})
+                                .get("display_name")),
+                "has_source": bool((record["data"] or {}).get("source")),
+                "revision_count": len(self.service(ownership).revisions(limit=100)),
+            })
+        projects.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        return {
+            "app": {"name": APP_NAME, "version": __version__, "stage": "pre-alpha",
+                     "single_user": True, "authenticated": False},
+            "owner": self.ownership().to_dict(),
+            "projects": projects,
+            "secrets": self.secrets.public_state(),
+            "planned_not_implemented": [dict(item) for item in PLANNED_NOT_IMPLEMENTED],
+            "preflight": run_preflight(self),
+            "recovered_on_start": [
+                {"job_id": r.get("job_id"), "job_type": r.get("job_type")}
+                for r in self._recovered_on_start
+            ],
+            "not_uploaded": True,
+        }
+
+    def project_view(self, ownership: Ownership) -> dict:
+        service = self.service(ownership)
+        store = self.job_store(ownership)
+        store.recover_abandoned()
+
+        project = service.load_artifact("project")
+        assessment = service.load_artifact("source_assessment")
+        plan = service.load_artifact("processing_plan")
+        hot = service.load_artifact("hot_moments")
+        selection = service.load_artifact("moment_selection")
+
+        gates = {}
+        for phase in source_strategy.GATED_PHASES:
+            allowed, reason = service.plan_gate(phase)
+            gates[phase] = {"allowed": allowed, "reason": reason}
+
+        jobs = store.list(limit=50)
+        moment_views = []
+        for raw_moment in ((hot["data"] or {}).get("hot_moments") or []):
+            moment = dict(raw_moment)
+            preview_path = moment.get("preview_path")
+            if preview_path:
+                try:
+                    # Pipeline artifacts may need an absolute path internally,
+                    # but the browser receives only an ownership-scoped media
+                    # route. This also repairs legacy Windows absolute paths.
+                    moment["preview_path"] = (
+                        service.relative(preview_path)
+                        if Path(str(preview_path)).is_absolute()
+                        else str(preview_path).replace("\\", "/")
+                    )
+                except (StorageViolation, ValueError):
+                    moment["preview_path"] = None
+                    moment["preview_problem"] = "preview proje depolama alani disinda"
+            moment_views.append(moment)
+        candidate_request = dict((hot["data"] or {}).get("candidate_request") or {})
+        produced_candidates = len(moment_views)
+        requested_candidates = candidate_request.get("requested")
+        if not isinstance(requested_candidates, int) or requested_candidates < 1:
+            # Legacy manifests predate candidate_request. Recover the user's
+            # actual top_n from the newest analysis job instead of misleadingly
+            # presenting an old 1-of-5 result as "1 / 1 complete".
+            latest_analysis = next(
+                (job for job in jobs if job.get("job_type") == "video_analysis"), None)
+            try:
+                requested_candidates = int(
+                    ((latest_analysis or {}).get("params") or {}).get("top_n"))
+            except (TypeError, ValueError):
+                requested_candidates = produced_candidates or None
+        source_summary = dict((hot["data"] or {}).get("source") or {})
+        candidate_summary = {
+            "requested": requested_candidates,
+            "produced": produced_candidates,
+            "complete": (requested_candidates is not None
+                         and produced_candidates == requested_candidates),
+            "policy": candidate_request.get("policy"),
+            "analysis_duration_sec": (candidate_request.get("analysis_duration_sec")
+                                      or source_summary.get("clip_duration_sec")),
+            "window_sec": (candidate_request.get("window_sec")
+                           or (hot["data"] or {}).get("window_sec")),
+            "stride_sec": (candidate_request.get("stride_sec")
+                           or (hot["data"] or {}).get("stride_sec")),
+        }
+        view = {
+            "owner": ownership.to_dict(),
+            "project": {"data": project["data"], "problem": project["problem"]},
+            "phase0": {
+                "assessment": assessment["data"], "assessment_problem": assessment["problem"],
+                "plan": plan["data"], "plan_problem": plan["problem"],
+                "panel": (source_strategy.format_assessment_panel(assessment["data"])
+                          if assessment["data"] else None),
+                "plan_panel": (source_strategy.format_plan_panel(plan["data"])
+                               if plan["data"] else None),
+                "modes": [
+                    {"key": source_strategy.MODE_DIRECT_CLIP_SERIES,
+                     "label": "Direct Clip Series",
+                     "description": "Coklu hot moment -> coklu Short, orijinal ses korunur, "
+                                    "script/TTS API cagrilmaz.",
+                     "consumes_api": False},
+                    {"key": source_strategy.MODE_NARRATED_THEORY,
+                     "label": "Narrated Theory",
+                     "description": "Momentler gorsel kanit; teori acisina gore Gemini script "
+                                    "+ TTS uretilir, onay zinciri aynen isler.",
+                     "consumes_api": True},
+                ],
+            },
+            "phase_gates": gates,
+                        "automation": self.automation(ownership).view(),
+            "moments": {
+                "data": moment_views if hot["data"] else None,
+                "problem": hot["problem"],
+                "selection": selection["data"], "selection_problem": selection["problem"],
+                "candidate_summary": candidate_summary,
+            },
+            # The chain view, not the per-artifact view: the UI must show an
+            # approval as invalid when anything UPSTREAM of it changed.
+            "approvals": service.approval_chain(),
+            "invalidated_approvals": service.invalidated_approvals(),
+            "jobs": [_job_view(job) for job in jobs],
+            "job_summary": _job_summary(jobs),
+            "outputs": service.outputs(),
+            "audit": AuditLog(self.storage, ownership).events(limit=40),
+            "secrets": self.secrets.public_state(),
+            "planned_not_implemented": [dict(item) for item in PLANNED_NOT_IMPLEMENTED],
+            "not_uploaded": True,
+            # The script a human is being asked to approve. Approving a hash for
+            # content you cannot read is not a review, so the text itself has to
+            # reach the page -- a curated slice of it, not the whole artifact.
+            "script": _script_review_view(service),
+            # The selectable narration styles, with the documented voice
+            # characteristic behind each -- so the picker can explain itself
+            # instead of listing opaque names.
+            "narration_presets": narration_presets.preset_public_list(),
+            "render_review": service.render_review_state(),
+            "voice_review": service.voice_review_state(),
+            # The workflow map is derived here, from the SAME artifacts and
+            # approval chain the pipeline itself uses, and shipped already
+            # decided so the browser never re-implements a gate.
+            "workflow": build_workflow_map(service, ownership, jobs=[_job_view(j) for j in jobs]),
+            # Live phase progress, written by whoever is doing the work. Read
+            # from disk every time, so a refresh, a second tab and a restarted
+            # server all agree.
+            "progress": load_progress(self.storage, ownership),
+            "revisions": service.revisions(),
+            "preflight": run_preflight(self, ownership),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Single choke point: no host path may reach the browser.
+        return scrub_host_paths(view, self.storage, ownership)
+
+    def shutdown(self) -> None:
+        self.runner.shutdown()
+
+
+def _summarize(result) -> dict:
+    """Small, JSON-safe job result summary. Never the whole artifact, never a
+    raw SDK object, never a credential."""
+    if not isinstance(result, dict):
+        return {}
+    keys = ("status", "status_reason", "provider", "model", "recommended_mode",
+            "pipeline_mode", "audio_path_relative", "latency_sec")
+    summary = {k: result[k] for k in keys if k in result}
+    if isinstance(result.get("hot_moments"), list):
+        summary["moment_count"] = len(result["hot_moments"])
+    output = result.get("output")
+    if isinstance(output, dict):
+        summary["validation_passed"] = (output.get("validation") or {}).get("passed")
+    return summary
+
+
+def _script_review_view(service) -> dict:
+    """What a reviewer needs to actually READ the script, and nothing more.
+
+    A curated slice rather than the raw artifact: the router's per-attempt
+    diagnostics belong on the jobs screen, not in front of someone judging
+    whether the writing is any good.
+    """
+    loaded = service.load_artifact("selected_script")
+    data = loaded["data"]
+    if not data:
+        return {"data": None, "problem": loaded["problem"]}
+    return {
+        "problem": loaded["problem"],
+        "data": {
+            "hook": data.get("hook"),
+            "script_text": data.get("script_text"),
+            "estimated_duration_sec": data.get("estimated_duration_sec"),
+            "character_count": len(data.get("script_text") or ""),
+            "language": data.get("language"),
+            "provider": data.get("provider"),
+            "model": data.get("model"),
+            "status": data.get("status"),
+            "status_reason": data.get("status_reason"),
+            "theory_angle": data.get("theory_angle"),
+            "generated_at": data.get("generated_at"),
+            "latency_sec": data.get("latency_sec"),
+        },
+    }
+
+
+def _job_view(job: dict) -> dict:
+    return {
+        "job_id": job.get("job_id"),
+        "job_type": job.get("job_type"),
+        "status": job.get("status"),
+        "artifact_status": job.get("artifact_status"),
+        "attempts": job.get("attempts"),
+        "max_attempts": job.get("max_attempts"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "finished_at": job.get("finished_at"),
+        "error": job.get("error"),
+        "error_kind": job.get("error_kind"),
+        "recoverable": bool(job.get("recoverable")),
+        "corrupt": bool(job.get("corrupt")),
+        "result": job.get("result"),
+        "can_retry": bool(job.get("recoverable")) and job.get("status") == STATUS_FAILED
+        and int(job.get("attempts") or 0) < int(job.get("max_attempts") or 3),
+    }
+
+
+def _job_summary(jobs) -> dict:
+    summary = {status: 0 for status in
+               ("queued", "running", "review_required", "failed", "completed")}
+    for job in jobs:
+        if job.get("status") in summary:
+            summary[job["status"]] += 1
+    summary["active"] = sum(summary[s] for s in ACTIVE_STATUSES)
+    return summary

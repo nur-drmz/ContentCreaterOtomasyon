@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Creator Console — pre-alpha</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23ff7a18'/></svg>">
+</head>
+<body>
+<a class="skip-link" href="#main">Ana icerige atla</a>
+
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand__mark" aria-hidden="true">C</div>
+      <div>
+        <div class="brand__name">Creator Console</div>
+        <div class="brand__stage">pre-alpha · tek kullanici</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav" aria-label="Ekranlar"></nav>
+
+    <div class="sidebar__footer dim" id="owner-info">
+      <div class="sidebar__section-title"></div>
+    </div>
+  </aside>
+
+  <main class="main" id="main" tabindex="-1">
+    <div id="global-alerts" role="region" aria-label="Uyarilar"></div>
+    <div id="screen" aria-live="polite"></div>
+  </main>
+</div>
+
+<!-- Live region for status changes, so a screen reader hears job transitions. -->
+<div class="sr-only" role="status" aria-live="polite" id="live-status"></div>
+
+<script type="module" src="/static/app.js"></script>
+<noscript>
+  <p class="alert alert--warn">Bu konsol JavaScript gerektirir. Tarayicida JavaScript'i etkinlestir.</p>
+</noscript>
+</body>
+</html>
