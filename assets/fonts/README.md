@@ -26,3 +26,8 @@ In single-file Colab mode, where this asset directory is not uploaded with the
 notebook, the render pipeline downloads this exact official file once into the
 Drive-backed render font cache and rejects it if the SHA-256 differs. It never
 silently substitutes another font for a themed render.
+
+
+
+
+
