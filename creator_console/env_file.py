@@ -30,6 +30,7 @@ SUPPORTED_LOCAL_ENV_KEYS = frozenset({
     "AZURE_SPEECH_REGION",
     "TMDB_API_KEY",
     "HF_TOKEN",
+    "GITHUB_TOKEN",
     "YOUTUBE_OAUTH_CLIENT_SECRETS_PATH",
     "YOUTUBE_AUTOMATION_USE_GPU",
 })
@@ -106,3 +107,49 @@ def load_env_file(path, *, environ=None, override: bool = False) -> dict:
         "loaded_names": tuple(sorted(loaded_names)),
         "preserved_names": tuple(sorted(preserved_names)),
     }
+
+
+def write_env_value(path, key: str, value: str) -> dict:
+    """Atomically add/replace one allowlisted local secret.
+
+    The value is deliberately absent from the return object.  Newlines and NUL
+    are rejected so one submitted value cannot inject a second environment key.
+    """
+    from .storage import atomic_write_bytes
+
+    path = Path(path)
+    if key not in SUPPORTED_LOCAL_ENV_KEYS:
+        raise EnvFileError(f"desteklenmeyen degisken {key!r}")
+    clean = str(value or "").strip()
+    if not clean:
+        raise EnvFileError("secret degeri bos olamaz")
+    if len(clean) > 8192:
+        raise EnvFileError("secret degeri 8192 karakterden uzun olamaz")
+    if any(char in clean for char in ("\x00", "\r", "\n")):
+        raise EnvFileError("secret degeri gecersiz kontrol karakteri iceriyor")
+
+    existing = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+    lines = existing.splitlines()
+    replacement = f"{key}={clean}"
+    found = False
+    updated = []
+    for raw in lines:
+        candidate = raw.strip()
+        if candidate.startswith("export "):
+            candidate = candidate[7:].strip()
+        current_key = candidate.split("=", 1)[0].strip() if "=" in candidate else None
+        if current_key == key:
+            if not found:
+                updated.append(replacement)
+                found = True
+            continue
+        updated.append(raw)
+    if not found:
+        if updated and updated[-1].strip():
+            updated.append("")
+        updated.append(replacement)
+    payload = ("\n".join(updated).rstrip("\n") + "\n").encode("utf-8")
+    if len(payload) > _MAX_FILE_BYTES:
+        raise EnvFileError(f"yerel API dosyasi {_MAX_FILE_BYTES} bayttan buyuk")
+    atomic_write_bytes(path, payload)
+    return {"saved": True, "key": key, "path_configured": True}

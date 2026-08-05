@@ -31,11 +31,17 @@ yalnızca kullanacağınız anahtarların `=` sonrasını doldurun:
 ```dotenv
 GeminiKey=BURAYA_GEMINI_ANAHTARI
 YoutubeKEY=BURAYA_YOUTUBE_DATA_ANAHTARI
+GITHUB_TOKEN=BURAYA_GITHUB_TOKEN
 ```
 
 Dosyayı kaydedip Console'u kapatın ve yeniden başlatın. Console bu dosyayı
 başlangıçta yalnızca sunucu sürecine yükler. Ayarlar ekranı değer yerine sadece
 `configured` veya `missing` gösterir.
+
+GitHub tokenı ayrıca **Ayarlar → GitHub token kaydet** alanından girilebilir.
+Değer yalnız yerel `.env.local` dosyasına atomik olarak yazılır; API yanıtında,
+DOM'da, logda veya proje artefaktlarında geri gösterilmez. Bu alan yalnız kimlik
+bilgisini hazırlar; `.console_data` otomatik senkronizasyonu ayrıca etkinleştirilmelidir.
 
 - `.env.local` Git tarafından yok sayılır.
 - Dosyayı paylaşmayın, commit etmeyin veya ekran görüntüsüne almayın.

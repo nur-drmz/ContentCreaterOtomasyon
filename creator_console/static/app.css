@@ -227,6 +227,9 @@ textarea { min-height: 96px; resize: vertical; }
 .preset-why summary { cursor: pointer; color: var(--c-text-mute); }
 .preset-why > div { margin-top: var(--sp-2); overflow-wrap: anywhere; }
 
+.secret-entry { border-color: var(--c-accent); }
+.secret-entry input[type="password"] { font-family: var(--font-mono); }
+
 /* -------------------------------------------------------- voice review */
 .voice-player {
   background: var(--c-surface-2); border: 1px solid var(--c-border);

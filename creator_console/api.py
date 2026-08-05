@@ -101,6 +101,12 @@ class ConsoleApi:
                 only=_csv(payload.get("only")))}
         if path == "/api/workspace" and method == "GET":
             return 200, self.app.workspace_view()
+        if path == "/api/settings/secrets" and method == "POST":
+            payload = _json_body(body)
+            return 200, self.app.save_local_secret(
+                kind=_required(payload, "kind"),
+                value=_required(payload, "secret_value", minimum=20),
+            )
         if path == "/api/projects" and method == "POST":
             payload = _json_body(body)
             record = self.app.create_project(

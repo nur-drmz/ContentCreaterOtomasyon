@@ -33,6 +33,7 @@ CONSOLE_SECRET_KINDS = {
     "azure_speech_region": "Opsiyonel Azure Neural TTS yedegi",
     "tmdb": "Opsiyonel film/dizi trend metadata zenginlestirmesi",
     "huggingface": "Opsiyonel Hugging Face model indirme kimlik dogrulamasi",
+    "github": "GitHub private repo/LFS senkron kimligi (otomatik veri senkronu henuz kapali)",
 }
 
 CONSOLE_SECRET_ALIASES = {
@@ -42,6 +43,7 @@ CONSOLE_SECRET_ALIASES = {
     "elevenlabs": ("ELEVENLABS_API_KEY",),
     "tmdb": ("TMDB_API_KEY",),
     "huggingface": ("HF_TOKEN",),
+    "github": ("GITHUB_TOKEN",),
 }
 
 

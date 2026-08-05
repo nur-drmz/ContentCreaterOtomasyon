@@ -75,6 +75,8 @@ def main(argv=None) -> int:
         # Secrets are read from the process environment on the SERVER only, and
         # only ever surface as configured/missing.
         secret_getter=lambda name: os.environ.get(name),
+        secret_setter=lambda name, value: os.environ.__setitem__(name, value),
+        env_file_path=env_path if not args.no_env_file else None,
     )
     app = ConsoleApp(config)
 

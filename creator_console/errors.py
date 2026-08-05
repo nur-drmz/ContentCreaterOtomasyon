@@ -149,6 +149,8 @@ FIELD_LABELS = {
     "language_code": "Dil kodu",
     "confirmation": "Proje adi dogrulamasi",
     "script_text": "Script metni",
+    "kind": "Secret turu",
+    "secret_value": "GitHub token",
 }
 
 

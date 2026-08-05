@@ -2347,7 +2347,8 @@ function screenSettings() {
   return el('div', {},
     el('div', { class: 'page-head' }, el('div', {},
       el('h1', { text: 'Ayarlar' }),
-      el('p', { class: 'subtitle', text: 'Secret DEGERLERI hicbir zaman tarayiciya gonderilmez.' }))),
+      el('p', { class: 'subtitle',
+                text: 'Kaydedilmis secret degerleri sunucudan tarayiciya geri gonderilmez.' }))),
     preflightPanel(),
     diagnosticsPanel(),
     phaseProgress('diagnostics'),
@@ -2357,6 +2358,41 @@ function screenSettings() {
         el('thead', {}, el('tr', {}, el('th', { text: 'Anahtar' }), el('th', { text: 'Durum' }),
           el('th', { text: 'Kullanim' }))),
         el('tbody', {}, secretRows)))),
+    el('div', { class: 'card secret-entry', 'data-testid': 'github-secret-entry' },
+      el('h2', { text: 'GitHub token kaydet' }),
+      el('p', { class: 'subtitle',
+                text: 'Token yalniz bu bilgisayardaki .env.local dosyasina yazilir. '
+                      + 'API yanitinda, logda veya proje artefaktinda geri dondurulmez.' }),
+      alertBox('info', 'Otomatik veri senkronu henuz kapali',
+        'Bu alan yalniz kimlik bilgisini hazirlar. .console_data icin guvenli '
+        + 'baslangic/kapanis senkronizasyonu ayri bir adimda etkinlestirilecek.'),
+      requiredLegend(),
+      inputField({ id: 'github-token', label: 'GitHub Personal Access Token',
+                   type: 'password', required: true,
+                   hint: 'Private repo erisimi icin gerekli en dar izinleri kullan. '
+                         + 'Kaydettikten sonra alan temizlenir.',
+                   attrs: { autocomplete: 'new-password', minlength: 20,
+                            maxlength: 8192, placeholder: 'github_pat_... veya ghp_...',
+                            'data-testid': 'github-token' } }),
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'github-token-save',
+        onclick: async (event) => {
+          const values = validateFields([
+            { id: 'github-token', label: 'GitHub token', required: true, minLength: 20 },
+          ]);
+          if (!values) return;
+          const input = document.getElementById('github-token');
+          event.currentTarget.disabled = true;
+          const saved = await guard(() => api.post('/api/settings/secrets', {
+            kind: 'github', secret_value: values['github-token'],
+          }), 'GitHub token yerel kasaya kaydedildi');
+          // Whether save succeeds or fails, do not leave a credential sitting
+          // in the DOM where another person at the machine could reveal it.
+          if (input) input.value = '';
+          if (saved) await refresh();
+          else event.currentTarget.disabled = false;
+        },
+      }, 'Tokeni yerel kasaya kaydet')),
     el('div', { class: 'card' },
       el('h2', { text: 'Sahiplik' }),
       el('div', { class: 'mono dim', text: JSON.stringify(source.owner || {}, null, 2) })),

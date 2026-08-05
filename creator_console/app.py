@@ -41,7 +41,7 @@ from .jobs import (
     ThreadJobRunner,
 )
 from .pipeline_service import ArtifactProblem, PipelineService, PipelineServiceError
-from .secrets_ref import SecretResolver
+from .secrets_ref import CONSOLE_SECRET_ALIASES, SecretResolver
 from .progress import ACTIVITIES as PROGRESS_ACTIVITIES
 from .progress import (
     ProgressTracker,
@@ -50,6 +50,8 @@ from .progress import (
 )
 from .status import build_workflow_map, run_preflight
 from .storage import LocalFilesystemStorage, StorageViolation
+from .env_file import write_env_value
+from .redaction import register_secret
 
 #: Pre-alpha is single-user. These are REAL ownership values, not placeholders:
 #: swapping them for session-derived ones is the only change authentication needs.
@@ -116,6 +118,8 @@ class ConsoleConfig:
     port: int = 8765
     inline_jobs: bool = False
     secret_getter: object = None
+    secret_setter: object = None
+    env_file_path: Path | None = None
     google_client_factory: object = None
     openai_client_factory: object = None
     anthropic_client_factory: object = None
@@ -186,6 +190,33 @@ class ConsoleApp:
             probe_fn=self.config.probe_fn,
             ffmpeg_bin=self.config.ffmpeg_bin, ffprobe_bin=self.config.ffprobe_bin,
         )
+
+    def save_local_secret(self, *, kind: str, value: str) -> dict:
+        """Persist one supported credential without ever echoing its value."""
+        if kind != "github":
+            raise PipelineServiceError("bu arayuz yalniz GitHub token kaydini destekliyor")
+        aliases = tuple(CONSOLE_SECRET_ALIASES.get(kind) or ())
+        if not aliases:
+            raise PipelineServiceError("bilinmeyen secret turu")
+        path = self.config.env_file_path
+        if path is None:
+            raise PipelineServiceError(
+                "yerel secret dosyasi yapilandirilmamis; Console'u .env.local destegiyle baslat")
+        clean = str(value or "").strip()
+        # Register before validation/write so even a later exception cannot put
+        # the submitted token into a server error line.
+        if clean:
+            register_secret(clean)
+        summary = write_env_value(path, aliases[0], clean)
+        if callable(self.config.secret_setter):
+            self.config.secret_setter(aliases[0], clean)
+        else:
+            os.environ[aliases[0]] = clean
+        reference = self.secrets.reference(kind).to_public_dict()
+        # A custom test getter may not observe the process environment.  The
+        # write succeeded nonetheless; never return the value to prove it.
+        reference.update({"state": "configured", "alias_used": aliases[0]})
+        return {"saved": summary["saved"], "secret": reference, "restart_required": False}
 
     def job_store(self, ownership: Ownership) -> JobStore:
         return JobStore(self.storage, ownership)
