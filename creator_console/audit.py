@@ -44,6 +44,8 @@ EVENT_TYPES = {
     "job.succeeded",
     "job.failed",
     "job.retry_requested",
+    "job.cancel_requested",
+    "job.cancelled",
     "job.recovered",
     "artifact.written",
     "artifact.rejected",

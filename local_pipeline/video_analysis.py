@@ -33,6 +33,77 @@ SUPPORTED_SOURCE_VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
 }
 
+FOCUS_REGIONS = ("start", "middle", "end", "custom")
+
+
+def resolve_analysis_range(*, source_duration_sec, focus_region=None,
+                           clip_duration_min=None, custom_start_min=None,
+                           clip_start_sec=0, clip_duration_sec=240) -> tuple[float, float]:
+    """Resolve a human-friendly long-video region to canonical seconds.
+
+    Existing notebook callers keep their second-based arguments. The Creator
+    Console can instead send ``focus_region`` plus minutes. The range is always
+    clamped to the actual source so "last 10 minutes" cannot seek past EOF.
+    """
+    if focus_region in (None, ""):
+        start = float(clip_start_sec or 0)
+        duration = float(clip_duration_sec or 240)
+        if start < 0 or duration <= 0:
+            raise ValueError("clip_start_sec >= 0 ve clip_duration_sec > 0 olmali")
+        return start, duration
+    if focus_region not in FOCUS_REGIONS:
+        raise ValueError(f"bilinmeyen focus_region: {focus_region!r}")
+    try:
+        source_duration = float(source_duration_sec)
+        requested_duration = float(clip_duration_min) * 60.0
+    except (TypeError, ValueError) as exc:
+        raise ValueError("video suresi ve analiz suresi sayisal olmali") from exc
+    if source_duration <= 0:
+        raise ValueError("uzun video odagi icin kaynak video suresi bilinmiyor")
+    if requested_duration <= 0:
+        raise ValueError("analiz suresi dakika olarak 0'dan buyuk olmali")
+    duration = min(source_duration, requested_duration)
+    if focus_region == "start":
+        start = 0.0
+    elif focus_region == "middle":
+        start = (source_duration - duration) / 2.0
+    elif focus_region == "end":
+        start = source_duration - duration
+    else:
+        try:
+            start = float(custom_start_min) * 60.0
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ozel baslangic dakikasi sayisal olmali") from exc
+        if start < 0:
+            raise ValueError("ozel baslangic dakikasi negatif olamaz")
+        start = min(start, max(0.0, source_duration - duration))
+    return round(max(0.0, start), 3), round(duration, 3)
+
+
+def _raise_if_cancelled(progress) -> None:
+    checker = getattr(progress, "raise_if_cancelled", None)
+    if checker:
+        checker()
+
+
+def _run_process_checked(cmd, progress):
+    """Run a child process while honoring the console's cooperative stop flag."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        while proc.poll() is None:
+            _raise_if_cancelled(progress)
+            time.sleep(0.1)
+        stdout, stderr = proc.communicate()
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        proc.communicate()
+        raise
+
 
 def resolve_source_video(source_video_dir, source_video_path="") -> Path:
     """Resolve the input video without requiring a filename on every run.
@@ -79,7 +150,7 @@ EMOTION_WORDS = {
 
 
 def extract_clip_and_audio(ffmpeg_bin: str, raw_video_path, video_out_path, audio_out_path,
-                            start_sec: float, duration_sec: float) -> None:
+                            start_sec: float, duration_sec: float, progress=None) -> None:
     """Cuts [start_sec, start_sec+duration_sec) out of raw_video_path into a
     normalized H.264/AAC clip, then extracts a 16kHz mono WAV from that clip
     for transcription/audio-analysis. Raises RuntimeError with truncated
@@ -99,7 +170,8 @@ def extract_clip_and_audio(ffmpeg_bin: str, raw_video_path, video_out_path, audi
         "-c:a", "aac", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
         str(video_out_path),
     ]
-    proc = subprocess.run(clip_cmd, capture_output=True, text=True)
+    report = progress if progress is not None else _NullProgress()
+    proc = _run_process_checked(clip_cmd, report)
     if proc.returncode != 0:
         raise RuntimeError(f"video klibi olusturulamadi: {proc.stderr[-3000:]}")
 
@@ -108,13 +180,14 @@ def extract_clip_and_audio(ffmpeg_bin: str, raw_video_path, video_out_path, audi
         "-i", str(video_out_path), "-vn", "-map", "0:a:0",
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(audio_out_path),
     ]
-    proc = subprocess.run(audio_cmd, capture_output=True, text=True)
+    proc = _run_process_checked(audio_cmd, report)
     if proc.returncode != 0:
         raise RuntimeError(f"videodan ses cikarilamadi: {proc.stderr[-3000:]}")
 
 
 def transcribe_audio(audio_path, model_size: str = "small", device: str = "cpu",
-                      compute_type: str = "int8", return_info: bool = False):
+                      compute_type: str = "int8", return_info: bool = False,
+                      progress=None):
     """Transcribes audio_path with faster-whisper. Returns (full_text, segments)
     where each segment is {'start_sec', 'end_sec', 'text', 'avg_logprob',
     'no_speech_prob', 'words': [{'start_sec','end_sec','word','probability'}]}.
@@ -127,7 +200,11 @@ def transcribe_audio(audio_path, model_size: str = "small", device: str = "cpu",
         vad_parameters={"min_silence_duration_ms": 500}, word_timestamps=True,
         condition_on_previous_text=False, multilingual=True,
     )
-    segments = list(segments_iter)
+    report = progress if progress is not None else _NullProgress()
+    segments = []
+    for segment in segments_iter:
+        _raise_if_cancelled(report)
+        segments.append(segment)
     text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
     segment_rows = []
     for seg in segments:
@@ -413,7 +490,7 @@ def generate_preview_clips(ffmpeg_bin: str, video_path, hot_moments: list[dict],
             "-vf", "scale=-2:720", "-c:v", "libx264", "-preset", "ultrafast",
             "-c:a", "aac", "-movflags", "+faststart", str(preview_path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = _run_process_checked(cmd, report)
         if proc.returncode == 0:
             moment["preview_path"] = str(preview_path)
         else:
@@ -429,6 +506,7 @@ class _NullProgress:
     def stage(self, key, message="") -> None: ...
     def count(self, completed, total, *, unit="", message="") -> None: ...
     def note(self, message: str) -> None: ...
+    def raise_if_cancelled(self) -> None: ...
 
 
 def _sha256_file(path) -> str:
@@ -686,14 +764,16 @@ def run_video_analysis(ffmpeg_bin: str, raw_video_path, runtime_dir, clip_start_
     audio_path = runtime_dir / "source_clip.wav"
 
     report.stage("preparation", "Kaynak klip cikariliyor")
-    extract_clip_and_audio(ffmpeg_bin, raw_video_path, video_path, audio_path, clip_start_sec, clip_duration_sec)
+    _raise_if_cancelled(report)
+    extract_clip_and_audio(ffmpeg_bin, raw_video_path, video_path, audio_path,
+                           clip_start_sec, clip_duration_sec, progress=report)
     report.stage("audio", "Ses akisi hazir")
 
     report.stage("whisper", f"faster-whisper-{whisper_model_size} calisiyor")
     text, segments, transcript_info = transcribe_audio(
         audio_path, model_size=whisper_model_size,
         device=whisper_device, compute_type=whisper_compute_type,
-        return_info=True,
+        return_info=True, progress=report,
     )
     # An empty transcript is NOT fatal: a music-only / no-speech video still has
     # usable audio-energy and scene-cut signals, and notebook 01's original
@@ -707,12 +787,15 @@ def run_video_analysis(ffmpeg_bin: str, raw_video_path, runtime_dir, clip_start_
               'prompt\'unda diyalog metni olmayacak.')
 
     report.stage("scenes", "Sahne kesitleri bulunuyor")
+    _raise_if_cancelled(report)
     scenes = detect_scenes(video_path, detector=scene_detector)
+    _raise_if_cancelled(report)
     scene_boundaries = [end for _, end in scenes[:-1]] if scenes else []
     report.count(len(scenes), len(scenes), unit="sahne",
                  message=f"{len(scenes)} sahne bulundu")
 
     report.stage("scoring", "Ses enerjisi ve moment skorlari")
+    _raise_if_cancelled(report)
     audio_info = compute_audio_peaks(audio_path)
     times, rms = audio_info["times"], audio_info["rms"]
     analysis_duration = min(float(clip_duration_sec), float(times[-1]) if len(times) else 0.0)
@@ -745,6 +828,7 @@ def run_video_analysis(ffmpeg_bin: str, raw_video_path, runtime_dir, clip_start_
         raise RuntimeError("hicbir hot-moment adayi bulunamadi (video cok kisa veya sessiz olabilir)")
 
     report.stage("previews", f"{len(hot_moments)} onizleme klibi uretiliyor")
+    _raise_if_cancelled(report)
     generate_preview_clips(ffmpeg_bin, video_path, hot_moments,
                            preview_dir or (runtime_dir / "hot_moment_previews"),
                            progress=report)

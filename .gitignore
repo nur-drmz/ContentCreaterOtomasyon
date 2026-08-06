@@ -25,6 +25,7 @@ __pycache__/
 # OS / editor
 .DS_Store
 Thumbs.db
+debug.log
 .vscode/*
 !.vscode/settings.json
 .claude/

@@ -293,6 +293,7 @@ textarea { min-height: 96px; resize: vertical; }
   border: 1px solid var(--c-danger); display: grid; gap: var(--sp-2);
 }
 .pprog__failed-step { font-size: 12px; font-weight: 600; }
+.pprog__actions { display: flex; justify-content: flex-end; margin-top: var(--sp-3); }
 
 .pbar {
   height: 8px; border-radius: var(--r-pill); background: var(--c-surface-3);
@@ -434,6 +435,11 @@ tbody tr:hover { background: var(--c-surface-2); }
 .moment-settings__fields { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); }
 .moment-settings__run { width: 100%; justify-content: center; margin-top: var(--sp-2); }
 .moment-settings .pprog { margin-top: var(--sp-4); }
+.analysis-range-preview {
+  margin: var(--sp-3) 0; padding: var(--sp-3); border: 1px solid var(--c-border);
+  border-radius: var(--r-sm); background: var(--c-surface-2); font-size: 13px;
+}
+.job-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
 .moment-selection-panel__saved {
   margin-top: var(--sp-3); padding: var(--sp-3); border-radius: var(--r-sm);
   color: var(--c-text); background: var(--c-surface-2); border: 1px solid var(--c-border);

@@ -44,6 +44,10 @@ STATES = (STATE_IDLE, STATE_RUNNING, STATE_COMPLETED, STATE_FAILED,
 STALE_AFTER_SEC = 180
 
 
+class OperationCancelled(RuntimeError):
+    """Raised only at explicit cooperative cancellation checkpoints."""
+
+
 def _stages(*pairs):
     return tuple({"key": key, "label": label} for key, label in pairs)
 
@@ -127,7 +131,7 @@ class ProgressTracker:
     """
 
     def __init__(self, storage, ownership, activity: str, *, job_id=None,
-                 attempt: int = 1, stages=None):
+                 attempt: int = 1, stages=None, cancel_check=None):
         self.storage = storage
         self.ownership = ownership
         self.activity = activity
@@ -137,6 +141,13 @@ class ProgressTracker:
         self.stages = list(stages if stages is not None else (definition.get("stages") or []))
         self._started = time.time()
         self._record = None
+        self._cancel_check = cancel_check
+
+    def raise_if_cancelled(self) -> None:
+        """Stop the progress record and abort at a safe pipeline boundary."""
+        if self._cancel_check is not None and self._cancel_check():
+            self.stop("kullanici_istegi", message="Kullanici tarafindan durduruldu.")
+            raise OperationCancelled("is kullanici tarafindan durduruldu")
 
     # -- storage ---------------------------------------------------------
     def _path(self) -> Path:
@@ -215,6 +226,7 @@ class ProgressTracker:
 
     def stage(self, key: str, message: str = "") -> None:
         """Enter a stage. Everything before it is finished, by definition."""
+        self.raise_if_cancelled()
         record = self._record or {}
         if not record:
             self.start()
@@ -258,6 +270,7 @@ class ProgressTracker:
         Only call this with numbers that were actually counted. There is no
         variant that estimates.
         """
+        self.raise_if_cancelled()
         record = self._record or {}
         if not record:
             return
@@ -279,6 +292,7 @@ class ProgressTracker:
         self._write(record)
 
     def finish(self, *, message: str = "") -> None:
+        self.raise_if_cancelled()
         record = self._record or {}
         if not record:
             self.start()
@@ -351,6 +365,7 @@ class NullTracker:
     def finish(self, *, message: str = "") -> None: ...
     def stop(self, reason: str, *, message: str = "") -> None: ...
     def fail(self, error: str, *, message: str = "") -> None: ...
+    def raise_if_cancelled(self) -> None: ...
 
 
 def load_progress(storage, ownership) -> dict:

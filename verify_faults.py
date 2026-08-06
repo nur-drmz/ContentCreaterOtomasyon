@@ -174,7 +174,7 @@ _target.write_bytes(_good)
 _hot = analyze(_app, _pid, _svc)
 call(_app, "POST", f"/api/projects/{_pid}/jobs", {"job_type": "render", "params": {
     "render_mode": "blurred_background", "preview_mode": True,
-    "subtitle_whisper_model_size": "tiny", "caption_style": "active_word_yellow",
+    "subtitle_whisper_model_size": "small", "caption_style": "active_word_yellow",
     "caption_theme": "auto"}})
 _manifest = _svc.load_artifact("render_manifest")["data"]
 _video = Path(_manifest["output"]["final_video_path"])
@@ -260,7 +260,7 @@ _source.write_bytes(b"bu bir video degil")  # ffmpeg will refuse this
 _status, _payload = call(_bad_app, "POST", f"/api/projects/{_bad_pid}/jobs",
                          {"job_type": "render", "params": {
                              "render_mode": "blurred_background", "preview_mode": True,
-                             "subtitle_whisper_model_size": "tiny",
+                             "subtitle_whisper_model_size": "small",
                              "caption_style": "active_word_yellow", "caption_theme": "auto"}})
 _job = _bad_app.job_store(_bad_own).get(_payload["job"]["job_id"])
 probe("ffmpeg basarisizligi",

@@ -65,7 +65,8 @@ const state = {
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
   // the automation flow itself live on the server.
   runParams: {
-    video_analysis: { clip_start_sec: 0, clip_duration_sec: 240,
+    video_analysis: { focus_region: 'start', clip_duration_min: 10,
+                      custom_start_min: 0,
                       whisper_model_size: 'small', scene_detector: 'content', top_n: 5 },
     tts: { voice: 'Kore', language_code: 'tr-TR', narration_direction: '' },
   },
@@ -1202,8 +1203,9 @@ function screenJobs() {
               el('td', {}, job.error
                 ? el('div', { class: 'muted', text: job.error })
                 : el('span', { class: 'dim', text: '-' })),
-              el('td', {}, job.can_retry
-                ? el('button', {
+              el('td', {}, el('div', { class: 'job-actions' },
+                cancelJobAction(job),
+                job.can_retry ? el('button', {
                     class: 'btn btn--sm',
                     'data-testid': `retry-job-${job.job_id}`,
                     onclick: async (event) => {
@@ -1214,35 +1216,69 @@ function screenJobs() {
                       await refresh();
                     },
                   }, 'Yeniden dene')
-                : el('span', { class: 'dim', text: job.status === 'failed' ? 'deneme hakki yok' : '' })))))))));
+                : el('span', { class: 'dim', text: job.status === 'failed' ? 'deneme hakki yok' : '' }))))))))));
 }
 
 function momentAnalysisControls(hasMoments) {
   const gate = (state.project.phase_gates || {}).video_analysis || {};
+  const params = state.runParams.video_analysis;
+  const sourceDuration = Number(((((state.project.phase0 || {}).assessment || {}).source || {})
+    .duration_sec) || 0);
+  const focusOptions = [
+    ['start', 'Video basina odaklan'],
+    ['middle', 'Video ortasina odaklan'],
+    ['end', 'Video sonuna odaklan'],
+    ['custom', 'Ozel dakika araligi'],
+  ];
+  const durationSec = Math.min(sourceDuration || Infinity,
+    Math.max(0, Number(params.clip_duration_min) || 0) * 60);
+  let startSec = 0;
+  if (params.focus_region === 'middle') startSec = Math.max(0, (sourceDuration - durationSec) / 2);
+  if (params.focus_region === 'end') startSec = Math.max(0, sourceDuration - durationSec);
+  if (params.focus_region === 'custom') {
+    startSec = Math.min(Math.max(0, Number(params.custom_start_min) || 0) * 60,
+      Math.max(0, sourceDuration - durationSec));
+  }
   return el('section', { class: 'card moment-settings' },
     el('h2', { text: 'Aday uretimi' }),
     el('p', { class: 'subtitle',
               text: 'Kaynak araligini ve kac farkli aday istedigini belirle.' }),
     !gate.allowed ? alertBox('warn', 'Bu faz plan tarafindan kapatildi', gate.reason) : null,
     el('div', { class: 'moment-settings__fields' },
-      numberField('va-start', 'Klip baslangici (sn)', 'video_analysis',
-                  'clip_start_sec', { min: '0', step: '1' }),
-      numberField('va-duration', 'Klip suresi (sn)', 'video_analysis',
-                  'clip_duration_sec', { min: '5', max: '3600', step: '5' }),
+      field({ id: 'va-focus', label: 'Videoda odak bolgesi', control: el('select', {
+        id: 'va-focus',
+        onchange: (event) => {
+          params.focus_region = event.currentTarget.value;
+          render();
+        },
+      }, focusOptions.map(([value, label]) => el('option', {
+        value, selected: params.focus_region === value,
+      }, label))) }),
+      numberField('va-duration', 'Incelenecek sure (dakika)', 'video_analysis',
+                  'clip_duration_min', { min: '0.5', max: '120', step: '0.5' }),
+      params.focus_region === 'custom'
+        ? numberField('va-custom-start', 'Ozel baslangic (dakika)', 'video_analysis',
+                      'custom_start_min', { min: '0', step: '0.5' }) : null,
       numberField('va-topn', 'Aday sayisi (hedef)', 'video_analysis',
                   'top_n', { min: '1', max: '20', step: '1' }),
       selectField('va-whisper', 'Whisper modeli', 'video_analysis',
                   'whisper_model_size', ['tiny', 'small', 'large-v3-turbo']),
       selectField('va-scene', 'Sahne dedektoru', 'video_analysis',
                   'scene_detector', ['content', 'adaptive', 'threshold'])),
+    sourceDuration > 0
+      ? el('div', { class: 'analysis-range-preview', 'data-testid': 'analysis-range-preview' },
+          el('strong', { text: 'Analiz araligi: ' }),
+          el('span', { text: `${formatMediaTime(startSec)} - ${formatMediaTime(startSec + durationSec)}` }),
+          el('span', { class: 'dim', text: ` / toplam ${formatMediaTime(sourceDuration)}` }))
+      : alertBox('warn', 'Video suresi bilinmiyor',
+                 'Once Faz 0 kaynak degerlendirmesini calistir.'),
     el('button', {
       class: 'btn btn--primary moment-settings__run', 'data-testid': 'run-video_analysis',
       disabled: !gate.allowed,
       onclick: async (event) => {
         event.currentTarget.disabled = true;
         state.selectedMoments.clear();
-        await guard(() => submitManualJob('video_analysis',
-                                          { ...state.runParams.video_analysis }),
+        await guard(() => submitManualJob('video_analysis', { ...params }),
                     'Analiz isi kuyruga alindi');
         await refresh();
       },
@@ -1269,7 +1305,7 @@ function screenMoments() {
       el('span', { text: 'aday hazir' })),
     el('div', { class: 'moment-summary__facts' },
       summary.analysis_duration_sec != null
-        ? el('span', { text: `${summary.analysis_duration_sec} sn analiz edildi` }) : null,
+        ? el('span', { text: `${formatMediaTime(summary.analysis_duration_sec)} analiz edildi` }) : null,
       summary.window_sec != null
         ? el('span', { text: `${summary.window_sec} sn aday penceresi` }) : null,
       selection && !staleSelection
@@ -1329,7 +1365,7 @@ function screenMoments() {
           },
             el('div', { class: 'moment-card__meta' },
               el('strong', { text: `Aday #${moment.rank}` }),
-              el('span', { text: `${moment.source_start_sec}s - ${moment.source_end_sec}s` }),
+              el('span', { text: `${formatMediaTime(moment.source_start_sec)} - ${formatMediaTime(moment.source_end_sec)}` }),
               el('span', { text: `Skor ${moment.score}` }),
               selection && selection.selected_moment_rank === moment.rank && !staleSelection
                 ? badge('approved', 'kayitli') : null),
@@ -1480,6 +1516,26 @@ function progressStages(record) {
       el('span', { class: 'pstage__label', text: stage.label }))));
 }
 
+function cancelJobAction(job, label = 'Durdur') {
+  if (!job) return null;
+  if (job.cancel_requested) {
+    return el('span', { class: 'dim', 'data-testid': `cancel-pending-${job.job_id}`,
+                        text: 'Durdurma bekleniyor...' });
+  }
+  if (!job.can_cancel) return null;
+  return el('button', {
+    class: 'btn btn--danger btn--sm',
+    'data-testid': `cancel-job-${job.job_id}`,
+    onclick: async (event) => {
+      event.currentTarget.disabled = true;
+      await guard(() => api.post(
+        `/api/projects/${state.projectId}/jobs/${job.job_id}/cancel`, {}),
+      'Durdurma istegi gonderildi');
+      await refresh();
+    },
+  }, label);
+}
+
 /* Activities already painted in THIS render pass. A second call for the same
  * activity returns null, so no screen can end up with two bars for one phase
  * however the components are composed. Reset by `render()`. */
@@ -1496,6 +1552,8 @@ function phaseProgress(activity) {
   const items = (record.item_total !== null && record.item_total !== undefined)
     ? `${record.item_completed}/${record.item_total} ${record.item_unit || ''}`.trim()
     : '';
+  const activeJob = ((state.project && state.project.jobs) || [])
+    .find(job => job.job_id === record.job_id);
   return el('section', {
     class: `pprog pprog--${record.state}`,
     'data-testid': `progress-${activity}`,
@@ -1543,6 +1601,8 @@ function phaseProgress(activity) {
                     text: record.message })
       : null,
     progressStages(record),
+    (activeJob && (activeJob.can_cancel || activeJob.cancel_requested))
+      ? el('div', { class: 'pprog__actions' }, cancelJobAction(activeJob)) : null,
     failed
       ? el('div', { class: 'pprog__failure', 'data-testid': `progress-failure-${activity}` },
           el('div', { class: 'pprog__failed-step',
@@ -1600,6 +1660,7 @@ function phaseStatusPanel(jobType) {
       el('span', { class: 'dim', text: `deneme ${latest.attempts}/${latest.max_attempts}` })),
     active ? alertBox('info', 'Bu faz su anda calisiyor',
                       `${active.job_type} · ${active.status}`) : null,
+    active ? cancelJobAction(active) : null,
     latest.error
       ? alertBox('danger', 'Son calistirma basarisiz', latest.error,
                  latest.can_retry ? 'Asagidaki "Yeniden dene" ile guvenle tekrarlanabilir.'
@@ -2442,6 +2503,16 @@ function render() {
   host.replaceChildren(...(state.projectId && state.project
     ? [preflightBanner(), workflowMap(), projectLifecyclePanel(), screen]
     : [screen]));
+}
+
+function formatMediaTime(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+    : `${minutes}:${String(secs).padStart(2, '0')}`;
 }
 
 async function refresh() {

@@ -333,6 +333,12 @@ class ConsoleApi:
                                         requested_by=_header(headers, "x-actor") or "console")
             return 202, {"job": record}
 
+        if len(rest) == 3 and rest[0] == "jobs" and rest[2] == "cancel" and method == "POST":
+            record = self.app.cancel_job(
+                ownership, rest[1],
+                requested_by=_header(headers, "x-actor") or "console")
+            return 202, {"job": record}
+
         if len(rest) == 2 and rest[0] == "jobs" and method == "GET":
             return 200, {"job": self.app.job_store(ownership).get(rest[1])}
 

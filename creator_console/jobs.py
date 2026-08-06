@@ -49,11 +49,13 @@ STATUS_RUNNING = "running"
 STATUS_REVIEW_REQUIRED = "review_required"
 STATUS_FAILED = "failed"
 STATUS_COMPLETED = "completed"
+STATUS_CANCELLED = "cancelled"
 
 JOB_STATUSES = (STATUS_QUEUED, STATUS_RUNNING, STATUS_REVIEW_REQUIRED,
-                STATUS_FAILED, STATUS_COMPLETED)
+                STATUS_FAILED, STATUS_COMPLETED, STATUS_CANCELLED)
 ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING)
-TERMINAL_STATUSES = (STATUS_REVIEW_REQUIRED, STATUS_FAILED, STATUS_COMPLETED)
+TERMINAL_STATUSES = (STATUS_REVIEW_REQUIRED, STATUS_FAILED, STATUS_COMPLETED,
+                     STATUS_CANCELLED)
 
 #: Job types the console can submit. Each maps to one canonical pipeline entry
 #: point in `pipeline_service`; there is no free-form "run arbitrary code" job.
@@ -169,6 +171,8 @@ def new_job_record(ownership: Ownership, job_type: str, *, idempotency_key: str,
         "error": None,
         "error_kind": None,
         "recoverable": False,
+        "cancel_requested_at": None,
+        "cancel_requested_by": None,
         "retry_of": None,
         "result": None,
         "artifacts": [],
@@ -367,6 +371,45 @@ class JobStore:
             })
             return self._save(record)
 
+    def request_cancel(self, job_id: str, *, requested_by: str = "console") -> dict:
+        """Request cooperative cancellation without pretending the work stopped.
+
+        A queued job has not started and can become terminal immediately. A
+        running job stays ``running`` with ``cancel_requested_at`` set until its
+        worker reaches a cancellation checkpoint and acknowledges it. This
+        distinction prevents the UI from saying "stopped" while FFmpeg or a
+        provider request is still unwinding.
+        """
+        with self._thread_lock, self._lock():
+            record = self.get(job_id)
+            status = record.get("status")
+            if status not in ACTIVE_STATUSES:
+                raise JobConflict(f"is '{status}' durumundayken durdurulamaz")
+            if record.get("cancel_requested_at"):
+                return record
+            record["cancel_requested_at"] = _iso()
+            record["cancel_requested_by"] = str(requested_by)[:120]
+            record["recoverable"] = True
+            if status == STATUS_QUEUED:
+                record.update({
+                    "status": STATUS_CANCELLED,
+                    "finished_at": _iso(),
+                    "error": None,
+                    "error_kind": "cancelled_by_user",
+                    "claimed_by": None,
+                    "owner_pid": None,
+                    "owner_host": None,
+                    "lease_expires_at": None,
+                })
+            return self._save(record)
+
+    def cancel_requested(self, job_id: str) -> bool:
+        """Cheap cooperative checkpoint used by the running pipeline."""
+        try:
+            return bool(self.get(job_id).get("cancel_requested_at"))
+        except JobError:
+            return False
+
     def request_retry(self, job_id: str, *, requested_by: str = "console") -> dict:
         """Safe retry: only a terminal, non-successful job may be requeued."""
         with self._thread_lock, self._lock():
@@ -391,6 +434,8 @@ class JobStore:
                 "finished_at": None,
                 "claimed_by": None,
                 "lease_expires_at": None,
+                "cancel_requested_at": None,
+                "cancel_requested_by": None,
                 "retry_of": record.get("retry_of") or record["job_id"],
                 "submitted_by": str(requested_by)[:120],
             })

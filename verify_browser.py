@@ -208,6 +208,9 @@ try:
         check(page.locator(
             "#plan-caption-theme option[value=game_of_thrones_cinzel]").count() == 1,
               "phase0:cinzel-rollback-choice", "Cinzel karsilastirma secenegi korunmadi")
+        # Keep the broad browser suite lightweight after asserting the product
+        # default above; the render must match the approved plan exactly.
+        page.select_option("#plan-subtitle-model", "small")
         page.locator("[data-testid=create-plan]").click()
         page.wait_for_timeout(1200)
         goto(page, _BASE, "phase0", _PID)
@@ -443,11 +446,13 @@ try:
         section("10. Manual controls inside each tab")
         # ================================================================
         goto(page, _BASE, "moments", _PID)
-        check(page.locator("#va-start, #va-duration, #va-topn, #va-whisper, #va-scene").count() == 5,
+        check(page.locator("#va-focus, #va-duration, #va-topn, #va-whisper, #va-scene").count() == 5,
               "manual:analysis-fields", "5 duzenlenebilir analiz alani")
+        check(page.locator("[data-testid=analysis-range-preview]").count() == 1,
+              "manual:analysis-range-preview", "dakika tabanli aralik ozeti yok")
 
         # Editing a field and running must submit THOSE values.
-        page.fill("#va-duration", "8")
+        page.fill("#va-duration", "0.5")
         page.select_option("#va-whisper", "tiny")
         page.fill("#va-topn", "2")
         before = len(_app.job_store(_app.ownership(_PID)).list(job_type="video_analysis"))
@@ -462,7 +467,8 @@ try:
         check(len(jobs) == before + 1, "manual:deliberate-rerun",
               f"{before} -> {len(jobs)} analiz isi")
         newest = jobs[0]
-        check(newest["params"].get("clip_duration_sec") == 8
+        check(newest["params"].get("focus_region") == "start"
+              and newest["params"].get("clip_duration_min") == 0.5
               and newest["params"].get("top_n") == 2,
               "manual:params-submitted", f"gonderilen parametreler: {newest['params']}")
 

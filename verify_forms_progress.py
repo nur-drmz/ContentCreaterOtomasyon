@@ -191,7 +191,7 @@ def section_progress_records():
     call(app, "POST", f"/api/projects/{pid}/jobs", {
         "job_type": "render",
         "params": {"render_mode": "blurred_background", "preview_mode": True,
-                    "subtitle_whisper_model_size": "tiny",
+                    "subtitle_whisper_model_size": "small",
                     "caption_style": "active_word_yellow", "caption_theme": "auto"}})
     render = call(app, "GET", f"/api/projects/{pid}/progress")[1]["progress"]["render"]
     check([s["key"] for s in render["stages"]]

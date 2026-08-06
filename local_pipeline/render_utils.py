@@ -287,6 +287,9 @@ def run_ffmpeg(ffmpeg_bin: str, args: list[str], *, progress=None,
     drainer.start()
     try:
         for line in popen.stdout:
+            checker = getattr(progress, 'raise_if_cancelled', None)
+            if checker:
+                checker()
             key, _, value = line.strip().partition('=')
             if key not in ('out_time_us', 'out_time_ms'):
                 continue
@@ -299,9 +302,17 @@ def run_ffmpeg(ffmpeg_bin: str, args: list[str], *, progress=None,
             done = min(total, micros / 1_000_000.0)
             progress.count(round(done, 1), round(total, 1), unit='sn',
                            message=f'FFmpeg {done:.0f}/{total:.0f} sn kodladi')
+        returncode = popen.wait()
+    except BaseException:
+        popen.terminate()
+        try:
+            popen.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            popen.kill()
+            popen.wait()
+        raise
     finally:
         popen.stdout.close()
-        returncode = popen.wait()
         drainer.join(timeout=5.0)
     stderr = captured_err[0] if captured_err else ''
     if returncode != 0:
@@ -881,7 +892,7 @@ def run_original_audio_subtitle_pipeline(
         '-map', '0:v:0', '-map', '0:a:0?',
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', str(base_clip_path),
-    ])
+    ], progress=report, total_duration_sec=seek_duration)
     base_info, _base_backend = probe_media(ffmpeg_bin, ffprobe_bin, base_clip_path)
     has_original_audio = any(stream.get('codec_type') == 'audio' for stream in base_info.get('streams', []))
     if not has_original_audio:
@@ -1152,7 +1163,7 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
         '-map', '0:v:0', '-map', '0:a:0?',
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', str(base_clip_path),
-    ])
+    ], progress=report, total_duration_sec=seek_duration)
     base_info, _base_backend = probe_media(ffmpeg_bin, ffprobe_bin, base_clip_path)
     has_original_audio = any(s.get('codec_type') == 'audio' for s in base_info.get('streams', []))
 

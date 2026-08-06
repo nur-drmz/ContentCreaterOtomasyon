@@ -164,6 +164,11 @@ class PipelineService:
         self._probe_fn = probe_fn
         self._ffmpeg_bin = ffmpeg_bin
         self._ffprobe_bin = ffprobe_bin
+        self._cancel_check = None
+
+    def bind_cancel_check(self, callback) -> None:
+        """Bind the current job's ownership-scoped cooperative stop signal."""
+        self._cancel_check = callback
 
     # ------------------------------------------------------------------ paths
     def tracker(self, activity: str, *, job_id=None, attempt: int = 1, stages=None):
@@ -175,7 +180,8 @@ class PipelineService:
         """
         return progress_module.ProgressTracker(
             self.storage, self.ownership, activity,
-            job_id=job_id, attempt=attempt, stages=stages)
+            job_id=job_id, attempt=attempt, stages=stages,
+            cancel_check=self._cancel_check)
 
     def path(self, key: str) -> Path:
         return self.storage.resolve(self.ownership, ARTIFACTS[key], create_parent=True)
@@ -1060,14 +1066,29 @@ class PipelineService:
 
     # ------------------------------------------------------------ pipeline
     def run_video_analysis(self, *, clip_start_sec=0, clip_duration_sec=240,
+                           focus_region=None, clip_duration_min=None,
+                           custom_start_min=None,
                            whisper_model_size="small", scene_detector="content",
                            top_n=5, job_id=None, actor="console") -> dict:
         self.require_phase("video_analysis")
         tracker = self.tracker("video_analysis", job_id=job_id)
         tracker.start("Video analizi basladi")
         try:
+            assessment = self.load_artifact("source_assessment", required=True)
+            source_duration = (((assessment.get("data") or {}).get("source") or {})
+                               .get("duration_sec"))
+            clip_start_sec, clip_duration_sec = video_analysis.resolve_analysis_range(
+                source_duration_sec=source_duration,
+                focus_region=focus_region,
+                clip_duration_min=clip_duration_min,
+                custom_start_min=custom_start_min,
+                clip_start_sec=clip_start_sec,
+                clip_duration_sec=clip_duration_sec,
+            )
             return self._run_video_analysis(
                 tracker, clip_start_sec=clip_start_sec, clip_duration_sec=clip_duration_sec,
+                focus_region=focus_region, clip_duration_min=clip_duration_min,
+                custom_start_min=custom_start_min,
                 whisper_model_size=whisper_model_size, scene_detector=scene_detector,
                 top_n=top_n, job_id=job_id, actor=actor)
         except Exception as exc:  # noqa: BLE001
@@ -1075,6 +1096,7 @@ class PipelineService:
             raise
 
     def _run_video_analysis(self, tracker, *, clip_start_sec, clip_duration_sec,
+                            focus_region, clip_duration_min, custom_start_min,
                             whisper_model_size, scene_detector, top_n, job_id, actor) -> dict:
         source = self.source_path()
         ffmpeg_bin, _ = self.binaries()
@@ -1088,6 +1110,15 @@ class PipelineService:
             scene_detector=scene_detector, top_n=top_n, preview_dir=preview_dir,
             progress=tracker, adaptive_candidate_windows=True,
         )
+        if focus_region:
+            data.setdefault("candidate_request", {}).update({
+                "focus_region": focus_region,
+                "clip_duration_min": float(clip_duration_min),
+                "custom_start_min": (float(custom_start_min)
+                                     if focus_region == "custom" else None),
+                "resolved_start_sec": clip_start_sec,
+                "resolved_duration_sec": clip_duration_sec,
+            })
         self.write_artifact("hot_moments", data, job_id=job_id, actor=actor)
         tracker.finish(message=f"{len(data.get('hot_moments') or [])} aday moment")
         return data

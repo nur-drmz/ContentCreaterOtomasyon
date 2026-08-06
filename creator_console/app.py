@@ -31,6 +31,7 @@ from .jobs import (
     ACTIVE_STATUSES,
     JOB_TYPES,
     STATUS_COMPLETED,
+    STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_REVIEW_REQUIRED,
     InlineJobRunner,
@@ -44,6 +45,7 @@ from .pipeline_service import ArtifactProblem, PipelineService, PipelineServiceE
 from .secrets_ref import CONSOLE_SECRET_ALIASES, SecretResolver
 from .progress import ACTIVITIES as PROGRESS_ACTIVITIES
 from .progress import (
+    OperationCancelled,
     ProgressTracker,
     load_progress,
     mark_interrupted,
@@ -510,6 +512,7 @@ class ConsoleApp:
         audit.record("job.started", job_id=job_id, actor=record.get("submitted_by", "console"),
                      detail={"job_type": record["job_type"], "attempt": record.get("attempts")})
         service = self.service(ownership)
+        service.bind_cancel_check(lambda: store.cancel_requested(job_id))
         method = getattr(service, self.JOB_EXECUTORS[record["job_type"]])
         # Analysis and render can run for many minutes. Without a heartbeat the
         # lease expires mid-run and a recovery pass would declare the job
@@ -518,6 +521,16 @@ class ConsoleApp:
         heartbeat.start()
         try:
             result = method(job_id=job_id, **(record.get("params") or {}))
+        except OperationCancelled:
+            store.finish(job_id, STATUS_CANCELLED, error_kind="cancelled_by_user",
+                         recoverable=True)
+            tracker = ProgressTracker(self.storage, ownership, record["job_type"],
+                                      job_id=job_id)
+            tracker.attach()
+            tracker.stop("kullanici_istegi", message="Kullanici tarafindan durduruldu.")
+            audit.record("job.cancelled", job_id=job_id,
+                         actor=record.get("cancel_requested_by") or "console")
+            return
         except (PipelineServiceError, ArtifactProblem) as exc:
             store.finish(job_id, STATUS_FAILED, error=str(exc),
                          error_kind="pipeline_precondition", recoverable=True)
@@ -535,6 +548,19 @@ class ConsoleApp:
             return
         finally:
             heartbeat.stop()
+
+        # Close the tiny race between the phase's final checkpoint and the job
+        # record transition. A late stop request must still win over success.
+        if store.cancel_requested(job_id):
+            store.finish(job_id, STATUS_CANCELLED, error_kind="cancelled_by_user",
+                         recoverable=True)
+            tracker = ProgressTracker(self.storage, ownership, record["job_type"],
+                                      job_id=job_id)
+            tracker.attach()
+            tracker.stop("kullanici_istegi", message="Kullanici tarafindan durduruldu.")
+            audit.record("job.cancelled", job_id=job_id,
+                         actor=record.get("cancel_requested_by") or "console")
+            return
 
         artifact_status = (result or {}).get("status")
         # Execution succeeded; the ARTIFACT still decides whether a human is
@@ -582,6 +608,25 @@ class ConsoleApp:
             "job.retry_requested", actor=requested_by, job_id=job_id,
             detail={"attempt": record.get("attempts")})
         self.runner.submit(store, job_id)
+        return store.get(job_id)
+
+    def cancel_job(self, ownership: Ownership, job_id: str, *, requested_by="console") -> dict:
+        """Request stop for one owned job and persist the intent immediately."""
+        store = self.job_store(ownership)
+        record = store.request_cancel(job_id, requested_by=requested_by)
+        activity = record.get("job_type")
+        if activity in PROGRESS_ACTIVITIES:
+            tracker = ProgressTracker(self.storage, ownership, activity, job_id=job_id)
+            tracker.attach()
+            if record.get("status") == STATUS_CANCELLED:
+                tracker.stop("kullanici_istegi", message="Kuyruktaki is durduruldu.")
+            else:
+                # The worker still owns the process until its next checkpoint.
+                # Keep the state running and say exactly what is happening.
+                tracker.note("Durdurma istegi alindi; guvenli cikis bekleniyor.")
+        AuditLog(self.storage, ownership).record(
+            "job.cancel_requested", actor=requested_by, job_id=job_id,
+            detail={"job_type": activity, "status": record.get("status")})
         return store.get(job_id)
 
     def recover_all_projects(self) -> list:
@@ -865,14 +910,17 @@ def _job_view(job: dict) -> dict:
         "recoverable": bool(job.get("recoverable")),
         "corrupt": bool(job.get("corrupt")),
         "result": job.get("result"),
-        "can_retry": bool(job.get("recoverable")) and job.get("status") == STATUS_FAILED
+        "can_retry": bool(job.get("recoverable")) and job.get("status") in (STATUS_FAILED, STATUS_CANCELLED)
         and int(job.get("attempts") or 0) < int(job.get("max_attempts") or 3),
+        "can_cancel": job.get("status") in ACTIVE_STATUSES
+        and not bool(job.get("cancel_requested_at")),
+        "cancel_requested": bool(job.get("cancel_requested_at")),
     }
 
 
 def _job_summary(jobs) -> dict:
     summary = {status: 0 for status in
-               ("queued", "running", "review_required", "failed", "completed")}
+               ("queued", "running", "review_required", "failed", "completed", "cancelled")}
     for job in jobs:
         if job.get("status") in summary:
             summary[job["status"]] += 1
