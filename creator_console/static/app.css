@@ -440,6 +440,12 @@ tbody tr:hover { background: var(--c-surface-2); }
   border-radius: var(--r-sm); background: var(--c-surface-2); font-size: 13px;
 }
 .job-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+.upload-live {
+  display: grid; gap: var(--sp-3); padding: var(--sp-3);
+  border: 1px solid var(--c-border); border-radius: var(--r-sm);
+  background: var(--c-surface-2);
+}
+.upload-live .btn { justify-self: start; }
 .moment-selection-panel__saved {
   margin-top: var(--sp-3); padding: var(--sp-3); border-radius: var(--r-sm);
   color: var(--c-text); background: var(--c-surface-2); border: 1px solid var(--c-border);

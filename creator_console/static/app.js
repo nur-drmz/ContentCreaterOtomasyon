@@ -37,6 +37,76 @@ const api = {
   post(path, body, headers) { return this.request('POST', path, { body, headers }); },
 };
 
+function uploadSourceFile(file) {
+  const limit = Number(((state.project || {}).upload_limits || {}).max_bytes || 0);
+  if (!file || file.size <= 0) {
+    const error = new Error('Secilen video bos veya tarayici tarafindan okunamiyor.');
+    error.hint = 'Dosyanin bilgisayarda tamamen indirildigini ve boyutunun 0 olmadigini kontrol et.';
+    return Promise.reject(error);
+  }
+  if (limit > 0 && file.size > limit) {
+    const error = new Error(`Video yukleme sinirini asiyor (${formatBytes(file.size)}).`);
+    error.hint = `Bu kurulumun siniri ${formatBytes(limit)}.`;
+    return Promise.reject(error);
+  }
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    state.uploadRequest = xhr;
+    state.uploadProgress = { loaded: 0, total: file.size, filename: file.name };
+    let paintScheduled = false;
+    const repaint = () => {
+      if (paintScheduled) return;
+      paintScheduled = true;
+      requestAnimationFrame(() => { paintScheduled = false; render(); });
+    };
+    const cleanup = () => {
+      state.uploadRequest = null;
+      state.uploadProgress = null;
+      repaint();
+    };
+    xhr.open('POST', `/api/projects/${state.projectId}/source`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+    xhr.upload.onprogress = (event) => {
+      state.uploadProgress = {
+        loaded: event.loaded, total: event.lengthComputable ? event.total : file.size,
+        filename: file.name,
+      };
+      repaint();
+    };
+    xhr.onload = () => {
+      let payload = null;
+      try { payload = JSON.parse(xhr.responseText || '{}'); } catch (_) { payload = null; }
+      cleanup();
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(payload);
+        return;
+      }
+      const info = (payload && payload.error) || {};
+      const error = new Error(info.message || `HTTP ${xhr.status}`);
+      error.hint = info.hint || '';
+      error.code = info.code || `http_${xhr.status}`;
+      error.status = xhr.status;
+      error.fields = info.fields || [];
+      reject(error);
+    };
+    xhr.onerror = () => {
+      cleanup();
+      const error = new Error('Video yuklenirken baglanti kesildi.');
+      error.hint = 'Console acik kalirken yeniden dene; yarim dosya otomatik temizlenir.';
+      reject(error);
+    };
+    xhr.onabort = () => {
+      cleanup();
+      const error = new Error('Video yuklemesi kullanici tarafindan durduruldu.');
+      error.hint = 'Yarim dosya kaydedilmedi; istedigin zaman yeniden baslatabilirsin.';
+      reject(error);
+    };
+    xhr.send(file);
+    repaint();
+  });
+}
+
 const state = {
   screen: 'projects',
   workspace: null,
@@ -54,6 +124,8 @@ const state = {
   // the browser). Null until the Settings screen asks for it.
   diagnostics: null,
   diagnosticsBusy: false,
+  uploadRequest: null,
+  uploadProgress: null,
   // Who is doing each review. Every tick is an API call that re-renders the
   // page, and a fresh input would come back empty -- so ticking six boxes meant
   // typing the name six times, and boxes 2..6 failed with "reviewer required"
@@ -957,12 +1029,39 @@ function phase0PlanEditor(phase0, selectedMode) {
         (planMode ? `Plan olustur (${planMode})` : 'Once bir mod sec'))));
 }
 
+function uploadProgressPanel(progress) {
+  const total = Math.max(0, Number(progress.total) || 0);
+  const loaded = Math.min(total || Infinity, Math.max(0, Number(progress.loaded) || 0));
+  const determinate = total > 0;
+  const percent = determinate ? Math.min(100, Math.round(100 * loaded / total)) : null;
+  return el('section', { class: 'upload-live', 'data-testid': 'upload-live' },
+    el('div', { class: 'row' },
+      el('strong', { text: progress.filename || 'Video' }),
+      el('span', { class: 'dim', 'data-testid': 'upload-live-label',
+                   text: determinate
+                     ? `${formatBytes(loaded)} / ${formatBytes(total)} · %${percent}`
+                     : `${formatBytes(loaded)} yuklendi` })),
+    el('div', {
+      class: `pbar${determinate ? ' pbar--live' : ' pbar--indeterminate'}`,
+      role: 'progressbar', 'aria-label': 'Kaynak video yukleme ilerlemesi',
+      'aria-valuemin': determinate ? '0' : null,
+      'aria-valuemax': determinate ? '100' : null,
+      'aria-valuenow': determinate ? String(percent) : null,
+    }, el('div', { class: 'pbar__fill', style: determinate ? `width:${percent}%` : null })),
+    el('button', {
+      class: 'btn btn--danger btn--sm', 'data-testid': 'cancel-upload',
+      onclick: () => { if (state.uploadRequest) state.uploadRequest.abort(); },
+    }, 'Yuklemeyi durdur'));
+}
+
 function screenPhase0() {
   const view = state.project;
   const phase0 = view.phase0;
   const source = (view.project.data || {}).source;
   const savedMode = phase0.plan && phase0.plan.decision && phase0.plan.decision.mode;
   const selectedPlanMode = state.selectedMode || savedMode || null;
+  const uploadLimit = Number((view.upload_limits || {}).max_bytes || 0);
+  const uploading = state.uploadProgress;
 
   const uploadCard = el('div', { class: 'card' },
     el('h2', { text: '1 · Kaynak video' }),
@@ -973,9 +1072,14 @@ function screenPhase0() {
           el('div', { class: 'dim', text: `${(source.size_bytes / 1048576).toFixed(1)} MB · parmak izi ${String(source.fingerprint_sha256).slice(0, 16)}…` }))
       : el('div', { class: 'stack' },
           el('p', { class: 'muted', text: 'Bu projede henuz kaynak video yok.' }),
-          el('input', { type: 'file', id: 'source-file', accept: 'video/*' }),
+          uploading ? null : el('input', { type: 'file', id: 'source-file', accept: 'video/*' }),
+          uploadLimit > 0
+            ? el('div', { class: 'dim', text: `En fazla ${formatBytes(uploadLimit)}; buyuk videolar RAM'e alinmadan dogrudan diske yazilir.` })
+            : null,
+          uploading ? uploadProgressPanel(uploading) : null,
           el('button', {
             class: 'btn btn--primary',
+            hidden: Boolean(uploading),
             onclick: async (event) => {
               const input = document.getElementById('source-file');
               if (!input.files || !input.files[0]) {
@@ -984,9 +1088,7 @@ function screenPhase0() {
               }
               event.currentTarget.disabled = true;
               const file = input.files[0];
-              await guard(() => api.request('POST', `/api/projects/${state.projectId}/source`, {
-                body: file, headers: { 'X-Filename': file.name },
-              }), 'Kaynak video kaydedildi');
+              await guard(() => uploadSourceFile(file), 'Kaynak video kaydedildi');
               await refresh();
             },
           }, 'Yukle')));
@@ -2513,6 +2615,19 @@ function formatMediaTime(seconds) {
   return hours
     ? `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
     : `${minutes}:${String(secs).padStart(2, '0')}`;
+}
+
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let amount = value;
+  let index = 0;
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024;
+    index += 1;
+  }
+  const digits = index === 0 ? 0 : (amount >= 10 ? 1 : 2);
+  return `${amount.toFixed(digits)} ${units[index]}`;
 }
 
 async function refresh() {

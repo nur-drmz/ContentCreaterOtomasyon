@@ -126,6 +126,14 @@ sekilde olmus isler kurtarilir; canli bir worker'in isi elinden alinmaz.
 9. **Çıktılar** — üretilen Short'lar, manifestler, hata ayrıntısı, audit geçmişi
 10. **Ayarlar** — kimlik bilgisi durumu (**değer asla gösterilmez**), sahiplik, "planlandı" listesi
 
+### Büyük kaynak video yükleme
+
+Kaynak videolar HTTP gövdesinin tamamı RAM'e alınmadan, 8 MB parçalar halinde doğrudan
+proje depolamasına yazılır. Varsayılan yerel sınır **20 GB**'dır ve arayüz dosyayı
+göndermeden önce bu sınırı gösterip doğrular. Yükleme sırasında gerçek bayt/yüzde çubuğu
+ve **Yüklemeyi durdur** düğmesi görünür. Tamamlanmayan aktarım `.part` dosyasını temizler;
+proje kaydına yalnızca eksiksiz dosya atomik olarak bağlanır.
+
 Bir proje açıkken sayfanın üstündeki **Otomatik akışı başlat** düğmesi sıradaki güvenli
 makine fazını çalıştırır. Plan türü, moment ve hash onayları insan kararı olarak kalır;
 otomasyon bu noktalarda durur ve kullanıcı işleminden sonra aynı düğmeyle devam eder.

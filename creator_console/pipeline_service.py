@@ -18,6 +18,7 @@ here exactly once, so:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from datetime import datetime, timezone
@@ -507,23 +508,69 @@ class PipelineService:
         tracker = (self.tracker("upload") if track else progress_module.NullTracker())
         tracker.start("Yukleme basladi")
         try:
-            return self._register_source_video(tracker, filename=filename, payload=payload,
-                                                registered_by=registered_by)
+            return self._register_source_video_stream(
+                tracker, filename=filename, stream=io.BytesIO(payload),
+                content_length=len(payload), registered_by=registered_by)
         except Exception as exc:  # noqa: BLE001
             tracker.fail(f"{type(exc).__name__}: {exc}")
             raise
 
-    def _register_source_video(self, tracker, *, filename, payload, registered_by) -> dict:
-        tracker.stage("receive", f"{len(payload) if payload else 0} bayt alindi")
-        if not payload:
+    def register_source_video_stream(self, *, filename: str, stream,
+                                     content_length: int, registered_by: str,
+                                     track: bool = True) -> dict:
+        """Stream a large local upload to disk without buffering it in RAM."""
+        tracker = (self.tracker("upload") if track else progress_module.NullTracker())
+        tracker.start("Yukleme basladi")
+        try:
+            return self._register_source_video_stream(
+                tracker, filename=filename, stream=stream,
+                content_length=content_length, registered_by=registered_by)
+        except Exception as exc:  # noqa: BLE001
+            tracker.fail(f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _register_source_video_stream(self, tracker, *, filename, stream,
+                                      content_length, registered_by) -> dict:
+        try:
+            expected = int(content_length)
+        except (TypeError, ValueError) as exc:
+            raise PipelineServiceError("yukleme boyutu gecersiz") from exc
+        if expected <= 0:
             raise PipelineServiceError("bos dosya yuklenemez")
         display = safe_filename(filename, default="source.mp4")
         stored_name = f"{new_id('source')}__{display}"
         path = self.storage.resolve(self.ownership, SOURCE_DIRNAME, stored_name,
                                      create_parent=True)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tracker.stage("store", f"{display} depolamaya yaziliyor")
-        path.write_bytes(payload)
+        # ``stored_name`` already contains a fresh source id, so this temporary
+        # name is collision-free without expanding the closed public id catalog.
+        partial = path.with_name(f".{path.name}.part")
+        digest = hashlib.sha256()
+        received = 0
+        tracker.stage("receive", f"{display} aliniyor ve diske yaziliyor")
+        tracker.count(0, expected, unit="bayt", message=f"0/{expected} bayt")
+        try:
+            with open(partial, "xb") as output:
+                while received < expected:
+                    chunk = stream.read(min(8 * 1024 * 1024, expected - received))
+                    if not chunk:
+                        raise PipelineServiceError(
+                            f"yukleme yarida kesildi ({received}/{expected} bayt)")
+                    output.write(chunk)
+                    digest.update(chunk)
+                    received += len(chunk)
+                    tracker.count(received, expected, unit="bayt",
+                                  message=f"{received}/{expected} bayt")
+                output.flush()
+                os.fsync(output.fileno())
+            tracker.stage("store", f"{display} atomik olarak etkinlestiriliyor")
+            os.replace(partial, path)
+        except BaseException:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         tracker.stage("fingerprint", "Parmak izi hesaplaniyor")
 
         project = self.load_artifact("project")
@@ -531,8 +578,8 @@ class PipelineService:
         record["source"] = {
             "display_name": display,
             "stored_path": self.relative(path),
-            "size_bytes": len(payload),
-            "content_sha256": _sha256_bytes(payload),
+            "size_bytes": received,
+            "content_sha256": digest.hexdigest(),
             "fingerprint_sha256": source_strategy.source_fingerprint_sha256(path),
             "registered_at": _now_iso(),
             "registered_by": str(registered_by)[:120],
@@ -540,8 +587,8 @@ class PipelineService:
         record["status_reason"] = "kaynak video kaydedildi; Faz 0 degerlendirmesi bekleniyor"
         self.write_artifact("project", record, actor=registered_by)
         self.audit.record("source.registered", actor=registered_by,
-                          detail={"display_name": display, "size_bytes": len(payload)})
-        tracker.finish(message=f"{display} ({len(payload)} bayt) kaydedildi")
+                          detail={"display_name": display, "size_bytes": received})
+        tracker.finish(message=f"{display} ({received} bayt) kaydedildi")
         return record
 
     def source_path(self) -> Path:

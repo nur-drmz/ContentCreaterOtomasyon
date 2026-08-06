@@ -129,7 +129,10 @@ class ConsoleConfig:
     probe_fn: object = None
     ffmpeg_bin: str | None = None
     ffprobe_bin: str | None = None
-    max_upload_bytes: int = 4 * 1024 * 1024 * 1024
+    # Local long-form sources commonly exceed 4 GiB. Uploads are streamed to
+    # disk (not buffered in RAM), so the guard protects disk capacity rather
+    # than process memory. The UI exposes this exact limit before sending.
+    max_upload_bytes: int = 20 * 1024 * 1024 * 1024
     extra: dict = field(default_factory=dict)
 
 
@@ -712,6 +715,8 @@ class ConsoleApp:
                 for r in self._recovered_on_start
             ],
             "not_uploaded": True,
+            "upload_limits": {"max_bytes": self.config.max_upload_bytes,
+                              "streamed_to_disk": True},
         }
 
     def project_view(self, ownership: Ownership) -> dict:
@@ -819,6 +824,8 @@ class ConsoleApp:
             "secrets": self.secrets.public_state(),
             "planned_not_implemented": [dict(item) for item in PLANNED_NOT_IMPLEMENTED],
             "not_uploaded": True,
+            "upload_limits": {"max_bytes": self.config.max_upload_bytes,
+                              "streamed_to_disk": True},
             # The script a human is being asked to approve. Approving a hash for
             # content you cannot read is not a review, so the text itself has to
             # reach the page -- a curated slice of it, not the whole artifact.

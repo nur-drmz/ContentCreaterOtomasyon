@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import mimetypes
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .errors import ApiError
 from .progress import load_progress
@@ -43,12 +43,13 @@ class ConsoleApi:
 
     # ------------------------------------------------------------- dispatch
     def handle(self, method: str, raw_path: str, *, body: bytes = b"",
-               headers=None) -> tuple:
+               headers=None, body_stream=None, content_length=None) -> tuple:
         parsed = urlparse(raw_path)
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
         try:
-            return self._route(method.upper(), path, body, query, headers or {})
+            return self._route(method.upper(), path, body, query, headers or {},
+                               body_stream=body_stream, content_length=content_length)
         except ApiError as exc:
             return self._fail(exc)
         except InvalidIdentifier as exc:
@@ -79,7 +80,8 @@ class ConsoleApi:
         self.app.log_error(error)
         return error.status, error.to_payload()
 
-    def _route(self, method, path, body, query, headers):
+    def _route(self, method, path, body, query, headers, *, body_stream=None,
+               content_length=None):
         if path == "/" and method == "GET":
             return self._static("index.html")
         if path.startswith("/static/") and method == "GET":
@@ -116,11 +118,14 @@ class ConsoleApi:
 
         parts = [p for p in path.split("/") if p]
         if len(parts) >= 3 and parts[0] == "api" and parts[1] == "projects":
-            return self._project_routes(method, parts, body, query, headers)
+            return self._project_routes(
+                method, parts, body, query, headers,
+                body_stream=body_stream, content_length=content_length)
         raise ApiError("unknown_route", detail=f"{method} {path}")
 
     # ------------------------------------------------------- project routes
-    def _project_routes(self, method, parts, body, query, headers):
+    def _project_routes(self, method, parts, body, query, headers, *,
+                        body_stream=None, content_length=None):
         ownership = self.app.assert_owned(parts[2])
         service = self.app.service(ownership)
         rest = parts[3:]
@@ -173,6 +178,22 @@ class ConsoleApi:
 
         if rest == ["source"] and method == "POST":
             filename = _header(headers, "x-filename") or _first(query.get("filename")) or "source.mp4"
+            filename = unquote(filename)
+            if body_stream is not None:
+                try:
+                    length = int(content_length)
+                except (TypeError, ValueError):
+                    length = 0
+                if length <= 0:
+                    raise ApiError("empty_upload")
+                if length > self.app.config.max_upload_bytes:
+                    raise ApiError("upload_too_large")
+                record = service.register_source_video_stream(
+                    filename=filename, stream=body_stream,
+                    content_length=length,
+                    registered_by=_header(headers, "x-actor") or "console",
+                    track=True)
+                return 201, {"project": record}
             if not body:
                 raise ApiError("empty_upload")
             if len(body) > self.app.config.max_upload_bytes:

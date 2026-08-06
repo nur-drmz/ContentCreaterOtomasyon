@@ -34,19 +34,35 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.console_log(f"{self.command} {self.path.split('?')[0]} {args[-1] if args else ''}")
 
     def _read_body(self) -> bytes:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            length = 0
-        if length <= 0:
-            return b""
-        if length > MAX_BODY_BYTES:
+        length = self._content_length()
+        if length <= 0 or length > MAX_BODY_BYTES:
             return b""
         return self.rfile.read(length)
 
+    def _content_length(self) -> int:
+        try:
+            return int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _dispatch(self, method: str):
-        body = self._read_body() if method in ("POST", "PUT", "PATCH", "DELETE") else b""
-        status, payload = self.api.handle(method, self.path, body=body, headers=self.headers)
+        path_parts = [part for part in self.path.split("?", 1)[0].split("/") if part]
+        source_upload = (
+            method == "POST" and len(path_parts) == 4
+            and path_parts[:2] == ["api", "projects"] and path_parts[3] == "source"
+        )
+        if source_upload:
+            length = self._content_length()
+            status, payload = self.api.handle(
+                method, self.path, headers=self.headers,
+                body_stream=self.rfile, content_length=length)
+            if length > self.api.app.config.max_upload_bytes:
+                # The request body was deliberately not consumed. Do not reuse
+                # this HTTP connection with unread video bytes still pending.
+                self.close_connection = True
+        else:
+            body = self._read_body() if method in ("POST", "PUT", "PATCH", "DELETE") else b""
+            status, payload = self.api.handle(method, self.path, body=body, headers=self.headers)
         if isinstance(payload, dict) and "__raw__" in payload:
             raw = payload["__raw__"]
             self.send_response(status)
