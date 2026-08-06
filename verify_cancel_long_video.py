@@ -93,6 +93,24 @@ try:
         checks += 1
     check(time.monotonic() - started < 5, "child process was not terminated promptly")
 
+    # Regression: waiting for process exit before reading stdout/stderr can
+    # deadlock once an FFmpeg diagnostic pipe fills. It must also tolerate
+    # non-UTF-8 bytes commonly encountered around multilingual MKV metadata.
+    class KeepRunning:
+        def raise_if_cancelled(self):
+            return None
+
+    started = time.monotonic()
+    flooded = _run_process_checked([
+        sys.executable, "-c",
+        "import os,sys; os.write(sys.stderr.fileno(), b'\\xff' * 1048576); "
+        "print('pipe-drained')",
+    ], KeepRunning())
+    check(flooded.returncode == 0, "pipe-flood child failed")
+    check("pipe-drained" in flooded.stdout, "stdout was not drained")
+    check(len(flooded.stderr) == 1048576, "stderr was truncated or undecodable")
+    check(time.monotonic() - started < 5, "full diagnostic pipe deadlocked")
+
     # The HTTP contract exposes one ownership-scoped cancel route.
     app = ConsoleApp(ConsoleConfig(storage_root=root / "api", inline_jobs=True))
     project = app.create_project(title="cancel api", created_by="tester")

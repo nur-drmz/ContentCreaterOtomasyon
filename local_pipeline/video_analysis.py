@@ -87,21 +87,33 @@ def _raise_if_cancelled(progress) -> None:
 
 
 def _run_process_checked(cmd, progress):
-    """Run a child process while honoring the console's cooperative stop flag."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    """Run a child process while honoring the console's cooperative stop flag.
+
+    ``communicate`` must drain both pipes WHILE the process runs. Polling first
+    and reading afterwards can deadlock when FFmpeg emits enough diagnostics to
+    fill a pipe. Explicit UTF-8 replacement also prevents multilingual MKV
+    metadata or decoder messages from killing a Windows pipe reader.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace")
     try:
-        while proc.poll() is None:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                pass
             _raise_if_cancelled(progress)
-            time.sleep(0.1)
-        stdout, stderr = proc.communicate()
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     except BaseException:
-        proc.terminate()
+        if proc.poll() is None:
+            proc.terminate()
         try:
-            proc.wait(timeout=3)
+            proc.communicate(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
-        proc.communicate()
+            proc.communicate()
         raise
 
 
@@ -162,8 +174,12 @@ def extract_clip_and_audio(ffmpeg_bin: str, raw_video_path, video_out_path, audi
 
     clip_cmd = [
         ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
-        "-fflags", "+genpts", "-i", str(raw_video_path),
-        "-ss", str(start_sec), "-t", str(duration_sec),
+        # Input-side seek is essential for long sources: output-side ``-ss``
+        # would decode from 00:00 up to (for example) minute 24 before writing
+        # the first byte. We re-encode below, so FFmpeg still resolves the exact
+        # requested timestamp after seeking to the preceding keyframe.
+        "-ss", str(start_sec), "-fflags", "+genpts", "-i", str(raw_video_path),
+        "-t", str(duration_sec),
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
