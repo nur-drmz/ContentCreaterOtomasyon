@@ -103,7 +103,7 @@ def main() -> int:
     # --- 1. project + source ------------------------------------------------
     status, payload = call(api, "POST", "/api/projects",
                            {"title": "GERCEK KAYNAK TESTI (izole)",
-                            "created_by": "verify_real_preview"})
+                            "operator_name": "verify_real_preview"})
     check(status == 201, "project", f"HTTP {status}")
     pid = payload["project"]["project_id"]
     ownership = app.ownership(pid)

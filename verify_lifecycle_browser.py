@@ -71,7 +71,6 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
             page.locator("[data-testid=script-editor] > summary").click()
             check(page.locator("[data-testid=script-editor-text]").input_value()
                   == "Editable script", "script-editor-prefilled")
-            page.fill("#script-editor-by", "Browser editor")
             page.fill("[data-testid=script-editor-text]", "Browser revised script")
             page.click("[data-testid=script-editor-save]")
             page.wait_for_timeout(700)
@@ -82,7 +81,6 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
                   "script-edit-click-archives-downstream")
 
             page.locator("[data-testid=project-lifecycle] > summary").click()
-            page.fill("#lifecycle-actor", "Browser editor")
             page.select_option("[data-testid=lifecycle-target]", "script")
             page.click("[data-testid=lifecycle-rewind]")
             page.wait_for_timeout(700)
@@ -91,7 +89,6 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
             # Delete through the real HTTP adapter, including its JSON body.
             if not page.locator("[data-testid=project-lifecycle]").evaluate("el => el.open"):
                 page.locator("[data-testid=project-lifecycle] > summary").click()
-            page.fill("#lifecycle-actor", "Browser editor")
             page.fill("#lifecycle-confirmation", "Browser lifecycle")
             page.click("[data-testid=lifecycle-delete]")
             page.wait_for_timeout(800)

@@ -115,9 +115,11 @@ class ConsoleApi:
             )
         if path == "/api/projects" and method == "POST":
             payload = _json_body(body)
+            title = _required(payload, "title")
+            operator = _required(payload, "operator_name")
             record = self.app.create_project(
-                title=_required(payload, "title"),
-                created_by=payload.get("created_by", "console"))
+                title=title,
+                created_by=operator, operator_name=operator)
             return 201, {"project": record}
 
         parts = [p for p in path.split("/") if p]
@@ -142,7 +144,9 @@ class ConsoleApi:
             record = service.update_project(
                 title=payload.get("title", ""),
                 notes=payload.get("notes", ""),
-                updated_by=_header(headers, "x-actor") or "console",
+                updated_by=_header(headers, "x-actor") or service.project_actor(),
+                operator_name=(payload.get("operator_name")
+                               if "operator_name" in payload else None),
             )
             return 200, {"project": record}
 
@@ -157,7 +161,8 @@ class ConsoleApi:
         if rest == ["lifecycle"] and method == "POST":
             payload = _json_body(body)
             action = payload.get("action")
-            actor = _header(headers, "x-actor") or payload.get("actor") or "console"
+            actor = (_header(headers, "x-actor") or payload.get("actor")
+                     or service.project_actor())
             if action == "rewind":
                 return 200, self.app.rewind_project(
                     ownership, target=payload.get("target") or "", actor=actor)
@@ -174,7 +179,7 @@ class ConsoleApi:
             artifact = self.app.update_script_text(
                 ownership,
                 script_text=_required(payload, "script_text"),
-                updated_by=_required(payload, "updated_by"),
+                updated_by=payload.get("updated_by") or service.project_actor(),
                 notes=payload.get("notes", ""),
             )
             return 200, {"script": artifact,
@@ -197,7 +202,7 @@ class ConsoleApi:
                 record = service.register_source_video_stream(
                     filename=filename, stream=body_stream,
                     content_length=length,
-                    registered_by=_header(headers, "x-actor") or "console",
+                    registered_by=_header(headers, "x-actor") or service.project_actor(),
                     track=True)
                 return 201, {"project": record}
             if not body:
@@ -206,7 +211,7 @@ class ConsoleApi:
                 raise ApiError("upload_too_large")
             record = service.register_source_video(
                 filename=filename, payload=body,
-                registered_by=_header(headers, "x-actor") or "console",
+                registered_by=_header(headers, "x-actor") or service.project_actor(),
                 track=True)
             return 201, {"project": record}
 
@@ -215,11 +220,10 @@ class ConsoleApi:
             mode = payload.get("mode")
             if not mode:
                 raise ApiError("mode_required")
-            # Deliberately NOT `or "console"`. The pipeline requires a named
-            # human for a mode decision; quietly signing it "console" would
-            # forge exactly the accountability the gate exists to create.
+            # New projects require one named operator. Reuse that persisted
+            # identity here instead of asking for the same name at every gate.
             plan = service.create_processing_plan(
-                mode=mode, selected_by=_required(payload, "selected_by"),
+                mode=mode, selected_by=payload.get("selected_by") or service.project_actor(),
                 output_count=payload.get("output_count"),
                 target_duration_sec=payload.get("target_duration_sec"),
                 moment_ranks=payload.get("moment_ranks"),
@@ -234,7 +238,7 @@ class ConsoleApi:
             payload = _json_body(body)
             plan = service.update_processing_plan(
                 updated_by=_header(headers, "x-actor")
-                           or payload.get("updated_by") or "console",
+                           or payload.get("updated_by") or service.project_actor(),
                 mode=payload.get("mode"),
                 selected_by=payload.get("selected_by"),
                 output_count=payload.get("output_count"),
@@ -258,21 +262,40 @@ class ConsoleApi:
 
         if rest == ["moment-selection"] and method == "POST":
             payload = _json_body(body)
+            slot = _slot(payload)
             selection = service.record_moment_selection(
                 selected_rank=payload.get("selected_rank"),
-                reviewed_by=payload.get("reviewed_by") or "",
+                reviewed_by=payload.get("reviewed_by") or service.project_actor(),
                 rejected_ranks=payload.get("rejected_ranks"),
                 notes=payload.get("notes", ""),
-                require_preview=payload.get("require_preview", True))
-            return 201, {"moment_selection": selection}
+                require_preview=payload.get("require_preview", True),
+                slot=slot)
+            return 201, {"moment_selection": selection, "slot": slot}
+
+        if rest == ["outputs"] and method == "GET":
+            return 200, {"outputs": service.outputs(), "batch": service.batch_state()}
+
+        if rest == ["batch"] and method == "GET":
+            return 200, {"batch": service.batch_state()}
+
+        if rest == ["batch"] and method == "POST":
+            payload = _json_body(body)
+            result = self.app.submit_batch_render(
+                ownership,
+                submitted_by=payload.get("submitted_by") or service.project_actor(),
+                run_request_id=payload.get("run_request_id"),
+                slots=payload.get("slots"))
+            return (202 if result["submitted_count"] else 200), result
 
         if len(rest) == 2 and rest[0] == "approvals" and method == "POST":
             payload = _json_body(body)
+            slot = _slot(payload)
             approved = service.approve(
                 rest[1], reviewed_sha256=payload.get("reviewed_sha256", ""),
-                approved_by=payload.get("approved_by", ""),
-                notes=payload.get("notes", ""))
-            return 200, {"artifact": approved, "approval": service.approval_state(rest[1])}
+                approved_by=payload.get("approved_by") or service.project_actor(),
+                notes=payload.get("notes", ""), slot=slot)
+            return 200, {"artifact": approved,
+                         "approval": service.approval_state(rest[1], slot)}
 
         if rest == ["jobs"] and method == "GET":
             store = self.app.job_store(ownership)
@@ -291,24 +314,26 @@ class ConsoleApi:
                                                 "deduplicated": not created}
 
         if rest == ["render-review"] and method == "GET":
-            return 200, {"render_review": service.render_review_state()}
+            return 200, {"render_review": service.render_review_state(_slot(query))}
 
         if rest == ["render-review"] and method == "POST":
             payload = _json_body(body)
             action = payload.get("action") or "set_item"
+            slot = _slot(payload)
             if action == "set_item":
                 return 200, {"render_review": service.set_render_review_item(
                     payload.get("key", ""), checked=bool(payload.get("checked")),
-                    reviewed_by=payload.get("reviewed_by", ""),
-                    note=payload.get("note", ""))}
+                    reviewed_by=payload.get("reviewed_by") or service.project_actor(),
+                    note=payload.get("note", ""), slot=slot)}
             if action == "request_revision":
                 return 200, {"render_review": service.request_render_revision(
-                    requested_by=payload.get("requested_by", ""),
+                    requested_by=payload.get("requested_by") or service.project_actor(),
                     notes=payload.get("notes", ""),
-                    target_tab=payload.get("target_tab", "moments"))}
+                    target_tab=payload.get("target_tab", "moments"), slot=slot)}
             if action == "clear_revision":
                 return 200, {"render_review": service.clear_render_revision(
-                    resolved_by=payload.get("resolved_by", ""))}
+                    resolved_by=payload.get("resolved_by") or service.project_actor(),
+                    slot=slot)}
             raise ApiError("validation_failed", detail=f"eylem: {action!r}")
 
         if rest == ["voice-review"] and method == "GET":
@@ -320,17 +345,16 @@ class ConsoleApi:
             if action == "set_item":
                 return 200, {"voice_review": service.set_voice_review_item(
                     payload.get("key", ""), checked=bool(payload.get("checked")),
-                    reviewed_by=_required(payload, "reviewed_by")
-                    if payload.get("checked") else payload.get("reviewed_by", ""),
+                    reviewed_by=payload.get("reviewed_by") or service.project_actor(),
                     note=payload.get("note", ""))}
             if action == "request_revision":
                 return 200, {"voice_review": service.request_voice_revision(
-                    requested_by=_required(payload, "requested_by"),
+                    requested_by=payload.get("requested_by") or service.project_actor(),
                     notes=_required({"note": payload.get("notes")}, "note"),
                     target_tab=payload.get("target_tab", "voice"))}
             if action == "clear_revision":
                 return 200, {"voice_review": service.clear_voice_revision(
-                    resolved_by=_required(payload, "resolved_by"))}
+                    resolved_by=payload.get("resolved_by") or service.project_actor())}
             raise ApiError("validation_failed", detail=f"eylem: {action!r}")
 
         if rest == ["progress"] and method == "GET":
@@ -348,22 +372,23 @@ class ConsoleApi:
             if action not in ("start", "pause", "resume", "cancel", "tick"):
                 raise ApiError("validation_failed", detail=f"eylem: {action!r}")
             return 202, {"automation": self.app.automation_action(
-                ownership, action, actor=payload.get("actor") or "console")}
+                ownership, action, actor=payload.get("actor") or service.project_actor())}
 
         if rest == ["auto-run"] and method == "POST":
             # Backwards-compatible alias for the persisted engine's tick.
             return 202, {"automation": self.app.automation_action(
-                ownership, "tick", actor="console")}
+                ownership, "tick", actor=service.project_actor())}
 
         if len(rest) == 3 and rest[0] == "jobs" and rest[2] == "retry" and method == "POST":
             record = self.app.retry_job(ownership, rest[1],
-                                        requested_by=_header(headers, "x-actor") or "console")
+                                        requested_by=_header(headers, "x-actor")
+                                                     or service.project_actor())
             return 202, {"job": record}
 
         if len(rest) == 3 and rest[0] == "jobs" and rest[2] == "cancel" and method == "POST":
             record = self.app.cancel_job(
                 ownership, rest[1],
-                requested_by=_header(headers, "x-actor") or "console")
+                requested_by=_header(headers, "x-actor") or service.project_actor())
             return 202, {"job": record}
 
         if len(rest) == 2 and rest[0] == "jobs" and method == "GET":
@@ -417,6 +442,31 @@ def _required(payload, name: str, *, minimum: int = 1) -> str:
     if len(value) < minimum:
         raise ApiError("missing_required_field", fields=[name],
                        detail=f"{name} bos veya cok kisa")
+    return value
+
+
+def _slot(source) -> int:
+    """Output slot from a JSON payload or a query string, defaulting to 1.
+
+    Accepts both shapes so one helper serves POST bodies and GET query params.
+    Whether the slot actually exists is decided by `PipelineService.require_slot`
+    against the approved plan -- not here, where the plan is not in scope.
+    """
+    if not source:
+        return 1
+    raw = source.get("slot")
+    if isinstance(raw, list):  # parse_qs gives lists
+        raw = _first(raw)
+    if raw in (None, ""):
+        return 1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ApiError("validation_failed", fields=["slot"],
+                       detail="slot bir tam sayi olmali") from None
+    if value < 1:
+        raise ApiError("validation_failed", fields=["slot"],
+                       detail="slot 1'den kucuk olamaz")
     return value
 
 

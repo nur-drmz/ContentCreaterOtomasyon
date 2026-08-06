@@ -260,10 +260,13 @@ class ConsoleApp:
             return []
         return sorted(p.name for p in base.iterdir() if p.is_dir())
 
-    def create_project(self, *, title: str, created_by: str) -> dict:
+    def create_project(self, *, title: str, created_by: str,
+                       operator_name: str | None = None) -> dict:
         ownership = self.ownership(new_id("project"))
         service = self.service(ownership)
-        record = service.create_project(title=title, created_by=created_by)
+        record = service.create_project(
+            title=title, created_by=created_by,
+            operator_name=operator_name or created_by)
         return record
 
     def _assert_lifecycle_idle(self, ownership: Ownership) -> None:
@@ -430,13 +433,15 @@ class ConsoleApp:
             return {"state": "blocked", "blocker": "no_hot_moments",
                     "message": "Analiz aday moment uretmedi. Moment Explorer'da ayarlari degistirip yeniden calistir."}
 
-        selection = service.load_artifact("moment_selection")
-        if not selection["data"] or selection["problem"]:
-            return {"state": "blocked", "blocker": "moment_selection",
-                    "message": "Moment Explorer'da adaylari izle ve bir moment sec."}
-
         decision = plan["data"].get("decision") or {}
         mode = decision.get("mode")
+        slot_indexes = service.slot_indexes()
+
+        selection = service.load_artifact("moment_selection")
+        if not selection["data"] or selection["problem"]:
+            return {"state": "blocked", "blocker": "moment_selection", "slot": 1,
+                    "message": "Moment Explorer'da adaylari izle ve bir moment sec."}
+
         approvals = service.approval_chain()
         if mode == source_strategy.MODE_NARRATED_THEORY:
             script = service.load_artifact("selected_script")
@@ -463,27 +468,102 @@ class ConsoleApp:
                 return {"state": "blocked", "blocker": "voiceover_approval",
                         "message": "Voice Studio'da sesi dinle ve onayla."}
 
-        render = service.load_artifact("render_manifest")
-        if not render["data"] or render["problem"]:
-            render_config = dict(decision.get("render") or {})
-            params = {
-                "render_mode": render_config.get("render_mode", "blurred_background"),
-                "preview_mode": render_config.get("preview_mode", True),
-                "subtitle_whisper_model_size": render_config.get(
-                    "subtitle_whisper_model_size", "small"),
-                "subtitle_language": render_config.get("subtitle_language", "auto"),
-                "caption_style": render_config.get("caption_style", "active_word_yellow"),
-                "caption_theme": render_config.get("caption_theme", "auto"),
-            }
-            return self._automatic_job(
-                ownership, "render", params, submit=submit,
-                message="Render baslatildi.")
+        # Every Short of a batch is walked in order. Automation renders the
+        # machine part of each slot and then STOPS at that slot's human gates --
+        # a batch does not turn N approvals into one.
+        render_config = dict(decision.get("render") or {})
+        for index in slot_indexes:
+            slot_label = f" (cikti {index})" if len(slot_indexes) > 1 else ""
 
-        render_state = approvals.get("render") or {}
-        if render_state.get("effective_valid"):
-            return {"state": "completed", "message": "Akis tamamlandi; render onayi gecerli."}
-        return {"state": "blocked", "blocker": "render_approval",
-                "message": "Render Studio'da videoyu izle ve final onayi ver."}
+            slot_selection = service.load_artifact("moment_selection", slot=index)
+            if not slot_selection["data"] or slot_selection["problem"]:
+                return {"state": "blocked", "blocker": "moment_selection", "slot": index,
+                        "message": f"Moment Explorer'da{slot_label} bir moment sec."}
+
+            render = service.load_artifact("render_manifest", slot=index)
+            if not render["data"] or render["problem"]:
+                params = {
+                    "render_mode": render_config.get("render_mode", "blurred_background"),
+                    "preview_mode": render_config.get("preview_mode", True),
+                    "subtitle_whisper_model_size": render_config.get(
+                        "subtitle_whisper_model_size", "small"),
+                    "subtitle_language": render_config.get("subtitle_language", "auto"),
+                    "caption_style": render_config.get("caption_style", "active_word_yellow"),
+                    "caption_theme": render_config.get("caption_theme", "auto"),
+                    "slot": index,
+                }
+                return self._automatic_job(
+                    ownership, "render", params, submit=submit,
+                    message=f"Render baslatildi{slot_label}.")
+
+            slot_render_state = (service.approval_chain(index).get("render")
+                                 if index != 1 else approvals.get("render")) or {}
+            if not slot_render_state.get("effective_valid"):
+                return {"state": "blocked", "blocker": "render_approval", "slot": index,
+                        "message": f"Render Studio'da{slot_label} videoyu izle ve final onayi ver."}
+
+        total = len(slot_indexes)
+        return {"state": "completed",
+                "message": (f"Akis tamamlandi; {total} ciktinin render onayi gecerli."
+                            if total > 1 else "Akis tamamlandi; render onayi gecerli.")}
+
+    def submit_batch_render(self, ownership: Ownership, *, submitted_by="console",
+                            run_request_id=None, slots=None) -> dict:
+        """Queue a render for every slot that is ready, in one click.
+
+        "Ready" means a human already chose that slot's moment and the plan gate
+        is open -- the batch queues machine work only. Slots still waiting on a
+        person are REPORTED as skipped with the reason, never quietly rendered
+        from a moment nobody picked.
+
+        Each slot is a separate job with its own params, so the existing
+        idempotency key already distinguishes them: a double-clicked batch button
+        deduplicates per slot instead of producing a second set of renders.
+        """
+        service = self.service(ownership)
+        state = service.batch_state()
+        requested = set(int(s) for s in slots) if slots else None
+
+        submitted, skipped = [], []
+        for entry in state["slots"]:
+            index = entry["index"]
+            if requested is not None and index not in requested:
+                continue
+            if not entry["runnable"]:
+                skipped.append({"slot": index, "state": entry["state"],
+                                "reason": entry.get("problem") or state.get("render_blocker")
+                                or "bu yuva makine isine hazir degil"})
+                continue
+            record, created = self.submit_job(
+                ownership, "render",
+                params=self._slot_render_params(service, index),
+                submitted_by=submitted_by,
+                run_request_id=f"{run_request_id or 'batch'}:{index}")
+            submitted.append({"slot": index, "job": _job_view(record), "created": created})
+
+        return {"submitted": submitted, "skipped": skipped,
+                "submitted_count": len(submitted), "skipped_count": len(skipped),
+                "batch": service.batch_state()}
+
+    def _slot_render_params(self, service, slot: int) -> dict:
+        """Render params for one slot, taken from the APPROVED plan.
+
+        Read from the plan rather than from the request so a batch cannot render
+        at settings the approval hash never covered.
+        """
+        decision = ((service.load_artifact("processing_plan")["data"] or {})
+                    .get("decision") or {})
+        render_config = dict(decision.get("render") or {})
+        return {
+            "render_mode": render_config.get("render_mode", "blurred_background"),
+            "preview_mode": render_config.get("preview_mode", True),
+            "subtitle_whisper_model_size": render_config.get(
+                "subtitle_whisper_model_size", "small"),
+            "subtitle_language": render_config.get("subtitle_language", "auto"),
+            "caption_style": render_config.get("caption_style", "active_word_yellow"),
+            "caption_theme": render_config.get("caption_theme", "auto"),
+            "slot": int(slot),
+        }
 
     def _automatic_job(self, ownership, job_type, params, *, submit, message) -> dict:
         if not submit:
@@ -691,6 +771,8 @@ class ConsoleApp:
                 "project_id": project_id,
                 "title": (record["data"] or {}).get("title") or "(okunamadi)",
                 "notes": (record["data"] or {}).get("notes") or "",
+                "operator_name": (record["data"] or {}).get("operator_name")
+                                 or self.service(ownership).project_actor(),
                 "problem": record["problem"],
                 "created_at": (record["data"] or {}).get("created_at"),
                 "updated_at": ((record["data"] or {}).get("updated_at")
@@ -787,6 +869,7 @@ class ConsoleApp:
         view = {
             "owner": ownership.to_dict(),
             "project": {"data": project["data"], "problem": project["problem"]},
+            "project_actor": service.project_actor(),
             "phase0": {
                 "assessment": assessment["data"], "assessment_problem": assessment["problem"],
                 "plan": plan["data"], "plan_problem": plan["problem"],
@@ -822,6 +905,10 @@ class ConsoleApp:
             "jobs": [_job_view(job) for job in jobs],
             "job_summary": _job_summary(jobs),
             "outputs": service.outputs(),
+            # Per-Short state for the batch board. Derived on the server from the
+            # same artifacts and approval chain the queue uses, so the board can
+            # never offer an action the pipeline would refuse.
+            "batch": service.batch_state(),
             "audit": AuditLog(self.storage, ownership).events(limit=40),
             "secrets": self.secrets.public_state(),
             "planned_not_implemented": [dict(item) for item in PLANNED_NOT_IMPLEMENTED],

@@ -76,6 +76,7 @@ function uploadSourceFile(file) {
     xhr.open('POST', `/api/projects/${state.projectId}/source`);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+    xhr.setRequestHeader('X-Actor', projectActor());
     xhr.upload.onprogress = (event) => {
       state.uploadProgress = {
         loaded: event.loaded, total: event.lengthComputable ? event.total : file.size,
@@ -135,14 +136,6 @@ const state = {
   diagnosticsBusy: false,
   uploadRequest: null,
   uploadProgress: null,
-  // Who is doing each review. Every tick is an API call that re-renders the
-  // page, and a fresh input would come back empty -- so ticking six boxes meant
-  // typing the name six times, and boxes 2..6 failed with "reviewer required"
-  // until you did. UI-local like runParams: the RESULT still lives on the
-  // server, this is only the input value surviving a repaint. Mirrored into
-  // localStorage so it also survives a refresh, and backfilled from whoever
-  // ticked the last item so it survives a restart or a different browser.
-  reviewers: { render: '', voice: '' },
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
   // the automation flow itself live on the server.
   runParams: {
@@ -152,6 +145,12 @@ const state = {
     tts: { voice: 'Kore', language_code: 'tr-TR', narration_direction: '' },
   },
 };
+
+function projectActor() {
+  const record = (((state.project || {}).project || {}).data) || {};
+  return String((state.project && state.project.project_actor)
+                || record.operator_name || record.created_by || 'console').trim();
+}
 
 const SCREENS = [
   { key: 'projects',  label: 'Projeler',        needsProject: false },
@@ -290,8 +289,10 @@ function validateFields(rules) {
 function applyServerFieldErrors(error) {
   const fields = (error && error.fields) || [];
   if (!fields.length) return false;
-  for (const item of fields) markFieldError(item.name, `${item.label} zorunlu.`);
-  const first = document.getElementById(fields[0].name);
+  const aliases = { title: 'new-project-title', operator_name: 'new-project-operator' };
+  const fieldId = (name) => document.getElementById(name) ? name : (aliases[name] || name);
+  for (const item of fields) markFieldError(fieldId(item.name), `${item.label} zorunlu.`);
+  const first = document.getElementById(fieldId(fields[0].name));
   if (first) { first.focus(); first.scrollIntoView({ block: 'center' }); }
   return true;
 }
@@ -317,6 +318,9 @@ function el(tag, attrs = {}, ...children) {
 const STATUS_ICONS = {
   queued: '◔', running: '◑', review_required: '⚑', failed: '✕', completed: '✓',
   approved: '✓', missing: '·', planned: '◇',
+  // Batch slot states. Each carries its own mark so the board never relies on
+  // colour alone to say what a Short is waiting for.
+  needs_moment: '◇', ready_to_render: '▶', needs_review: '⚑', needs_revision: '✎',
 };
 
 function badge(status, label) {
@@ -377,16 +381,24 @@ function screenProjects() {
       requiredLegend(),
       inputField({ id: 'new-project-title', label: 'Proje adi', required: true,
                    attrs: { placeholder: 'Ornek: HOTD sezon analizi', maxlength: 200 } }),
+      inputField({ id: 'new-project-operator', label: 'Ureten kisi', required: true,
+                   hint: 'Bir kez kaydedilir; plan, secim, onay ve revizyonlarda otomatik kullanilir.',
+                   attrs: { placeholder: 'Ornek: Bix', maxlength: 120,
+                            autocomplete: 'name' } }),
       el('button', {
         class: 'btn btn--primary', 'data-testid': 'create-project',
         onclick: async (event) => {
           const values = validateFields([
-            { id: 'new-project-title', label: 'Proje adi', required: true }]);
+            { id: 'new-project-title', label: 'Proje adi', required: true },
+            { id: 'new-project-operator', label: 'Ureten kisi', required: true }]);
           if (!values) return;
           const button = event.currentTarget;
           button.disabled = true;   // double-click guard on the client too
           const created = await guard(
-            () => api.post('/api/projects', { title: values['new-project-title'] }),
+            () => api.post('/api/projects', {
+              title: values['new-project-title'],
+              operator_name: values['new-project-operator'],
+            }),
             'Proje olusturuldu');
           button.disabled = false;
           if (created) { state.projectId = created.project.project_id; await goto('phase0'); }
@@ -429,7 +441,7 @@ function submitManualJob(jobType, params = {}) {
     job_type: jobType,
     params,
     run_request_id: newRunRequestId(jobType),
-    submitted_by: 'console:manual',
+    submitted_by: projectActor(),
   });
 }
 
@@ -438,7 +450,9 @@ async function automationAction(action) {
   state.autoBusy = true;
   render();
   const result = await guard(
-    () => api.post(`/api/projects/${state.projectId}/automation`, { action }));
+    () => api.post(`/api/projects/${state.projectId}/automation`, {
+      action, actor: projectActor(),
+    }));
   state.autoBusy = false;
   await refresh();
   return result;
@@ -706,19 +720,14 @@ function projectLifecyclePanel() {
   const revisions = (state.project && state.project.revisions) || [];
   const disabled = active > 0;
   const runLifecycle = async (action, extra, successTitle) => {
-    const values = validateFields([
-      { id: 'lifecycle-actor', label: 'Islemi yapan kisi', required: true },
-    ]);
-    if (!values) return null;
     const result = await guard(() => api.post(
       `/api/projects/${state.projectId}/lifecycle`, {
-        action, actor: values['lifecycle-actor'], ...extra,
+        action, actor: projectActor(), ...extra,
       }), successTitle);
     if (result) await refresh();
     return result;
   };
   const destructiveValues = () => validateFields([
-    { id: 'lifecycle-actor', label: 'Islemi yapan kisi', required: true },
     { id: 'lifecycle-confirmation', label: 'Proje adi dogrulamasi', required: true },
   ]);
   return el('details', { class: 'card lifecycle-card', 'data-testid': 'project-lifecycle' },
@@ -731,8 +740,6 @@ function projectLifecyclePanel() {
     disabled ? alertBox('warn', 'Proje su anda calisiyor',
       `${active} aktif is tamamlanmadan geri donme, sifirlama veya silme yapilamaz.`) : null,
     requiredLegend(),
-    inputField({ id: 'lifecycle-actor', label: 'Islemi yapan kisi', required: true,
-                 attrs: { maxlength: 120, placeholder: 'adin' } }),
     el('div', { class: 'lifecycle-section' },
       el('h3', { text: 'Bir asamaya geri don' }),
       el('p', { class: 'dim',
@@ -794,7 +801,7 @@ function projectLifecyclePanel() {
             const removed = await guard(() => api.request(
               'DELETE', `/api/projects/${state.projectId}`, {
                 body: { confirmation: values['lifecycle-confirmation'],
-                        actor: values['lifecycle-actor'] },
+                        actor: projectActor() },
               }), 'Proje silindi');
             if (removed) {
               state.projectId = null; state.project = null; state.selectedMode = null;
@@ -809,6 +816,7 @@ function screenHistory() {
   const projectCards = projects.map(project => {
     const titleId = `history-title-${project.project_id}`;
     const notesId = `history-notes-${project.project_id}`;
+    const operatorId = `history-operator-${project.project_id}`;
     return el('article', { class: 'card archive-card' },
       el('div', { class: 'card__head' },
         el('div', {},
@@ -829,6 +837,10 @@ function screenHistory() {
       inputField({ id: titleId, label: 'Proje adi', required: true,
                    attrs: { value: project.title, maxlength: 200,
                             disabled: Boolean(project.problem) } }),
+      inputField({ id: operatorId, label: 'Ureten kisi', required: true,
+                   hint: 'Degistirirsen bundan sonraki proje islemlerinde yeni ad kullanilir.',
+                   attrs: { value: project.operator_name || '', maxlength: 120,
+                            disabled: Boolean(project.problem) } }),
       field({ id: notesId, label: 'Proje notlari',
               control: el('textarea', { id: notesId, maxlength: 2000,
                 placeholder: 'Icerik fikri, hedef kitle veya sonraki adimlar...',
@@ -839,6 +851,7 @@ function screenHistory() {
           onclick: async (event) => {
             const values = validateFields([
               { id: titleId, label: 'Proje adi', required: true },
+              { id: operatorId, label: 'Ureten kisi', required: true },
               { id: notesId, label: 'Proje notlari' },
             ]);
             if (!values) return;
@@ -846,7 +859,8 @@ function screenHistory() {
             button.disabled = true;
             const updated = await guard(() => api.request(
               'PATCH', `/api/projects/${project.project_id}`,
-              { body: { title: values[titleId], notes: values[notesId] || '' } }),
+              { body: { title: values[titleId], operator_name: values[operatorId],
+                        notes: values[notesId] || '' } }),
               'Kayit guncellendi');
             button.disabled = false;
             if (updated) await refresh();
@@ -893,10 +907,6 @@ function phase0PlanEditor(phase0, selectedMode) {
     approved ? alertBox('warn', 'Onayli plan duzenlenecek',
       'Kaydetmek mevcut plan onayini gecersiz kilar ve alt faz kapilarini yeniden kapatir.') : null,
     el('div', { class: 'grid grid--2' },
-      inputField({ id: 'plan-by', required: true,
-                   label: isEdit ? 'Plani duzenleyen kisi' : 'Secimi yapan kisi',
-                   attrs: { maxlength: 120, placeholder: 'adin',
-                            value: plan ? (plan.updated_by || plan.selected_by || '') : '' } }),
       inputField({ id: 'plan-count', label: 'Cikti sayisi', type: 'number', required: true,
                    attrs: { min: '1', max: '10', value: decision.output_count || 1 } }),
       inputField({ id: 'plan-duration', label: 'Hedef sure (sn)', type: 'number',
@@ -981,8 +991,6 @@ function phase0PlanEditor(phase0, selectedMode) {
         'data-testid': isEdit ? 'save-plan' : 'create-plan',
         onclick: async (event) => {
           const rules = [
-            { id: 'plan-by', label: isEdit ? 'Plani duzenleyen kisi' : 'Secimi yapan kisi',
-              required: true },
             { id: 'plan-count', label: 'Cikti sayisi', required: true,
               number: true, min: 1, max: 10 },
             { id: 'plan-duration', label: 'Hedef sure', required: true,
@@ -997,7 +1005,7 @@ function phase0PlanEditor(phase0, selectedMode) {
           const button = event.currentTarget;
           button.disabled = true;
           const result = await guard(async () => {
-            const actor = values['plan-by'];
+            const actor = projectActor();
             const body = {
               mode: planMode,
               selected_by: isEdit ? (plan.selected_by || actor) : actor,
@@ -1174,10 +1182,7 @@ function screenPhase0() {
           phase0PlanEditor(phase0, selectedPlanMode),
           approvalPanel('processing_plan', 'Plani onayla'))
       : el('div', { class: 'stack' },
-          requiredLegend(),
-          inputField({ id: 'plan-by', label: 'Secimi yapan kisi', required: true,
-                       hint: 'Mod secimi bir insan karari; adin plana yazilir.',
-                       attrs: { placeholder: 'adin', maxlength: 120 } }),
+          el('div', { class: 'dim', text: `Karari kaydeden: ${projectActor()}` }),
           inputField({ id: 'plan-count', label: 'Cikti sayisi', type: 'number',
                        hint: 'Bos birakilirsa Faz 0 onerisi kullanilir.',
                        attrs: { min: '1', max: '10', placeholder: '1' } }),
@@ -1230,7 +1235,6 @@ function screenPhase0() {
             disabled: !state.selectedMode || !phase0.assessment,
             onclick: async (event) => {
               const rules = [
-                { id: 'plan-by', label: 'Secimi yapan kisi', required: true },
                 { id: 'plan-count', label: 'Cikti sayisi', number: true, min: 1, max: 10 },
                 { id: 'plan-duration', label: 'Hedef sure', number: true, min: 5, max: 180 },
               ];
@@ -1246,7 +1250,7 @@ function screenPhase0() {
               // never silently swapped for a default.
               await guard(() => api.post(`/api/projects/${state.projectId}/plan`, {
                 mode: state.selectedMode,
-                selected_by: values['plan-by'],
+                selected_by: projectActor(),
                 output_count: values['plan-count'],
                 target_duration_sec: values['plan-duration'],
                 theory_angle: values['plan-theory'] || '',
@@ -1442,9 +1446,6 @@ function screenMoments() {
     el('p', { class: 'subtitle',
               text: selectedRank ? `Aday #${selectedRank} secildi.`
                                  : 'Once bir adayi izle ve sec.' }),
-    requiredLegend(),
-    inputField({ id: 'moment-by', label: 'Inceleyen kisi', required: true,
-                 attrs: { placeholder: 'adin', maxlength: 120 } }),
     el('button', {
       class: 'btn btn--primary', 'data-testid': 'save-moment-selection',
       disabled: selectedRank === null || !gate.allowed,
@@ -1452,7 +1453,7 @@ function screenMoments() {
         event.currentTarget.disabled = true;
         await guard(() => api.post(`/api/projects/${state.projectId}/moment-selection`, {
           selected_rank: selectedRank,
-          reviewed_by: document.getElementById('moment-by').value,
+          reviewed_by: projectActor(),
           require_preview: false,
         }), 'Moment secimi kaydedildi');
         await refresh();
@@ -1531,37 +1532,22 @@ function approvalPanel(kind, actionLabel) {
       ? alertBox('danger', 'Onay artik gecerli degil', approval.reason,
           (approval.upstream_invalid || []).length
             ? `Yukari-akis degisti: ${(approval.upstream_invalid || []).join(', ')}. Once onu duzelt.`
-            : 'Icerik onaydan sonra degismis. Yeniden incele ve yeni hash ile onayla.')
+            : 'Icerik onaydan sonra degismis. Yeniden incele ve tekrar onayla.')
       : null,
     approval.blocker ? alertBox('warn', 'Onay engelli', approval.blocker,
       (approval.blocking_conditions || []).join(', ')) : null,
-    approval.content_sha256
-      ? el('div', {},
-          el('h3', { text: 'Incelenen icerigin SHA-256 degeri' }),
-          el('div', { class: 'pre mono', 'data-testid': `hash-${kind}`,
-                      text: approval.content_sha256 }))
-      : null,
     approval.reviewable
       ? el('div', {},
-          requiredLegend(),
-          inputField({ id: `${kind}-hash`, label: 'Yukaridaki hash i buraya yapistir',
-                       required: true,
-                       attrs: { class: 'mono', placeholder: 'sha256…' } }),
-          inputField({ id: `${kind}-by`, label: 'Onaylayan', required: true,
-                       attrs: { placeholder: 'adin', maxlength: 120 } }),
+          el('p', { class: 'dim',
+            text: `Onay ${projectActor()} adina, ekranda inceledigin guncel icerige baglanir.` }),
           el('button', {
             class: 'btn btn--primary', 'data-testid': `approve-${kind}`,
+            disabled: !approval.content_sha256,
             onclick: async (event) => {
-              const values = validateFields([
-                { id: `${kind}-hash`, label: 'Dogrulama hash i',
-                  required: true, minLength: 64 },
-                { id: `${kind}-by`, label: 'Onaylayan', required: true },
-              ]);
-              if (!values) return;
               event.currentTarget.disabled = true;
               await guard(() => api.post(`/api/projects/${state.projectId}/approvals/${kind}`, {
-                reviewed_sha256: values[`${kind}-hash`],
-                approved_by: values[`${kind}-by`],
+                reviewed_sha256: approval.content_sha256,
+                approved_by: projectActor(),
               }), 'Onaylandi');
               await refresh();
             },
@@ -1907,8 +1893,6 @@ function scriptReadingPanel() {
         'Kaydetmek script onayini kaldirir; mevcut seslendirme ve render revizyon '
         + 'arsivine tasinir. Script yeniden onaylandiktan sonra ses ve renderi yeniden uret.'),
       requiredLegend(),
-      inputField({ id: 'script-editor-by', label: 'Duzenleyen kisi', required: true,
-                   attrs: { maxlength: 120, placeholder: 'adin' } }),
       textareaField({ id: 'script-editor-text', label: 'Script metni', required: true,
                       attrs: { maxlength: 20000, 'data-testid': 'script-editor-text',
                                text: data.script_text || '' } }),
@@ -1919,7 +1903,6 @@ function scriptReadingPanel() {
         class: 'btn btn--primary', 'data-testid': 'script-editor-save',
         onclick: async (event) => {
           const values = validateFields([
-            { id: 'script-editor-by', label: 'Duzenleyen kisi', required: true },
             { id: 'script-editor-text', label: 'Script metni', required: true },
             { id: 'script-editor-notes', label: 'Revizyon notu' },
           ]);
@@ -1927,7 +1910,7 @@ function scriptReadingPanel() {
           event.currentTarget.disabled = true;
           const saved = await guard(() => api.request(
             'PATCH', `/api/projects/${state.projectId}/script`, {
-              body: { updated_by: values['script-editor-by'],
+              body: { updated_by: projectActor(),
                       script_text: values['script-editor-text'],
                       notes: values['script-editor-notes'] || '' },
             }), 'Script guncellendi; ses ve render yeniden uretilmeli');
@@ -2153,20 +2136,14 @@ function voiceRerunAction() {
 
 
 
-/* The single reviewer input the checklist AND the revision request both read.
- * Module scope because two panels share it: keeping it local to one of them is
- * how the revision button ended up throwing a ReferenceError on click. */
-const REVIEWER_INPUT_ID = 'render-reviewer';
-
 /* Render review and voice review are the same interaction over different media,
  * so they are ONE component parameterised by kind rather than two that drift.
  * The render ids keep their historical, unprefixed form; voice gets its own. */
 const REVIEW_KINDS = {
   render: {
     viewKey: 'render_review', endpoint: 'render-review',
-    reviewerId: 'render-reviewer', testid: (name) => name,
+    testid: (name) => name,
     mediaNoun: 'video', regeneratedNoun: 'video yeniden uretilirse',
-    reviewerHint: 'Kontrol maddesini isaretlemek bir insan karari.',
     revisionLead: 'Bir sorun gordiysen not birak ve duzeltmenin yapilacagi sekmeye git. '
                   + 'Bu islem videoyu DEGISTIRMEZ ve hicbir durumu onaylamaz.',
     targets: [['moments', 'Moment Explorer (klip araligi / moment secimi)'],
@@ -2177,9 +2154,8 @@ const REVIEW_KINDS = {
   },
   voice: {
     viewKey: 'voice_review', endpoint: 'voice-review',
-    reviewerId: 'voice-reviewer', testid: (name) => `voice-${name}`,
+    testid: (name) => `voice-${name}`,
     mediaNoun: 'ses', regeneratedNoun: 'ses yeniden uretilirse',
-    reviewerHint: 'Sesi DINLEYIP isaretlemek bir insan karari.',
     revisionLead: 'Bir sorun duydysan not birak. Bu islem sesi DEGISTIRMEZ ve '
                   + 'hicbir durumu onaylamaz; duzeltmeyi sen baslatirsin.',
     targets: [['voice', 'Voice Studio (ses/ton/tempo ayari, yeniden uret)'],
@@ -2187,30 +2163,11 @@ const REVIEW_KINDS = {
   },
 };
 
-function reviewerName(kind) {
-  if (state.reviewers[kind]) return state.reviewers[kind];
-  try {
-    const stored = localStorage.getItem(`reviewer:${kind}`);
-    if (stored) { state.reviewers[kind] = stored; return stored; }
-  } catch (error) { /* private mode: fall through to the server value */ }
-  // Server-derived fallback: whoever ticked an item last. Survives a restart
-  // and a different browser, which localStorage alone does not.
-  const review = (state.project && state.project[REVIEW_KINDS[kind].viewKey]) || {};
-  const ticked = (review.items || []).filter(item => item.checked_by);
-  return ticked.length ? ticked[ticked.length - 1].checked_by : '';
-}
-
-function setReviewerName(kind, value) {
-  state.reviewers[kind] = value;
-  try { localStorage.setItem(`reviewer:${kind}`, value); } catch (error) { /* ignore */ }
-}
-
 function reviewChecklist(kind) {
   const config = REVIEW_KINDS[kind];
   const review = (state.project && state.project[config.viewKey]) || {};
   const items = review.items || [];
   if (!items.length) return null;
-  const reviewerId = config.reviewerId;
   return el('div', { class: 'card' },
     el('div', { class: 'card__head' },
       el('h2', { text: 'Insan inceleme listesi' }),
@@ -2230,14 +2187,7 @@ function reviewChecklist(kind) {
                     style: `width:${Math.round(100 * review.done_count / Math.max(1, review.total_count))}%` })),
       el('span', { class: 'dim', 'data-testid': config.testid('checklist-progress'),
                    text: `${review.done_count}/${review.total_count} tamamlandi` })),
-    requiredLegend(),
-    inputField({ id: reviewerId, label: 'Inceleyen kisi', required: true,
-                 hint: config.reviewerHint,
-                 attrs: { 'data-testid': reviewerId, placeholder: 'adin',
-                          maxlength: 120, value: reviewerName(kind),
-                          oninput: (event) => {
-                            setReviewerName(kind, event.currentTarget.value);
-                          } } }),
+    el('div', { class: 'dim', text: `Inceleyen: ${projectActor()}` }),
     el('div', { class: 'checklist' }, items.map(item => el('div', {
       class: `check-item${item.checked ? ' check-item--done' : ''}`
              + `${item.stale ? ' check-item--stale' : ''}`,
@@ -2250,8 +2200,7 @@ function reviewChecklist(kind) {
         onchange: async (event) => {
           const box = event.currentTarget;
           const wanted = box.checked;
-          const who = ((document.getElementById(reviewerId) || {}).value
-                       || reviewerName(kind) || '').trim();
+          const who = projectActor();
           box.disabled = true;
           const result = await guard(() => api.post(
             `/api/projects/${state.projectId}/${config.endpoint}`,
@@ -2317,8 +2266,7 @@ function reviewRevisionPanel(kind) {
               class: 'btn', 'data-testid': config.testid('revision-clear'),
               onclick: async (event) => {
                 event.currentTarget.disabled = true;
-                const who = ((document.getElementById(config.reviewerId) || {}).value
-                             || reviewerName(kind) || 'console').trim();
+                const who = projectActor();
                 await guard(() => api.post(
                   `/api/projects/${state.projectId}/${config.endpoint}`,
                   { action: 'clear_revision', resolved_by: who }),
@@ -2343,7 +2291,6 @@ function reviewRevisionPanel(kind) {
             class: 'btn btn--danger', 'data-testid': config.testid('revision-submit'),
             onclick: async (event) => {
               const values = validateFields([
-                { id: config.reviewerId, label: 'Inceleyen kisi', required: true },
                 { id: notesId, label: 'Revizyon notu', required: true },
               ]);
               if (!values) return;
@@ -2351,7 +2298,7 @@ function reviewRevisionPanel(kind) {
               await guard(() => api.post(
                 `/api/projects/${state.projectId}/${config.endpoint}`, {
                   action: 'request_revision',
-                  requested_by: values[config.reviewerId],
+                  requested_by: projectActor(),
                   notes: values[notesId],
                   target_tab: document.getElementById(
                     `${config.testid('revision')}-target`).value,
@@ -2479,12 +2426,82 @@ function screenRender() {
 }
 
 
+const BATCH_STATE_LABELS = {
+  needs_moment: 'Moment bekliyor',
+  ready_to_render: 'Render edilebilir',
+  needs_review: 'Izlenmeyi bekliyor',
+  needs_revision: 'Revizyon acik',
+  approved: 'Onaylandi',
+};
+
+//: The batch board. Every state, action and blocker shown here is decided by
+//: `PipelineService.batch_state()` on the server -- the browser picks layout and
+//: colour only. Re-deriving "can this slot render?" in JS is how a board starts
+//: offering buttons the pipeline refuses.
+function batchBoard() {
+  const batch = state.project.batch;
+  if (!batch || !batch.slots || batch.slots.length <= 1) return null;
+  const runnable = batch.runnable_slots || [];
+  return el('div', { class: 'card', 'data-testid': 'batch-board' },
+    el('div', { class: 'spread' },
+      el('h2', { text: `Batch: ${batch.output_count} Short` }),
+      el('span', { class: 'dim',
+        text: `${batch.approved_count}/${batch.output_count} onayli - `
+              + `${batch.rendered_count}/${batch.output_count} render edildi` })),
+    batch.render_blocker
+      ? alertBox('warn', 'Render fazi kapali', batch.render_blocker) : null,
+    el('div', { class: 'spread' },
+      el('p', { class: 'dim', text: runnable.length
+        ? `${runnable.length} yuva makine isine hazir (moment secilmis, render bekliyor).`
+        : 'Makine isine hazir yuva yok; sirada bir insan karari var.' }),
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'batch-run',
+        disabled: runnable.length === 0,
+        text: runnable.length ? `${runnable.length} render'i kuyruga al` : 'Kuyruga alinacak yuva yok',
+        onclick: async (event) => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/batch`,
+            { run_request_id: crypto.randomUUID() }));
+          if (result) {
+            pushAlert('info', `${result.submitted_count} render kuyruga alindi`,
+              result.skipped_count
+                ? `${result.skipped_count} yuva atlandi; her biri once bir insan karari bekliyor.`
+                : 'Her yuva kendi dizinine render edilir ve ayri ayri onaylanir.');
+          }
+          await refresh();
+        } })),
+    el('div', { class: 'stack' }, batch.slots.map(slot => el('div', {
+        class: 'moment-card', 'data-testid': `batch-slot-${slot.index}` },
+      el('div', { class: 'spread' },
+        el('strong', { text: `Short ${slot.index}` }),
+        badge(slot.state, BATCH_STATE_LABELS[slot.state] || slot.state)),
+      el('div', { class: 'dim', text: slot.moment_selected
+        ? `Moment rank ${slot.moment_rank}` : 'Moment secilmedi' }),
+      slot.review_total
+        ? el('div', { class: 'dim',
+            text: `Inceleme ${slot.review_checked || 0}/${slot.review_total}` })
+        : null,
+      slot.problem ? el('div', { class: 'dim', text: slot.problem }) : null,
+      slot.video && slot.video.usable
+        ? el('video', { controls: true, preload: 'none',
+            src: `/api/projects/${state.projectId}/media/${slot.video.relative_path}` })
+        : null,
+      slot.next_action
+        ? el('button', { class: 'btn', 'data-testid': `batch-slot-${slot.index}-action`,
+            text: slot.next_action,
+            onclick: () => goto(slot.state === 'needs_moment' ? 'moments' : 'render') })
+        : null))));
+}
+
 function screenOutputs() {
   const outputs = state.project.outputs || [];
   return el('div', {},
     el('div', { class: 'page-head' }, el('div', {},
       el('h1', { text: 'Ciktilar ve gecmis' }),
       el('p', { class: 'subtitle', text: 'Hicbir cikti otomatik yuklenmez veya yayinlanmaz.' }))),
+    batchBoard(),
     el('div', { class: 'card' },
       outputs.length === 0 ? el('div', { class: 'empty', text: 'Henuz cikti yok.' })
         : el('div', { class: 'stack' }, outputs.map(output => el('div', { class: 'moment-card' },

@@ -54,6 +54,27 @@ ARTIFACTS = {
     "render_manifest": "results/render/render_manifest.json",
 }
 
+#: Artifacts a batch produces once PER SHORT. Everything else in ARTIFACTS
+#: describes the project as a whole and is shared by every slot: the source
+#: assessment, the approved plan and the analysis are the common ground all the
+#: Shorts of one project are cut from, and duplicating them per slot would let
+#: two Shorts of the same project disagree about their own source.
+#:
+#: Narration artifacts are absent on purpose: `build_processing_plan` refuses a
+#: `narrated_theory` plan with output_count != 1, so a narrated project has
+#: exactly one slot and its script/voiceover cannot be ambiguous.
+PER_SLOT_ARTIFACTS = frozenset({"moment_selection", "render_manifest"})
+
+#: A full-source scan does not run the window pipeline's stages, so it declares
+#: its own. Showing a window run's "Whisper transkript" stage during a scan that
+#: transcribes several regions would describe work that is not happening.
+FULL_SOURCE_ANALYSIS_STAGES = (
+    {"key": "full_scan", "label": "Tum kaynak taraniyor"},
+    {"key": "region_analysis", "label": "Aday bolgeler inceleniyor"},
+    {"key": "scoring", "label": "Film geneli siralama"},
+    {"key": "previews", "label": "Onizleme klipleri"},
+)
+
 SOURCE_DIRNAME = "source_videos"
 RESULTS_DIRNAME = "results"
 RUNTIME_DIRNAME = ".runtime"
@@ -197,8 +218,29 @@ class PipelineService:
             job_id=job_id, attempt=attempt, stages=stages,
             cancel_check=self._cancel_check)
 
-    def path(self, key: str) -> Path:
-        return self.storage.resolve(self.ownership, ARTIFACTS[key], create_parent=True)
+    def artifact_relative(self, key: str, slot: int = 1) -> str:
+        """Namespace-relative path of an artifact FOR ONE OUTPUT SLOT.
+
+        Only the artifacts a batch produces once per Short are slot-scoped. The
+        source assessment, the plan and the analysis describe the project as a
+        whole and are deliberately shared: re-deriving them per slot would let
+        two Shorts of the same project disagree about the source they came from.
+
+        Slot 1 resolves to the historical path, so every existing project,
+        artifact and test keeps working unchanged.
+        """
+        relative = ARTIFACTS[key]
+        index = int(slot or 1)
+        if index < 1:
+            raise PipelineServiceError(f"gecersiz cikti yuvasi: {slot!r}")
+        if index == 1 or key not in PER_SLOT_ARTIFACTS:
+            return relative
+        name = relative.rsplit("/", 1)[-1]
+        return f"{RESULTS_DIRNAME}/render/output_{index:02d}/{name}"
+
+    def path(self, key: str, slot: int = 1) -> Path:
+        return self.storage.resolve(self.ownership, self.artifact_relative(key, slot),
+                                     create_parent=True)
 
     def relative(self, path) -> str:
         return self.storage.relative_to_namespace(self.ownership, path)
@@ -209,16 +251,16 @@ class PipelineService:
         return self._ffmpeg_bin, self._ffprobe_bin
 
     # -------------------------------------------------------------- artifacts
-    def load_artifact(self, key: str, *, required: bool = False) -> dict:
+    def load_artifact(self, key: str, *, required: bool = False, slot: int = 1) -> dict:
         """Read one artifact and REPORT its trustworthiness.
 
         Returns {'present','data','problem','relative_path'}. A corrupt or
         incompatible artifact yields `data=None` and a human-actionable
         `problem` -- it is never repaired, guessed at, or replaced by a default.
         """
-        relative = ARTIFACTS[key]
-        info = {"key": key, "present": False, "data": None, "problem": None,
-                "relative_path": relative}
+        relative = self.artifact_relative(key, slot)
+        info = {"key": key, "slot": int(slot or 1), "present": False, "data": None,
+                "problem": None, "relative_path": relative}
         try:
             path = self.storage.resolve(self.ownership, relative)
         except StorageViolation as exc:
@@ -289,8 +331,8 @@ class PipelineService:
             return None
         return data if isinstance(data, dict) else None
 
-    def write_artifact(self, key: str, data, *, job_id=None, actor="console") -> str:
-        path = self.path(key)
+    def write_artifact(self, key: str, data, *, job_id=None, actor="console", slot: int = 1) -> str:
+        path = self.path(key, slot)
         atomic_write_json(path, data)
         relative = self.relative(path)
         self.audit.record("artifact.written", actor=actor, job_id=job_id, artifact=relative,
@@ -298,7 +340,9 @@ class PipelineService:
         return relative
 
     # ---------------------------------------------------------------- project
-    def create_project(self, *, title: str, created_by: str) -> dict:
+    def create_project(self, *, title: str, created_by: str,
+                       operator_name: str | None = None) -> dict:
+        operator = str(operator_name or created_by or "console").strip()[:120]
         record = {
             "schema_version": 1,
             "artifact_type": "console_project",
@@ -306,6 +350,7 @@ class PipelineService:
             "title": str(title or "Isimsiz proje").strip()[:200],
             "notes": "",
             "created_by": str(created_by or "console")[:120],
+            "operator_name": operator,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
             "status": "review_required",
@@ -319,7 +364,27 @@ class PipelineService:
                           detail={"title": record["title"]})
         return record
 
-    def update_project(self, *, title: str, notes: str = "", updated_by: str = "console") -> dict:
+    def project_actor(self) -> str:
+        """Return the one persisted human name used throughout this project.
+
+        Legacy projects predate ``operator_name``. Recover a name that the user
+        already entered in an earlier decision instead of asking again.
+        """
+        project = self.load_artifact("project")
+        record = project.get("data") or {}
+        candidates = [record.get("operator_name"), record.get("created_by")]
+        plan = self.load_artifact("processing_plan").get("data") or {}
+        candidates.extend([plan.get("updated_by"), plan.get("selected_by")])
+        selection = self.load_artifact("moment_selection").get("data") or {}
+        candidates.append(selection.get("reviewed_by"))
+        for value in candidates:
+            clean = str(value or "").strip()
+            if clean and clean.lower() not in {"console", "console:manual", "system"}:
+                return clean[:120]
+        return "console"
+
+    def update_project(self, *, title: str, notes: str = "", updated_by: str = "console",
+                       operator_name: str | None = None) -> dict:
         """Edit user-facing project metadata without touching pipeline inputs.
 
         Title/notes are deliberately outside approval hashes: renaming an
@@ -337,6 +402,10 @@ class PipelineService:
             raise PipelineServiceError("proje adi en fazla 200 karakter olabilir")
         if len(clean_notes) > 2000:
             raise PipelineServiceError("proje notu en fazla 2000 karakter olabilir")
+        clean_operator = (str(operator_name).strip()[:120]
+                          if operator_name is not None else None)
+        if operator_name is not None and not clean_operator:
+            raise PipelineServiceError("proje ureticisi bos olamaz")
 
         record = loaded["data"]
         previous_title = record.get("title")
@@ -346,6 +415,8 @@ class PipelineService:
             "updated_by": str(updated_by or "console")[:120],
             "updated_at": _now_iso(),
         })
+        if clean_operator is not None:
+            record["operator_name"] = clean_operator
         self.write_artifact("project", record, actor=updated_by)
         self.audit.record(
             "project.updated",
@@ -804,13 +875,27 @@ class PipelineService:
     }
 
     # ------------------------------------------------------- render review
-    def render_video_digest(self):
+    def render_review_relative(self, slot: int = 1) -> str:
+        """Where THIS slot's checklist lives.
+
+        Each Short is watched separately, so each Short owns its own checklist.
+        Sharing one file would let ticks earned on slot 1 unlock the approval
+        gate of a slot 2 nobody has watched -- the exact failure the checklist
+        exists to prevent.
+        """
+        index = int(slot or 1)
+        if index == 1:
+            return render_review_module.RENDER_REVIEW_ARTIFACT
+        name = render_review_module.RENDER_REVIEW_ARTIFACT.rsplit("/", 1)[-1]
+        return f"{RESULTS_DIRNAME}/render/output_{index:02d}/{name}"
+
+    def render_video_digest(self, slot: int = 1):
         """SHA-256 of the render currently on disk, or None.
 
         The SAME digest the approval gate binds to, so a checklist entry and an
         approval can never disagree about which video was reviewed.
         """
-        loaded = self.load_artifact("render_manifest")
+        loaded = self.load_artifact("render_manifest", slot=slot)
         if not loaded["data"] or loaded["problem"]:
             return None
         try:
@@ -818,64 +903,68 @@ class PipelineService:
         except ValueError:
             return None
 
-    def render_review_state(self) -> dict:
-        review = self.load_artifact_path(render_review_module.RENDER_REVIEW_ARTIFACT)
+    def render_review_state(self, slot: int = 1) -> dict:
+        review = self.load_artifact_path(self.render_review_relative(slot))
         state = render_review_module.evaluate(
-            review, self.render_video_digest(), self.ownership)
+            review, self.render_video_digest(slot), self.ownership)
         state["technical"] = render_review_module.technical_summary(
-            self.load_artifact("render_manifest")["data"])
+            self.load_artifact("render_manifest", slot=slot)["data"])
+        state["slot"] = int(slot or 1)
         return state
 
-    def _save_render_review(self, review: dict) -> dict:
-        path = self.storage.resolve(self.ownership,
-                                     render_review_module.RENDER_REVIEW_ARTIFACT,
+    def _save_render_review(self, review: dict, slot: int = 1) -> dict:
+        path = self.storage.resolve(self.ownership, self.render_review_relative(slot),
                                      create_parent=True)
         atomic_write_json(path, review)
         return review
 
-    def _load_or_new_review(self) -> dict:
-        existing = self.load_artifact_path(render_review_module.RENDER_REVIEW_ARTIFACT)
+    def _load_or_new_review(self, slot: int = 1) -> dict:
+        existing = self.load_artifact_path(self.render_review_relative(slot))
         if isinstance(existing, dict):
             return existing
-        return render_review_module.new_review(self.ownership, self.render_video_digest())
+        return render_review_module.new_review(self.ownership, self.render_video_digest(slot))
 
     def set_render_review_item(self, key: str, *, checked: bool, reviewed_by: str,
-                                note: str = "") -> dict:
-        digest = self.render_video_digest()
+                                note: str = "", slot: int = 1) -> dict:
+        slot = self.require_slot(slot)
+        digest = self.render_video_digest(slot)
         if not digest:
             raise PipelineServiceError(
                 "Incelenecek bir render videosu yok; once render fazini calistir.")
         review = render_review_module.set_item(
-            self._load_or_new_review(), key, checked=checked, video_sha256=digest,
+            self._load_or_new_review(slot), key, checked=checked, video_sha256=digest,
             reviewed_by=reviewed_by, note=note)
-        self._save_render_review(review)
+        self._save_render_review(review, slot)
         self.audit.record("artifact.written", actor=reviewed_by,
-                          artifact=render_review_module.RENDER_REVIEW_ARTIFACT,
-                          detail={"checklist_item": key, "checked": checked})
-        return self.render_review_state()
+                          artifact=self.render_review_relative(slot),
+                          detail={"checklist_item": key, "checked": checked, "slot": slot})
+        return self.render_review_state(slot)
 
     def request_render_revision(self, *, requested_by: str, notes: str,
-                                 target_tab: str = "moments") -> dict:
-        digest = self.render_video_digest()
+                                 target_tab: str = "moments", slot: int = 1) -> dict:
+        slot = self.require_slot(slot)
+        digest = self.render_video_digest(slot)
         if not digest:
             raise PipelineServiceError("Revizyon istenecek bir render videosu yok.")
         review = render_review_module.request_revision(
-            self._load_or_new_review(), video_sha256=digest, requested_by=requested_by,
+            self._load_or_new_review(slot), video_sha256=digest, requested_by=requested_by,
             notes=notes, target_tab=target_tab)
-        self._save_render_review(review)
+        self._save_render_review(review, slot)
         # A revision request is a NOTE: it changes no artifact, no status, and
         # never touches the video.
         self.audit.record("approval.rejected", actor=requested_by,
-                          artifact=render_review_module.RENDER_REVIEW_ARTIFACT,
-                          detail={"revision_requested": True, "target_tab": target_tab})
-        return self.render_review_state()
+                          artifact=self.render_review_relative(slot),
+                          detail={"revision_requested": True, "target_tab": target_tab,
+                                  "slot": slot})
+        return self.render_review_state(slot)
 
-    def clear_render_revision(self, *, resolved_by: str) -> dict:
+    def clear_render_revision(self, *, resolved_by: str, slot: int = 1) -> dict:
+        slot = self.require_slot(slot)
         review = render_review_module.clear_revision(
-            self._load_or_new_review(), video_sha256=self.render_video_digest(),
+            self._load_or_new_review(slot), video_sha256=self.render_video_digest(slot),
             resolved_by=resolved_by)
-        self._save_render_review(review)
-        return self.render_review_state()
+        self._save_render_review(review, slot)
+        return self.render_review_state(slot)
 
     def voice_audio_digest(self):
         """SHA-256 of the voiceover currently on disk, or None.
@@ -974,7 +1063,8 @@ class PipelineService:
         self._save_voice_review(review)
         return self.voice_review_state()
 
-    def approve(self, kind: str, *, reviewed_sha256: str, approved_by: str, notes: str = "") -> dict:
+    def approve(self, kind: str, *, reviewed_sha256: str, approved_by: str, notes: str = "",
+                slot: int = 1) -> dict:
         """Approve through the EXISTING hash-bound gate.
 
         The console cannot approve anything the gate would refuse: it passes the
@@ -984,14 +1074,15 @@ class PipelineService:
         if kind not in self.APPROVAL_ARTIFACTS:
             raise PipelineServiceError(f"bilinmeyen onay turu: {kind!r}")
         key = self.APPROVAL_ARTIFACTS[kind]
-        loaded = self.load_artifact(key, required=True)
+        slot = self.require_slot(slot) if key in PER_SLOT_ARTIFACTS else 1
+        loaded = self.load_artifact(key, required=True, slot=slot)
         if loaded["problem"]:
             raise ArtifactProblem(loaded["problem"])
         if kind in ("render", "voiceover"):
             # The hash proves the reviewer saw (or heard) the bytes; the
             # checklist proves they checked the things that actually go wrong.
             # This ADDS to the canonical gate, it does not replace it.
-            state = (self.render_review_state() if kind == "render"
+            state = (self.render_review_state(slot) if kind == "render"
                      else self.voice_review_state())
             if not state["complete"] or state["open_revision"]:
                 raise PipelineServiceError(
@@ -1002,32 +1093,34 @@ class PipelineService:
                 loaded["data"], kind, reviewed_sha256, approved_by, notes)
         except ValueError as exc:
             self.audit.record("approval.rejected", actor=approved_by,
-                              artifact=ARTIFACTS[key], detail={"kind": kind, "reason": str(exc)})
+                              artifact=self.artifact_relative(key, slot),
+                              detail={"kind": kind, "reason": str(exc), "slot": slot})
             raise PipelineServiceError(str(exc)) from None
-        relative = self.write_artifact(key, approved, actor=approved_by)
+        relative = self.write_artifact(key, approved, actor=approved_by, slot=slot)
         self.audit.record("approval.granted", actor=approved_by, artifact=relative,
-                          detail={"kind": kind,
+                          detail={"kind": kind, "slot": slot,
                                    "approved_content_sha256":
                                        approved["human_approval"]["approved_content_sha256"]})
         return approved
 
-    def approval_state(self, kind: str) -> dict:
+    def approval_state(self, kind: str, slot: int = 1) -> dict:
         """Live approval validity, re-derived from current content every time."""
         key = self.APPROVAL_ARTIFACTS[kind]
-        loaded = self.load_artifact(key)
+        slot = int(slot or 1) if key in PER_SLOT_ARTIFACTS else 1
+        loaded = self.load_artifact(key, slot=slot)
         if loaded["problem"]:
-            return {"kind": kind, "present": True, "valid": False, "approved": False,
-                    "reason": loaded["problem"]}
+            return {"kind": kind, "slot": slot, "present": True, "valid": False,
+                    "approved": False, "reason": loaded["problem"]}
         if not loaded["data"]:
-            return {"kind": kind, "present": False, "valid": False, "approved": False,
-                    "reason": "artefakt henuz uretilmedi"}
+            return {"kind": kind, "slot": slot, "present": False, "valid": False,
+                    "approved": False, "reason": "artefakt henuz uretilmedi"}
         state = approval.check_approval(loaded["data"], kind)
         try:
             review = approval.describe_for_review(kind, loaded["data"])
         except Exception as exc:  # noqa: BLE001 - review must never crash the page
             review = {"reviewable": False, "blocker": str(exc), "content_sha256": None}
         return {
-            "kind": kind, "present": True,
+            "kind": kind, "slot": slot, "present": True,
             "status": loaded["data"].get("status"),
             "approved": state["approved"], "valid": state["valid"], "reason": state["reason"],
             "content_sha256": review.get("content_sha256"),
@@ -1036,7 +1129,7 @@ class PipelineService:
             "blocking_conditions": review.get("blocking_conditions") or [],
         }
 
-    def approval_chain(self) -> dict:
+    def approval_chain(self, slot: int = 1) -> dict:
         """Approval validity INCLUDING upstream dependencies.
 
         A per-artifact hash check is not enough. Approving a script, then editing
@@ -1046,11 +1139,16 @@ class PipelineService:
         change anywhere upstream invalidates everything downstream, so validity is
         computed along the chain:
 
-            processing_plan -> [moment_selection] -> script -> voiceover -> render
+            processing_plan -> [slot moment_selection] -> script -> voiceover -> slot render
 
         `script`/`voiceover` are only in the chain for `narrated_theory`; in
         `direct_clip_series` they are never produced and their absence must not
         invalidate the render.
+
+        The chain is evaluated FOR ONE SLOT. Each Short has its own moment
+        selection and its own render, so slot 2's render approval must not be
+        invalidated by slot 3's stale selection -- they are independent Shorts
+        that happen to share a source, a plan and an analysis.
 
         NOTHING is deleted here. The artifacts, their `human_approval` blocks and
         the audit trail all stay exactly as they were -- this only reports that an
@@ -1069,7 +1167,7 @@ class PipelineService:
         # The moment selection is upstream of everything after the plan even
         # though it is not an approvable "kind": a stale selection means the
         # script/render were built from a moment that no longer exists.
-        selection = self.load_artifact("moment_selection")
+        selection = self.load_artifact("moment_selection", slot=slot)
         hot = self.load_artifact("hot_moments")
         selection_problem = None
         if selection["problem"]:
@@ -1082,7 +1180,7 @@ class PipelineService:
 
         states = {}
         for kind in chain:
-            state = self.approval_state(kind)
+            state = self.approval_state(kind, slot)
             problems = list(upstream_problems)
             if kind != "processing_plan" and selection_problem:
                 problems.append(selection_problem)
@@ -1101,7 +1199,7 @@ class PipelineService:
                 upstream_problems.append("processing_plan onayi gecerli degil")
 
         for kind in self.APPROVAL_ARTIFACTS:
-            states.setdefault(kind, {**self.approval_state(kind),
+            states.setdefault(kind, {**self.approval_state(kind, slot),
                                       "upstream_invalid": [], "effective_valid": False,
                                       "in_chain": False})
             states[kind].setdefault("in_chain", kind in chain)
@@ -1111,12 +1209,25 @@ class PipelineService:
         """Approvals that were granted but no longer bind -- their own content or
         anything upstream of them changed.
 
+        Every slot is checked: a batch can have one Short whose approval still
+        binds and another whose source moment was re-analysed underneath it.
+
         Reported, never deleted: the audit trail of the original approval stays
         intact even after it stops being valid.
         """
         stale = []
-        for kind, state in self.approval_chain().items():
-            if state.get("approved") and not state.get("effective_valid"):
+        seen = set()
+        for index in self.slot_indexes():
+            for kind, state in self.approval_chain(index).items():
+                if not (state.get("approved") and not state.get("effective_valid")):
+                    continue
+                # Project-wide approvals (plan, script, voiceover) are identical
+                # for every slot; reporting them once per Short would turn one
+                # stale plan into N identical warnings.
+                marker = (kind, state.get("slot") if kind == "render" else None)
+                if marker in seen:
+                    continue
+                seen.add(marker)
                 stale.append(state)
         return stale
 
@@ -1132,19 +1243,74 @@ class PipelineService:
         if not allowed:
             raise PipelineServiceError(reason)
 
+    # ------------------------------------------------------------ output slots
+    def slot_count(self) -> int:
+        """How many Shorts the APPROVED plan asks for (1 when there is no plan).
+
+        Read from `outputs` rather than `decision.output_count` so the slots the
+        engine walks are exactly the slots the plan describes, directories
+        included.
+        """
+        plan = self.load_artifact("processing_plan")["data"] or {}
+        slots = plan.get("outputs") or []
+        return max(1, len(slots))
+
+    def slot_indexes(self) -> list:
+        return list(range(1, self.slot_count() + 1))
+
+    def require_slot(self, slot: int) -> int:
+        """Reject a slot the approved plan does not define.
+
+        Without this an out-of-range slot would quietly create
+        `results/render/output_47/` and render a Short nobody planned -- outside
+        every count the plan, the batch board and the approval chain reason about.
+        """
+        try:
+            index = int(slot)
+        except (TypeError, ValueError):
+            raise PipelineServiceError(f"gecersiz cikti yuvasi: {slot!r}") from None
+        total = self.slot_count()
+        if not 1 <= index <= total:
+            raise PipelineServiceError(
+                f"cikti yuvasi {index} bu planda yok (plan {total} cikti tanimliyor)")
+        return index
+
+    def slot_moment_rank(self, slot: int):
+        """The moment rank this slot's plan entry pre-assigned, or None."""
+        plan = self.load_artifact("processing_plan")["data"] or {}
+        for entry in (plan.get("outputs") or []):
+            if int(entry.get("index") or 0) == int(slot):
+                return entry.get("moment_rank")
+        return None
+
     # ------------------------------------------------------------ pipeline
     def run_video_analysis(self, *, clip_start_sec=0, clip_duration_sec=240,
                            focus_region=None, clip_duration_min=None,
-                           custom_start_min=None,
+                           custom_start_min=None, analysis_scope="window",
                            whisper_model_size="small", scene_detector="content",
                            top_n=5, job_id=None, actor="console") -> dict:
         self.require_phase("video_analysis")
-        tracker = self.tracker("video_analysis", job_id=job_id)
+        # The two scopes genuinely have different stages. Declaring the real ones
+        # keeps the panel honest: a window run must not display a "region" stage
+        # it will never enter, and a full scan must not be described as a single
+        # clip extraction.
+        tracker = self.tracker(
+            "video_analysis", job_id=job_id,
+            stages=FULL_SOURCE_ANALYSIS_STAGES if analysis_scope == "full_source" else None)
         tracker.start("Video analizi basladi")
         try:
             assessment = self.load_artifact("source_assessment", required=True)
             source_duration = (((assessment.get("data") or {}).get("source") or {})
                                .get("duration_sec"))
+            if analysis_scope == "full_source":
+                return self._run_full_source_analysis(
+                    tracker, source_duration_sec=source_duration,
+                    whisper_model_size=whisper_model_size, scene_detector=scene_detector,
+                    top_n=top_n, job_id=job_id, actor=actor)
+            if analysis_scope != "window":
+                raise PipelineServiceError(
+                    f"bilinmeyen analiz kapsami: {analysis_scope!r} "
+                    "(beklenen: window, full_source)")
             clip_start_sec, clip_duration_sec = video_analysis.resolve_analysis_range(
                 source_duration_sec=source_duration,
                 focus_region=focus_region,
@@ -1163,6 +1329,38 @@ class PipelineService:
             tracker.fail(f"{type(exc).__name__}: {exc}")
             raise
 
+    def _run_full_source_analysis(self, tracker, *, source_duration_sec,
+                                  whisper_model_size, scene_detector, top_n,
+                                  job_id, actor) -> dict:
+        """Scan the WHOLE source instead of one window.
+
+        A batch of N Shorts cut from one 240-second window would be N variations
+        of the same scene. Producing N genuinely different Shorts from a feature
+        film requires candidates from the whole film, which is what this scope is
+        for.
+        """
+        if not source_duration_sec:
+            raise PipelineServiceError(
+                "Tam kaynak taramasi icin video suresi bilinmiyor; once kaynak "
+                "degerlendirmesini calistir.")
+        source = self.source_path()
+        ffmpeg_bin, _ = self.binaries()
+        runtime_dir = self.storage.resolve(self.ownership, RUNTIME_DIRNAME, create_parent=True)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "moment_previews",
+                                            create_parent=True)
+        data = video_analysis.run_full_source_analysis(
+            ffmpeg_bin, source, runtime_dir,
+            source_duration_sec=float(source_duration_sec),
+            whisper_model_size=whisper_model_size, scene_detector=scene_detector,
+            top_n=top_n, preview_dir=preview_dir, progress=tracker,
+        )
+        self.write_artifact("hot_moments", data, job_id=job_id, actor=actor)
+        tracker.finish(
+            message=f"{len(data.get('hot_moments') or [])} aday moment "
+                    f"({(data.get('full_source_scan') or {}).get('regions_scanned', 0)} bolge)")
+        return data
+
     def _run_video_analysis(self, tracker, *, clip_start_sec, clip_duration_sec,
                             focus_region, clip_duration_min, custom_start_min,
                             whisper_model_size, scene_detector, top_n, job_id, actor) -> dict:
@@ -1178,6 +1376,7 @@ class PipelineService:
             scene_detector=scene_detector, top_n=top_n, preview_dir=preview_dir,
             progress=tracker, adaptive_candidate_windows=True,
         )
+        data["analysis_scope"] = "window"
         if focus_region:
             data.setdefault("candidate_request", {}).update({
                 "focus_region": focus_region,
@@ -1193,18 +1392,39 @@ class PipelineService:
 
     def record_moment_selection(self, *, selected_rank: int, reviewed_by: str,
                                 rejected_ranks=None, notes: str = "",
-                                require_preview: bool = True) -> dict:
+                                require_preview: bool = True, slot: int = 1) -> dict:
         self.require_phase("moment_selection")
+        self.require_slot(slot)
         hot = self.load_artifact("hot_moments", required=True)
         if hot["problem"]:
             raise ArtifactProblem(hot["problem"])
+        taken = self.moment_rank_owner(selected_rank, slot)
+        if taken is not None:
+            raise PipelineServiceError(
+                f"rank {selected_rank} zaten {taken}. cikti yuvasi icin secilmis; "
+                "her Short farkli bir moment kullanmali")
         selection = video_analysis.build_moment_selection(
             hot["data"], selected_moment_rank=selected_rank, reviewed_by=reviewed_by,
             rejected_moment_ranks=rejected_ranks, review_notes=notes,
             require_preview=require_preview,
         )
-        self.write_artifact("moment_selection", selection, actor=reviewed_by)
+        self.write_artifact("moment_selection", selection, actor=reviewed_by, slot=slot)
         return selection
+
+    def moment_rank_owner(self, rank: int, slot: int):
+        """Index of another slot that already selected `rank`, or None.
+
+        Producing the same moment twice in one batch is almost always a mistake
+        rather than an intent, and it is invisible until both Shorts are rendered
+        and watched. It is rejected at selection time, where the fix is one click.
+        """
+        for other in self.slot_indexes():
+            if int(other) == int(slot):
+                continue
+            existing = self.load_artifact("moment_selection", slot=other)["data"]
+            if existing and existing.get("selected_moment_rank") == int(rank):
+                return int(other)
+        return None
 
     def run_script_generation(self, *, job_id=None, actor="console",
                               enable_google_model_fallback: bool = True,
@@ -1363,17 +1583,18 @@ class PipelineService:
     def run_render(self, *, render_mode="blurred_background", preview_mode=True,
                    subtitle_whisper_model_size="small", subtitle_language="auto",
                    caption_style="active_word_yellow", caption_theme="auto",
-                   job_id=None, actor="console") -> dict:
+                   job_id=None, actor="console", slot=1) -> dict:
         self.require_phase("render")
+        slot = self.require_slot(slot)
         tracker = self.tracker("render", job_id=job_id)
-        tracker.start("Render basladi")
+        tracker.start(f"Render basladi (cikti {slot})" if slot > 1 else "Render basladi")
         try:
             return self._run_render(
                 tracker, render_mode=render_mode, preview_mode=preview_mode,
                 subtitle_whisper_model_size=subtitle_whisper_model_size,
                 subtitle_language=subtitle_language,
                 caption_style=caption_style, caption_theme=caption_theme,
-                job_id=job_id, actor=actor)
+                job_id=job_id, actor=actor, slot=slot)
         except Exception as exc:  # noqa: BLE001
             tracker.fail(f"{type(exc).__name__}: {exc}")
             raise
@@ -1381,7 +1602,7 @@ class PipelineService:
     def _run_render(self, tracker, *, render_mode, preview_mode,
                     subtitle_whisper_model_size, subtitle_language,
                     caption_style, caption_theme,
-                    job_id, actor) -> dict:
+                    job_id, actor, slot=1) -> dict:
         plan = self.load_artifact("processing_plan", required=True)
         if plan["problem"]:
             raise ArtifactProblem(plan["problem"])
@@ -1398,18 +1619,17 @@ class PipelineService:
         hot = self.load_artifact("hot_moments", required=True)
         if hot["problem"]:
             raise ArtifactProblem(hot["problem"])
-        render_dir = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
-                                           create_parent=True)
+        render_dir = self.slot_render_dir(slot)
         pipeline_mode = plan["data"]["pipeline_mode"]
 
         if pipeline_mode == "original_audio_subtitles":
-            selection = self.load_artifact("moment_selection", required=True)
+            selection = self.load_artifact("moment_selection", required=True, slot=slot)
             if selection["problem"]:
                 raise ArtifactProblem(selection["problem"])
             manifest = render_utils.run_original_audio_subtitle_pipeline(
                 hot["data"], selection["data"],
                 self.relative(self.path("hot_moments")),
-                self.relative(self.path("moment_selection")),
+                self.relative(self.path("moment_selection", slot)),
                 render_dir=render_dir, render_mode=render_mode, preview_mode=preview_mode,
                 subtitle_whisper_model_size=subtitle_whisper_model_size,
                 subtitle_language=subtitle_language,
@@ -1432,7 +1652,8 @@ class PipelineService:
                 source_video_path_override=str(self.source_path()),
                 progress=tracker,
             )
-        self.write_artifact("render_manifest", manifest, job_id=job_id, actor=actor)
+        manifest["output_slot"] = int(slot)
+        self.write_artifact("render_manifest", manifest, job_id=job_id, actor=actor, slot=slot)
         # A render that failed technical validation is NOT a completed render,
         # and the panel must not claim otherwise.
         if manifest.get("status") == "failed":
@@ -1442,6 +1663,20 @@ class PipelineService:
             details = ((manifest.get("output") or {}).get("validation") or {}).get("details") or {}
             tracker.finish(message=f"{details.get('resolution', 'video')} hazir, inceleme bekliyor")
         return manifest
+
+    def slot_render_dir(self, slot: int = 1):
+        """Filesystem directory this slot renders into.
+
+        Derived from the same rule as `artifact_relative`, so a slot's manifest
+        and its video, subtitles and ASS file can never end up in different
+        directories.
+        """
+        index = int(slot or 1)
+        if index == 1:
+            return self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
+                                         create_parent=True)
+        return self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
+                                     f"output_{index:02d}", create_parent=True)
 
     # ------------------------------------------------------------- helpers
     def _call(self, factory):
@@ -1462,34 +1697,92 @@ class PipelineService:
         than listing it as a downloadable output.
         """
         results = []
-        plan = self.load_artifact("processing_plan")["data"] or {}
-        slots = plan.get("outputs") or []
-        manifest = self.load_artifact("render_manifest")
-        primary = {
-            "index": 1,
-            "relative_path": ARTIFACTS["render_manifest"],
-            "status": None, "problem": manifest["problem"], "video": None,
-        }
-        if manifest["data"]:
-            primary["status"] = manifest["data"].get("status")
-            video_path = (manifest["data"].get("output") or {}).get("final_video_path")
-            primary["video"] = self._describe_media(video_path)
-            if manifest["data"].get("status") in ("completed", "approved", "review_required") \
-                    and primary["video"] and not primary["video"]["usable"]:
-                primary["problem"] = (
-                    f"manifest '{manifest['data'].get('status')}' diyor ama video kullanilamaz: "
-                    f"{primary['video']['problem']}"
-                )
-        results.append(primary)
-        for slot in slots[1:]:
-            results.append({
-                "index": slot.get("index"),
-                "relative_path": slot.get("render_manifest_path"),
-                "status": "insufficient_data",
-                "problem": "bu cikti yuvasi icin ayri, insan onayli moment secimi gerekiyor",
+        for index in self.slot_indexes():
+            manifest = self.load_artifact("render_manifest", slot=index)
+            selection = self.load_artifact("moment_selection", slot=index)
+            entry = {
+                "index": index,
+                "relative_path": self.artifact_relative("render_manifest", index),
+                "status": None,
+                "problem": manifest["problem"] or selection["problem"],
                 "video": None,
-            })
+                "moment_rank": (selection["data"] or {}).get("selected_moment_rank"),
+                "moment_selected": bool(selection["data"]),
+                "planned_moment_rank": self.slot_moment_rank(index),
+            }
+            if manifest["data"]:
+                entry["status"] = manifest["data"].get("status")
+                video_path = (manifest["data"].get("output") or {}).get("final_video_path")
+                entry["video"] = self._describe_media(video_path)
+                if manifest["data"].get("status") in ("completed", "approved", "review_required") \
+                        and entry["video"] and not entry["video"]["usable"]:
+                    entry["problem"] = (
+                        f"manifest '{manifest['data'].get('status')}' diyor ama video kullanilamaz: "
+                        f"{entry['video']['problem']}"
+                    )
+            elif not entry["problem"]:
+                # Distinguish "waiting for a human decision" from "rendered and
+                # broken": the batch board offers a different action for each.
+                entry["status"] = "insufficient_data"
+                entry["problem"] = (
+                    "bu cikti yuvasi icin moment secilmedi"
+                    if not entry["moment_selected"]
+                    else "moment secildi, render henuz calistirilmadi"
+                )
+            results.append(entry)
         return results
+
+    def batch_state(self) -> dict:
+        """What the batch board shows and what the batch queue may run.
+
+        One place decides, for every slot, whether it is waiting on a human, ready
+        for the machine, or finished -- so the board, the queue and the automation
+        engine can never disagree about which Shorts are runnable.
+        """
+        plan = self.load_artifact("processing_plan")["data"] or {}
+        decision = plan.get("decision") or {}
+        plan_ok = self.approval_state("processing_plan").get("valid")
+        render_allowed, render_reason = self.plan_gate("render")
+
+        slots = []
+        for entry in self.outputs():
+            index = entry["index"]
+            chain = self.approval_chain(index)
+            render_state = chain.get("render") or {}
+            review = self.render_review_state(index)
+            rendered = bool(entry.get("video") and entry["video"].get("usable"))
+            if not entry.get("moment_selected"):
+                state, action = "needs_moment", "Moment sec"
+            elif not rendered:
+                state, action = "ready_to_render", "Render et"
+            elif render_state.get("approved") and render_state.get("effective_valid"):
+                state, action = "approved", None
+            elif review.get("open_revision"):
+                state, action = "needs_revision", "Revizyonu gider"
+            else:
+                state, action = "needs_review", "Izle ve onayla"
+            slots.append({
+                **entry,
+                "state": state,
+                "next_action": action,
+                "runnable": state == "ready_to_render" and bool(render_allowed) and bool(plan_ok),
+                "review_checked": review.get("done_count"),
+                "review_total": review.get("total_count"),
+                "review_complete": review.get("complete"),
+                "approved": state == "approved",
+            })
+        return {
+            "mode": decision.get("mode"),
+            "output_count": len(slots),
+            "plan_approved": bool(plan_ok),
+            "render_allowed": bool(render_allowed),
+            "render_blocker": None if render_allowed else render_reason,
+            "slots": slots,
+            "runnable_slots": [s["index"] for s in slots if s["runnable"]],
+            "approved_count": sum(1 for s in slots if s["approved"]),
+            "rendered_count": sum(1 for s in slots
+                                  if s.get("video") and s["video"].get("usable")),
+        }
 
     def _describe_media(self, path) -> dict:
         info = {"relative_path": None, "size_bytes": 0, "usable": False, "problem": None}

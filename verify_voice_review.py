@@ -304,7 +304,10 @@ def section_revision(app, ownership, service):
 
     status, payload = call(app, "POST", f"/api/projects/{pid}/voice-review", {
         "action": "request_revision", "requested_by": "", "notes": "x"})
-    check(status == 400, "revision-requires-human", f"HTTP {status}")
+    check(status == 200, "revision-reuses-project-operator", f"HTTP {status}")
+    check(payload["voice_review"]["open_revision"]["requested_by"] == "test",
+          "revision-signed-by-project-operator",
+          str(payload["voice_review"]["open_revision"].get("requested_by")))
     status, payload = call(app, "POST", f"/api/projects/{pid}/voice-review", {
         "action": "request_revision", "requested_by": "d", "notes": ""})
     check(status == 400, "revision-requires-note", f"HTTP {status}")
@@ -386,7 +389,7 @@ def section_frontend():
             ("function reviewApprovalSection(kind", "shared-approval-gate"),
             ("function voiceRerunAction()", "rerun-panel"),
             ("data-testid': 'voice-rerun-tts'", "rerun-action"),
-            ("reviewerName(kind)", "reviewer-persistence")):
+            ("function projectActor()", "project-operator-reuse")):
         check(needle in js, f"js-{label}", f"{needle!r} yok")
     # The render panels must be delegations now, not a second implementation.
     check(js.count("action: 'set_item'") == 1, "single-checklist-implementation",
@@ -394,7 +397,8 @@ def section_frontend():
     check("return reviewChecklist('render');" in js, "render-delegates", "")
     check("crossorigin" in js and "/media/" in js, "player-uses-media-route",
           "oynatici medya rotasini kullanmiyor")
-    check("localStorage" in js, "reviewer-survives-refresh", "")
+    check("voice-reviewer" not in js and "render-reviewer" not in js,
+          "no-repeated-reviewer-inputs", "tekrar isim alanlari geri geldi")
     check(".voice-player audio" in css, "player-style", "oynatici stili yok")
     check(js.count("approvalPanel(approvalKind, actionLabel)") == 1
           and js.count("review.complete && !review.open_revision") == 1,

@@ -471,9 +471,19 @@ def score_hot_moments(transcript_segments: list[dict], times, rms, scene_boundar
 
 
 def generate_preview_clips(ffmpeg_bin: str, video_path, hot_moments: list[dict], preview_dir,
-                           progress=None) -> None:
+                           progress=None, time_field: str = "aligned") -> None:
     """Cuts a fast 720p preview clip per hot moment into preview_dir, mutating
-    each moment dict in place with 'preview_path' (or 'preview_error')."""
+    each moment dict in place with 'preview_path' (or 'preview_error').
+
+    ``time_field`` selects which timeline ``video_path`` is on. The default
+    "aligned" keeps every existing caller unchanged: offsets are read as 0-based
+    positions inside the trimmed analysis clip. Full-source analysis has no
+    single analysis clip, so it passes the raw video with "source" and the
+    absolute ``source_*_sec`` offsets are used instead.
+    """
+    if time_field not in ("aligned", "source"):
+        raise ValueError(f"bilinmeyen time_field: {time_field!r} (beklenen: aligned, source)")
+    start_key, end_key = f"{time_field}_start_sec", f"{time_field}_end_sec"
     report = progress if progress is not None else _NullProgress()
     preview_dir = Path(preview_dir)
     preview_dir.mkdir(parents=True, exist_ok=True)
@@ -482,10 +492,10 @@ def generate_preview_clips(ffmpeg_bin: str, video_path, hot_moments: list[dict],
     for done, moment in enumerate(hot_moments, start=1):
         preview_path = preview_dir / f"hot_moment_{moment['rank']:02d}.mp4"
         moment["preview_path"] = None
-        preview_duration = moment["aligned_end_sec"] - moment["aligned_start_sec"]
+        preview_duration = moment[end_key] - moment[start_key]
         cmd = [
             ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", str(moment["aligned_start_sec"]), "-i", str(video_path),
+            "-ss", str(moment[start_key]), "-i", str(video_path),
             "-t", str(preview_duration),
             "-vf", "scale=-2:720", "-c:v", "libx264", "-preset", "ultrafast",
             "-c:a", "aac", "-movflags", "+faststart", str(preview_path),
@@ -498,6 +508,427 @@ def generate_preview_clips(ffmpeg_bin: str, video_path, hot_moments: list[dict],
         # A genuine count of finished clips -- the one place in analysis where a
         # real percentage exists.
         report.count(done, total, unit="klip", message=f"{done}/{total} onizleme")
+
+
+#: Full-source scan tuning. A region is the unit pass 2 transcribes, so it has
+#: to be long enough to contain a whole moment plus its scene context, and short
+#: enough that transcribing a handful of them stays far cheaper than
+#: transcribing the entire film.
+FULL_SCAN_REGION_DURATION_SEC = 180.0
+#: Scan more regions than the caller wants moments: the loudest region does not
+#: always contain the best moment once speech and scene signals are known.
+FULL_SCAN_REGION_MULTIPLIER = 2
+FULL_SCAN_MAX_REGIONS = 12
+FULL_SCAN_MOMENTS_PER_REGION = 3
+#: Weight of the globally comparable energy signal when merging candidates that
+#: were each scored inside their own region. See `_merge_region_moments`.
+FULL_SCAN_GLOBAL_ENERGY_WEIGHT = 0.4
+
+
+def extract_full_audio(ffmpeg_bin: str, raw_video_path, audio_out_path, progress=None) -> None:
+    """Extract the WHOLE source's audio as 16kHz mono PCM in one pass.
+
+    Pass 1 of a full-source scan needs to see the entire film, and audio is the
+    only signal cheap enough to compute over hours of video. Raises RuntimeError
+    with truncated stderr when the source has no usable audio stream.
+    """
+    audio_out_path = Path(audio_out_path)
+    audio_out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(raw_video_path), "-vn", "-map", "0:a:0",
+        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(audio_out_path),
+    ]
+    report = progress if progress is not None else _NullProgress()
+    proc = _run_process_checked(cmd, report)
+    if proc.returncode != 0:
+        raise RuntimeError(f"kaynak sesi cikarilamadi: {proc.stderr[-3000:]}")
+
+
+def scan_audio_energy_profile(audio_path, frame_sec: float = 1.0) -> dict:
+    """Coarse RMS energy per `frame_sec` across an entire WAV, read in blocks.
+
+    Deliberately does NOT use librosa: loading a two-hour 16kHz track as one
+    float array costs hundreds of megabytes, and pass 1 only needs a
+    one-sample-per-second envelope. Reading block by block keeps memory flat
+    regardless of source length.
+    """
+    import wave
+
+    if float(frame_sec) <= 0:
+        raise ValueError("frame_sec 0'dan buyuk olmali")
+    times: list[float] = []
+    energies: list[float] = []
+    with wave.open(str(audio_path), "rb") as stream:
+        channels = stream.getnchannels()
+        width = stream.getsampwidth()
+        rate = stream.getframerate()
+        if width != 2:
+            raise ValueError(f"beklenen 16-bit PCM, bulunan {width * 8}-bit")
+        if rate <= 0:
+            raise ValueError("gecersiz ornekleme hizi")
+        block_frames = max(1, int(rate * float(frame_sec)))
+        consumed = 0
+        while True:
+            raw = stream.readframes(block_frames)
+            if not raw:
+                break
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if channels > 1:
+                usable = (samples.size // channels) * channels
+                samples = samples[:usable].reshape(-1, channels).mean(axis=1)
+            if samples.size == 0:
+                break
+            times.append(round(consumed / float(rate), 3))
+            energies.append(float(np.sqrt(np.mean(np.square(samples)))))
+            consumed += samples.size
+    return {
+        "times": np.asarray(times, dtype=float),
+        "rms": np.asarray(energies, dtype=float),
+        "frame_sec": float(frame_sec),
+        "duration_sec": round(float(times[-1] + frame_sec), 3) if times else 0.0,
+    }
+
+
+def _mean_energy(profile: dict, start_sec: float, end_sec: float):
+    """Mean coarse energy over an absolute source range, or None when unknown."""
+    times, rms = profile.get("times"), profile.get("rms")
+    if times is None or rms is None or len(times) == 0:
+        return None
+    mask = (times >= float(start_sec)) & (times < float(end_sec))
+    if not bool(mask.any()):
+        return None
+    return float(np.mean(rms[mask]))
+
+
+def select_candidate_regions(profile: dict, *, source_duration_sec: float,
+                             region_duration_sec: float = FULL_SCAN_REGION_DURATION_SEC,
+                             region_count: int = 4) -> list[dict]:
+    """Pick the regions pass 2 will transcribe, loudest first, non-overlapping.
+
+    Falls back to regions spread evenly across the film when there is no usable
+    energy profile (silent or audio-less source). The fallback is REPORTED on
+    every region as `selection_policy`, never silently mistaken for a signal.
+    """
+    source_duration = float(source_duration_sec or 0.0)
+    if source_duration <= 0:
+        raise ValueError("tam kaynak taramasi icin video suresi bilinmiyor")
+    region_count = max(1, int(region_count))
+    region_duration = min(float(region_duration_sec), source_duration)
+    if region_duration <= 0:
+        raise ValueError("bolge suresi 0'dan buyuk olmali")
+
+    times, rms = profile.get("times"), profile.get("rms")
+    has_energy = (times is not None and rms is not None and len(times) > 0
+                  and float(np.ptp(rms)) > 1e-9)
+
+    if not has_energy:
+        slots = min(region_count, max(1, int(source_duration // region_duration) or 1))
+        span = source_duration / slots
+        regions = []
+        for index in range(slots):
+            start = min(index * span, max(0.0, source_duration - region_duration))
+            regions.append({
+                "index": index + 1,
+                "start_sec": round(max(0.0, start), 3),
+                "duration_sec": round(min(region_duration, source_duration - start), 3),
+                "mean_rms": None,
+                "selection_policy": "uniform_fallback",
+            })
+        return regions
+
+    stride = max(region_duration / 2.0, 1.0)
+    windows = []
+    start = 0.0
+    while start < source_duration:
+        end = min(start + region_duration, source_duration)
+        if end - start >= min(region_duration, source_duration) * 0.5:
+            energy = _mean_energy(profile, start, end)
+            if energy is not None:
+                windows.append({"start_sec": start, "end_sec": end, "mean_rms": energy})
+        if end >= source_duration:
+            break
+        start += stride
+
+    if not windows:
+        windows = [{"start_sec": 0.0,
+                    "end_sec": min(region_duration, source_duration),
+                    "mean_rms": _mean_energy(profile, 0.0, region_duration)}]
+
+    chosen: list[dict] = []
+    for candidate in sorted(windows, key=lambda item: item["mean_rms"], reverse=True):
+        overlaps = any(
+            candidate["start_sec"] < picked["end_sec"] and picked["start_sec"] < candidate["end_sec"]
+            for picked in chosen
+        )
+        if overlaps:
+            continue
+        chosen.append(candidate)
+        if len(chosen) == region_count:
+            break
+
+    chosen.sort(key=lambda item: item["start_sec"])
+    return [
+        {
+            "index": index + 1,
+            "start_sec": round(float(item["start_sec"]), 3),
+            "duration_sec": round(float(item["end_sec"] - item["start_sec"]), 3),
+            "mean_rms": round(float(item["mean_rms"]), 6),
+            "selection_policy": "audio_energy",
+        }
+        for index, item in enumerate(chosen)
+    ]
+
+
+def _merge_region_moments(region_moments: list[dict], profile: dict, top_n: int) -> list[dict]:
+    """Rank candidates that were each scored INSIDE their own region.
+
+    `score_hot_moments` min-max normalizes its components against the other
+    windows of the same clip, so a 92 from a quiet region and a 92 from the
+    film's loudest region do not mean the same thing. Comparing them directly
+    would silently favour whichever region happened to be most internally
+    varied. The merge therefore blends each candidate's region score with the
+    one signal that IS absolute across the whole film -- its coarse energy from
+    pass 1 -- and records both inputs on the moment so the ranking stays
+    auditable. With no usable energy profile the region score is used alone and
+    `global_energy_score` stays None rather than being invented.
+    """
+    energies = []
+    for moment in region_moments:
+        energies.append(_mean_energy(profile, moment["source_start_sec"], moment["source_end_sec"]))
+    known = [value for value in energies if value is not None]
+    spread = (max(known) - min(known)) if known else 0.0
+    low = min(known) if known else 0.0
+
+    for moment, energy in zip(region_moments, energies):
+        if energy is None or spread <= 1e-12:
+            moment["global_energy_score"] = None
+            moment["global_score"] = round(float(moment["score"]), 2)
+        else:
+            energy_score = (energy - low) / spread * 100.0
+            moment["global_energy_score"] = round(float(energy_score), 2)
+            moment["global_score"] = round(
+                (1.0 - FULL_SCAN_GLOBAL_ENERGY_WEIGHT) * float(moment["score"])
+                + FULL_SCAN_GLOBAL_ENERGY_WEIGHT * float(energy_score), 2)
+        moment["region_score"] = round(float(moment["score"]), 2)
+
+    ordered = sorted(region_moments, key=lambda item: item["global_score"], reverse=True)
+
+    selected: list[dict] = []
+    for candidate in ordered:
+        overlaps = any(
+            candidate["source_start_sec"] < picked["source_end_sec"]
+            and picked["source_start_sec"] < candidate["source_end_sec"]
+            for picked in selected
+        )
+        if overlaps:
+            continue
+        selected.append(candidate)
+        if len(selected) == int(top_n):
+            break
+
+    for rank, moment in enumerate(selected, start=1):
+        moment["rank"] = rank
+    return selected
+
+
+def run_full_source_analysis(ffmpeg_bin: str, raw_video_path, runtime_dir, *,
+                             source_duration_sec: float,
+                             whisper_model_size: str = "large-v3-turbo",
+                             whisper_device: str = "cpu", whisper_compute_type: str = "int8",
+                             scene_detector: str = "content", top_n: int = 5,
+                             region_duration_sec: float = FULL_SCAN_REGION_DURATION_SEC,
+                             max_regions: int | None = None,
+                             preview_dir=None, progress=None) -> dict:
+    """Find hot moments across an ENTIRE long source, in two passes.
+
+    `run_video_analysis` examines one contiguous window (240s by default), so on
+    a two-hour film it can only ever propose moments from the few minutes the
+    caller happened to point it at. Transcribing the whole film instead would be
+    the obvious fix and is not affordable: Whisper dominates analysis cost and
+    scales linearly with duration.
+
+    So pass 1 scans the complete film with the cheap signal (coarse audio
+    energy, one value per second, streamed) and picks the regions worth a closer
+    look. Pass 2 runs the EXISTING per-window pipeline -- clip extraction,
+    Whisper with word timestamps, scene detection, multi-signal scoring -- on
+    those regions only. Candidates are then merged on the absolute source
+    timeline, so the returned manifest describes moments from anywhere in the
+    film while the expensive work stays bounded by `max_regions`.
+
+    Returns the same hot_moments.json contract dict as `run_video_analysis`,
+    plus an `analysis_scope: "full_source"` block describing what was scanned.
+    """
+    report = progress if progress is not None else _NullProgress()
+    runtime_dir = Path(runtime_dir)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    source_duration = float(source_duration_sec or 0.0)
+    if source_duration <= 0:
+        raise ValueError("tam kaynak taramasi icin video suresi bilinmeli")
+    requested_candidates = max(1, int(top_n))
+    region_budget = int(max_regions or min(
+        FULL_SCAN_MAX_REGIONS, max(2, requested_candidates * FULL_SCAN_REGION_MULTIPLIER)))
+
+    # ---------------------------------------------------------- pass 1
+    report.stage("full_scan", "Tum kaynak sesi taraniyor")
+    _raise_if_cancelled(report)
+    full_audio_path = runtime_dir / "full_source.wav"
+    profile = {"times": np.asarray([]), "rms": np.asarray([]),
+               "frame_sec": 1.0, "duration_sec": 0.0}
+    scan_problem = None
+    try:
+        extract_full_audio(ffmpeg_bin, raw_video_path, full_audio_path, progress=report)
+        profile = scan_audio_energy_profile(full_audio_path)
+    except (RuntimeError, ValueError, OSError) as exc:
+        # A source with no readable audio still deserves an analysis; it just
+        # cannot be guided by loudness. Regions fall back to even coverage and
+        # the manifest says so.
+        scan_problem = f"{type(exc).__name__}: {exc}"
+        report.note(f"ses tabanli tarama yapilamadi, bolgeler esit dagitilacak ({scan_problem})")
+    finally:
+        # The full-length WAV is scratch: hundreds of MB that nothing downstream
+        # reads. Region clips carry their own audio.
+        try:
+            full_audio_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    regions = select_candidate_regions(
+        profile, source_duration_sec=source_duration,
+        region_duration_sec=region_duration_sec, region_count=region_budget)
+    report.count(0, len(regions), unit="bolge",
+                 message=f"{len(regions)} aday bolge secildi")
+
+    # ---------------------------------------------------------- pass 2
+    region_dir = runtime_dir / "regions"
+    region_dir.mkdir(parents=True, exist_ok=True)
+    collected: list[dict] = []
+    transcript_available = False
+    transcript_language = None
+    transcript_language_probability = None
+    region_reports: list[dict] = []
+
+    for done, region in enumerate(regions, start=1):
+        _raise_if_cancelled(report)
+        report.stage("region_analysis",
+                     f"Bolge {done}/{len(regions)} inceleniyor "
+                     f"({int(region['start_sec'] // 60)}. dakika)")
+        clip_path = region_dir / f"region_{region['index']:02d}.mp4"
+        audio_path = region_dir / f"region_{region['index']:02d}.wav"
+        entry = dict(region)
+        try:
+            extract_clip_and_audio(ffmpeg_bin, raw_video_path, clip_path, audio_path,
+                                   region["start_sec"], region["duration_sec"], progress=report)
+            text, segments, transcript_info = transcribe_audio(
+                audio_path, model_size=whisper_model_size, device=whisper_device,
+                compute_type=whisper_compute_type, return_info=True, progress=report)
+            if text.strip():
+                transcript_available = True
+                if transcript_language is None:
+                    transcript_language = transcript_info.get("language")
+                    transcript_language_probability = transcript_info.get("language_probability")
+            _raise_if_cancelled(report)
+            scenes = detect_scenes(clip_path, detector=scene_detector)
+            scene_boundaries = [end for _, end in scenes[:-1]] if scenes else []
+            audio_info = compute_audio_peaks(audio_path)
+            times, rms = audio_info["times"], audio_info["rms"]
+            analysis_duration = min(float(region["duration_sec"]),
+                                    float(times[-1]) if len(times) else 0.0)
+            moments = score_hot_moments(
+                segments, times, rms, scene_boundaries, analysis_duration,
+                region["start_sec"], top_n=FULL_SCAN_MOMENTS_PER_REGION)
+            for moment in moments:
+                moment["analysis_region"] = {
+                    "index": region["index"],
+                    "start_sec": region["start_sec"],
+                    "duration_sec": region["duration_sec"],
+                }
+            collected.extend(moments)
+            entry.update({"scene_count": len(scenes), "candidate_count": len(moments),
+                          "transcript_chars": len(text.strip()), "problem": None})
+        except (RuntimeError, ValueError, OSError) as exc:
+            # One unreadable region must not throw away the regions that worked.
+            entry.update({"scene_count": 0, "candidate_count": 0, "transcript_chars": 0,
+                          "problem": f"{type(exc).__name__}: {exc}"})
+            report.note(f"bolge {region['index']} incelenemedi: {entry['problem']}")
+        finally:
+            for scratch in (clip_path, audio_path):
+                try:
+                    scratch.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        region_reports.append(entry)
+        report.count(done, len(regions), unit="bolge",
+                     message=f"{done}/{len(regions)} bolge incelendi")
+
+    if not collected:
+        raise RuntimeError(
+            "tam kaynak taramasinda hicbir hot-moment adayi bulunamadi "
+            f"({len(regions)} bolge tarandi)")
+
+    # ---------------------------------------------------------- merge
+    report.stage("scoring", "Adaylar film genelinde siralaniyor")
+    _raise_if_cancelled(report)
+    hot_moments = _merge_region_moments(collected, profile, requested_candidates)
+
+    report.stage("previews", f"{len(hot_moments)} onizleme klibi uretiliyor")
+    _raise_if_cancelled(report)
+    generate_preview_clips(ffmpeg_bin, raw_video_path, hot_moments,
+                           preview_dir or (runtime_dir / "hot_moment_previews"),
+                           progress=report, time_field="source")
+
+    manifest = build_hot_moments_manifest(
+        hot_moments, transcript_candidate=f"faster-whisper-{whisper_model_size}",
+        window_sec=30.0, stride_sec=10.0, weights=DEFAULT_WEIGHTS,
+        raw_video_path=raw_video_path, analysis_clip_path=None,
+        clip_start_sec=0.0, clip_duration_sec=round(source_duration, 3),
+        candidate_request={
+            "requested": requested_candidates,
+            "produced": len(hot_moments),
+            "policy": "full-source-two-pass-v1",
+            "analysis_duration_sec": round(source_duration, 3),
+            "window_sec": 30.0,
+            "stride_sec": 10.0,
+            "complete": len(hot_moments) == requested_candidates,
+        },
+    )
+    manifest["method"] = "full-source-two-pass-v1"
+    manifest["analysis_scope"] = "full_source"
+    manifest["full_source_scan"] = {
+        "source_duration_sec": round(source_duration, 3),
+        "coarse_pass": {
+            "signal": "audio_rms_1s",
+            "problem": scan_problem,
+            "frame_count": int(len(profile["times"])) if profile.get("times") is not None else 0,
+        },
+        "region_duration_sec": round(float(region_duration_sec), 3),
+        "region_budget": region_budget,
+        "regions_scanned": len(regions),
+        "regions_with_candidates": sum(1 for item in region_reports if item.get("candidate_count")),
+        "regions": region_reports,
+        "candidates_before_merge": len(collected),
+        "ranking_policy": "full-source-energy-blend-v1",
+        "ranking_notes": (
+            "score_hot_moments normalizes its components within one region, so region "
+            "scores are not comparable across regions. Final ordering blends the region "
+            f"score with the globally comparable coarse energy at weight "
+            f"{FULL_SCAN_GLOBAL_ENERGY_WEIGHT}; both inputs are kept on each moment as "
+            "region_score and global_energy_score. Without a usable energy profile the "
+            "region score is used alone and global_energy_score is null."
+        ),
+        "timestamp_notes": (
+            "aligned_*_sec are offsets into the region clip that scored the moment "
+            "(see analysis_region); that clip is scratch and is deleted after analysis. "
+            "source_*_sec are absolute offsets into raw_video_path and are what render "
+            "and preview use."
+        ),
+    }
+    manifest["transcript_available"] = transcript_available
+    manifest["transcript_language"] = transcript_language
+    manifest["transcript_language_probability"] = transcript_language_probability
+    if not transcript_available:
+        manifest["status_reason"] += "; WARNING: transcript was empty (no speech detected)"
+    return manifest
 
 
 class _NullProgress:

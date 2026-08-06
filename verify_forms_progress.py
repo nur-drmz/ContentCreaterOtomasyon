@@ -86,20 +86,23 @@ def section_required_fields():
         check(error_fields(payload) == ["title"], f"title-named-{label}",
               str(error_fields(payload)))
     status, payload = call(app, "POST", "/api/projects", {"title": "Gecerli"})
-    check(status == 201, "title-accepted", f"HTTP {status}")
+    check(status == 400, "operator-required-once", f"HTTP {status}")
+    check(error_fields(payload) == ["operator_name"], "operator-named",
+          str(error_fields(payload)))
+    status, payload = call(app, "POST", "/api/projects", {
+        "title": "Gecerli", "operator_name": "bix"})
+    check(status == 201, "title-and-operator-accepted", f"HTTP {status}")
 
     seed = fixtures.seed_demo_project(app, title="alan testi")
     pid = seed["project_id"]
 
-    # THE regression: an unnamed plan used to be signed "console".
+    # The project operator is intentionally reused for later human actions.
     status, payload = call(app, "POST", f"/api/projects/{pid}/plan",
                            {"mode": "direct_clip_series"})
-    check(status == 400, "plan-selected-by-required", f"HTTP {status}")
-    check(error_fields(payload) == ["selected_by"], "plan-selected-by-named",
-          str(error_fields(payload)))
+    check(status == 201, "plan-reuses-project-operator", f"HTTP {status}")
     plan = app.service(app.ownership(pid)).load_artifact("processing_plan")["data"]
-    check(plan is None, "plan-not-created-without-name",
-          "isimsiz plan yine de olusturuldu")
+    check(plan["selected_by"] == "fixtures", "plan-signed-by-project-operator",
+          str(plan.get("selected_by")))
 
     status, payload = call(app, "POST", f"/api/projects/{pid}/plan",
                            {"mode": "direct_clip_series", "selected_by": "   "})
@@ -110,11 +113,16 @@ def section_required_fields():
         "mode": "narrated_theory", "selected_by": "tester", "theory_angle": "kisa"})
     check(status == 400, "theory-angle-enforced", f"HTTP {status}")
 
-    # Reviewer names are human decisions and cannot be defaulted either.
+    # Approval also reuses the project operator when no duplicate field is sent.
     service = app.service(app.ownership(pid))
-    for body, label in (({"selected_rank": 1, "reviewed_by": ""}, "moment"),):
-        status, _ = call(app, "POST", f"/api/projects/{pid}/moment-selection", body)
-        check(status == 400, f"{label}-reviewer-required", f"HTTP {status}")
+    digest = service.approval_state("processing_plan")["content_sha256"]
+    status, _ = call(app, "POST", f"/api/projects/{pid}/approvals/processing_plan",
+                     {"reviewed_sha256": digest})
+    check(status == 200, "plan-approved-with-project-operator", f"HTTP {status}")
+    approved = service.load_artifact("processing_plan")["data"]
+    check(approved["human_approval"]["approved_by"] == "fixtures",
+          "approval-signed-by-project-operator",
+          str(approved["human_approval"].get("approved_by")))
 
     check(set(error_fields(payload)) <= set(FIELD_LABELS),
           "fields-from-closed-set", "kapali kume disinda alan adi dondu")
@@ -357,6 +365,16 @@ def section_frontend_contract():
           "no-silent-number-default", "sessiz sayi varsayilani hala var")
     check("selected_by: document.getElementById" not in js, "no-raw-selected-by",
           "selected_by dogrulanmadan gonderiliyor")
+    check("new-project-operator" in js and "operator_name:" in js,
+          "project-operator-captured-once", "proje ureticisi kaydedilmiyor")
+    repeated_ids = ("plan-by", "moment-by", "script-editor-by", "lifecycle-actor",
+                    "render-reviewer", "voice-reviewer")
+    check(not any(value in js for value in repeated_ids),
+          "no-repeated-actor-fields", "tekrar isim alani bulundu")
+    check("`${kind}-hash`" not in js and "hash i buraya yapistir" not in js,
+          "no-manual-hash-field", "manuel hash kopyalama alani bulundu")
+    check("reviewed_sha256: approval.content_sha256" in js,
+          "approval-still-hash-bound", "onay guncel icerik hash'ine bagli degil")
 
     check("role: 'progressbar'" in js, "progressbar-role", "role=progressbar yok")
     check("'aria-valuenow': determinate" in js, "valuenow-only-when-determinate",

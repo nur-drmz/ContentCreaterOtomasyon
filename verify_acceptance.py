@@ -68,6 +68,9 @@ MOBILE = {"width": 390, "height": 844}
 #: still exercising real ffmpeg/Whisper on real footage.
 CLIP_START_SEC = 60
 CLIP_DURATION_SEC = 45
+#: The Moment Explorer asks for a focus region and a duration in MINUTES.
+CLIP_FOCUS_REGION = "start"
+CLIP_DURATION_MIN = 1
 
 FAILURES: list = []
 CHECKS: list = []
@@ -223,6 +226,7 @@ def main(argv=None) -> int:
                   "bos formla proje olusturuldu")
 
             page.fill("#new-project-title", "KABUL TESTI (izole)")
+            page.fill("#new-project-operator", "kabul-testi")
             page.locator("[data-testid=create-project]").click()
             page.wait_for_timeout(1500)
             check(len(app.project_ids()) == 1, "validation:valid-submit",
@@ -284,15 +288,8 @@ def main(argv=None) -> int:
             goto(page, base, "phase0", pid)
             page.locator("button.mode-option").first.click()
             page.wait_for_timeout(500)
-            # Required fields refuse an unnamed plan, in the browser.
-            page.locator("[data-testid=create-plan]").click()
-            page.wait_for_timeout(600)
-            check(page.locator("[data-testid=err-plan-by]").is_visible(),
-                  "plan:requires-human-name", "isimsiz plan engellenmedi")
-            check(service.load_artifact("processing_plan")["data"] is None,
-                  "plan:not-created-unnamed", "isimsiz plan yine de olusturuldu")
-
-            page.fill("#plan-by", "kabul-testi")
+            check(page.locator("#plan-by").count() == 0,
+                  "plan:reuses-project-operator", "tekrar isim alani gorunuyor")
             page.locator("[data-testid=create-plan]").click()
             page.wait_for_timeout(2000)
             plan = service.load_artifact("processing_plan")["data"]
@@ -318,9 +315,8 @@ def main(argv=None) -> int:
             check(not allowed, "plan:gate-closed-before-approval", reason or "kapi acik!")
 
             goto(page, base, "phase0", pid)
-            digest = page.locator("[data-testid=hash-processing_plan]").inner_text().strip()
-            page.fill("#processing_plan-hash", digest)
-            page.fill("#processing_plan-by", "kabul-testi")
+            check(page.locator("#processing_plan-hash").count() == 0,
+                  "plan:no-manual-hash", "hash kopyalama alani gorunuyor")
             page.locator("[data-testid=approve-processing_plan]").click()
             page.wait_for_timeout(1800)
             allowed, reason = service.plan_gate("video_analysis")
@@ -332,9 +328,12 @@ def main(argv=None) -> int:
             # ==========================================================
             section("7. Analiz: manuel calistirma + canli ilerleme + yenileme")
             # ==========================================================
-            page.fill("#va-start", str(CLIP_START_SEC))
-            page.fill("#va-duration", str(CLIP_DURATION_SEC))
-            page.dispatch_event("#va-start", "change")
+            # Long-video focus controls: the Moment Explorer moved from raw
+            # seconds to a focus region plus MINUTES, so this walk drives what
+            # the screen actually offers.
+            page.select_option("#va-focus", CLIP_FOCUS_REGION)
+            page.dispatch_event("#va-focus", "change")
+            page.fill("#va-duration", str(CLIP_DURATION_MIN))
             page.dispatch_event("#va-duration", "change")
             page.fill("#va-topn", "3")
             page.dispatch_event("#va-topn", "change")
@@ -406,7 +405,6 @@ def main(argv=None) -> int:
 
             page.locator(f"[data-testid=select-moment-{rank}]").click()
             page.wait_for_timeout(400)
-            page.fill("#moment-by", "kabul-testi")
             page.locator("[data-testid=save-moment-selection]").click()
             page.wait_for_timeout(1500)
             selection = service.load_artifact("moment_selection")["data"]
@@ -593,15 +591,12 @@ while True:
                   "review:lock-explained",
                   locked.inner_text()[:70] if locked.count() else "aciklama yok")
 
-            # Typed ONCE on purpose: if the name did not survive the repaint
-            # each tick triggers, boxes 2..6 would fail "reviewer required".
-            page.fill("[data-testid=render-reviewer]", "kabul-testi")
+            # Every review action reuses the project-level operator.
             for index in range(boxes.count()):
                 page.locator("[data-testid^=checkbox-]").nth(index).click()
                 page.wait_for_timeout(600)
-            check(page.input_value("[data-testid=render-reviewer]") == "kabul-testi",
-                  "review:reviewer-name-survives-repaint",
-                  "isim yeniden cizimde silindi (her madde icin yeniden yazmak gerekiyor)")
+            check(page.locator("[data-testid=render-reviewer]").count() == 0,
+                  "review:no-repeated-name", "tekrar isim alani gorunuyor")
             state = service.render_review_state()
             check(state["done_count"] == 6, "review:checklist-persisted",
                   f"{state['done_count']}/6")

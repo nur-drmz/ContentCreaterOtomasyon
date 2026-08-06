@@ -167,7 +167,7 @@ def main(argv=None) -> int:
     # --- project + source ---------------------------------------------------
     status, payload = call(api, "POST", "/api/projects",
                            {"title": "CANLI narrated_theory testi (izole)",
-                            "created_by": "verify_live_script"})
+                            "operator_name": "verify_live_script"})
     pid = payload["project"]["project_id"]
     ownership = app.ownership(pid)
     service = app.service(ownership)

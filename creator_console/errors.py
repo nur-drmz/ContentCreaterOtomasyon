@@ -139,6 +139,7 @@ RETRYABLE_CODES = frozenset({"internal_error", "storage_unavailable", "job_confl
 #: it can never echo a value or an arbitrary key back to the browser.
 FIELD_LABELS = {
     "title": "Proje adi",
+    "operator_name": "Proje ureticisi",
     "selected_by": "Secimi yapan kisi",
     "theory_angle": "Teori / yorum acisi",
     "output_count": "Cikti sayisi",

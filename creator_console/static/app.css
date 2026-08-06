@@ -355,6 +355,13 @@ textarea { min-height: 96px; resize: vertical; }
 .badge--approved  { background: var(--c-ok-soft); color: var(--c-ok); border-color: var(--c-ok); }
 .badge--planned   { background: var(--c-info-soft); color: var(--c-info); border-color: var(--c-info); }
 .badge--missing   { background: var(--c-surface-3); color: var(--c-text-dim); border-color: var(--c-border); }
+/* Batch slot states. Orange stays reserved for "you are here / act here", so a
+   slot that is merely waiting on a person is not painted the same as one that
+   failed. */
+.badge--needs_moment    { background: var(--c-surface-3); color: var(--c-text-dim); border-color: var(--c-border); }
+.badge--ready_to_render { background: var(--c-accent-soft); color: var(--c-accent-hover); border-color: var(--c-accent); }
+.badge--needs_review    { background: var(--c-warn-soft); color: var(--c-warn); border-color: var(--c-warn); }
+.badge--needs_revision  { background: var(--c-danger-soft); color: var(--c-danger); border-color: var(--c-danger); }
 
 /* ---------------------------------------------------------------- alerts */
 .alert {

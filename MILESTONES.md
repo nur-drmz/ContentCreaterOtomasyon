@@ -1,11 +1,13 @@
 # Ayrıntılı Milestone ve İlerleme Takibi
 
-**Son güncelleme:** 2026-08-03  
-**Ürün hedefi:** Kullanıcının verdiği uzun videodan seçilen anı, orijinal sesi
-koruyup zaman kodlu altyazı ekleyerek izlenebilir 9:16 bir YouTube Short'a çevirmek.
-Gemini script + TTS anlatımı isteğe bağlı ikinci moddur.  
-**Şu anki ana hedef:** `M0.5 — Gerçek Colab uçtan uca sesli Short PoC`
-**Sıradaki doğrulama:** `M0.5 — Gerçek Colab'da Faz 0 stratejisi seçilip onaylanarak uçtan uca koşu`
+**Son güncelleme:** 2026-08-06
+**Ürün hedefi:** Kullanıcının verdiği uzun filmden **birden fazla** izlenebilir 9:16
+Short üretmek: kısa klip Short'ları (orijinal ses + zaman kodlu altyazı), teori
+videoları (Gemini script + TTS anlatımı) ve savaş/karakter editleri (çoklu segment
+montaj + müzik yatağı). Her çıktı ayrı insan onayından geçer.
+**Şu anki ana hedef:** `M0.10 — Tam film analizi ve batch çoklu Short üretimi`
+**Sıradaki doğrulama:** `M0.10 — Gerçek uzun filmde tam tarama, batch render ve
+her Short'un ayrı ayrı izlenip onaylanması`
 
 Bu belge günlük ilerleme ve kabul takibi içindir. Üst seviye ürün yönü ve özgün
 release fazları için [ROADMAP.md](ROADMAP.md) esas alınır.
@@ -98,7 +100,10 @@ girdisini otomatik değiştiremez. Araştırma artefaktları
 | R0.2 | Viral potansiyel araştırması | `in_progress` | P2 | Yeterli gerçek tarihçe üzerinde holdout raporu |
 | M0.7 | Private upload ve yayın güvenliği | `not_started` | P2 | Ayrı yetkilendirilmiş private-upload PoC |
 | M0.8 | Analytics ve öğrenme | `not_started` | P2 | Gerçek yayın sonrası temel metrik toplama |
-| M0.9 | Creator Console pre-alpha | `verification_required` | P1 | Gerçek kaynak videoyla arayüzden preview Short ve mobil inceleme kontrolü |
+| M0.9 | Creator Console pre-alpha | `verification_required` | P1 | Mobil izleme/onay görünümü ve erişilebilirlik smoke testi |
+| M0.10 | Tam film analizi + batch çoklu Short | `verification_required` | P0 | Gerçek uzun filmde tam tarama, batch render ve her Short'un ayrı onayı |
+| M0.11 | Montaj motoru (savaş/karakter editleri) | `not_started` | P1 | Çoklu segment concat + müzik yatağı ile izlenmiş edit |
+| M0.12 | Konsol sadeleştirme | `not_started` | P1 | Batch ve montaj akışının tek ekrandan zorlanmadan yönetilmesi |
 | M1.0 | Çoklu kanal ve Channel Brain | `not_started` | P3 | Kanal bazlı ayar ve izolasyon testleri |
 | M1.1 | Web/mobil beta | `not_started` | P3 | Onay ve izleme iş akışlı beta |
 | M2.0 | SaaS ve ölçek | `deferred` | P4 | MVP sonrasına ertelendi |
@@ -220,10 +225,14 @@ hiçbir alt faz çalışmaz. Notebook'ta Faz 0 → 0a → 0b → 0c hücreleri b
 
 ### Bilinen sınır
 
-Tek koşuda yalnızca **ilk** çıktı yuvası render edilir. 2..N yuvaları izole dizinleriyle
-raporlanır ama render edilmez, çünkü her yuva kendi insan-onaylı moment seçimini gerektirir
-ve onaysız bir momenti render etmek onay kapısını delerdi. Yuva başına moment seçimi
-üreticisi bir sonraki milestone işidir.
+~~Tek koşuda yalnızca **ilk** çıktı yuvası render edilir.~~ **2026-08-06'da M0.10 ile
+kapatıldı:** her yuvanın artık kendi moment seçimi, render'ı, inceleme listesi ve onayı
+var; `POST /api/projects/<id>/batch` hazır yuvaları kuyruğa alır. Onay kapısı delinmedi,
+korundu — momenti seçilmemiş bir yuva batch tarafından render **edilmez**, gerekçesiyle
+atlanır. Ayrıntı: [M0.10 bölümü](#m010--tam-film-analizi-ve-batch-çoklu-short).
+
+Kalan sınır: bir Short hâlâ **tek bitişik aralıktır**. Çoklu segment montaj (savaş/karakter
+editleri) M0.11 işidir.
 
 ## 5. M0.0 — Planlama ve güvenlik ilkeleri
 
@@ -441,7 +450,7 @@ GEMINI_TTS_LANGUAGE_CODE = "tr-TR"
 
 ### M0.9 — Creator Console pre-alpha
 
-**Durum:** `planned`  
+**Durum:** `verification_required`
 **Amaç:** Notebook hücrelerini son tüketiciye göstermeden kaynak video alımı,
 işleme stratejisi seçimi, moment inceleme, script/ses onayı ve render takibini tek
 bir web arayüzünden yönetmek. İlk sürüm yerel/özel tek kullanıcı pre-alpha'dır;
@@ -506,7 +515,12 @@ Pre-alpha tek kullanıcıyla çalışsa da aşağıdaki alanlar ve sınırlar ba
 - [x] API anahtarları istemci paketinde, ağ cevabında, logda veya artefaktta görünmemiş.
 - [x] Başarısız iş uygulanabilir hata ve güvenli yeniden deneme sunmuş.
 - [ ] Masaüstü ana akış ve mobil izleme/onay görünümü görsel kontrolden geçmiş.
-- [ ] En az bir gerçek kaynak video arayüzden preview Short'a dönüştürülmüş.
+- [x] En az bir gerçek kaynak video arayüzden preview Short'a dönüştürülmüş.
+      *Kanıt:* kullanıcının kendi `odi` projesi (`prj_36285d3f3294a1b8`) arayüzden
+      540×960 `final_short.mp4` üretti (2026-08-05); ayrıca izole
+      `verify_real_preview.py` → `REAL_PREVIEW_OK` ve `verify_acceptance.py` 109/109.
+      **Not:** üretilmiş olması izlenmiş olması değildir — görsel kalite yargısı
+      hâlâ açık (aşağıdaki mobil/erişilebilirlik maddeleri ve M0.10 insan kabulü).
 - [ ] Erişilebilirlik, responsive davranış ve temel performans smoke testleri geçmiş.
 - [x] Çok kullanıcılı hazırlık için sahiplik ve storage izolasyonu otomatik test edilmiş.
 - [x] Önceki projeler yeniden başlatma sonrasında listelenmiş, açılmış ve metadata düzenlemesi kalıcı olmuş.
@@ -564,6 +578,136 @@ mobil görsel kontrol hâlâ elle yapılmalı; erişilebilirlik denetimi otomati
 Bu maddeler M1.0, M1.1 ve M2.0 aşamalarında ele alınacaktır. Pre-alpha arayüzü
 gelecekteki sistemi taklit ederek sahte başarı göstermemeli; henüz uygulanmayan
 çok kullanıcılı yetenekleri açıkça “planlandı” olarak göstermelidir.
+
+### M0.10 — Tam film analizi ve batch çoklu Short
+
+**Durum:** `verification_required` (mekanik doğrulandı; **insan izlemesi bekliyor**)
+**Yeni:** [verify_batch_outputs.py](verify_batch_outputs.py) — **88/88**
+
+#### Neden gerekliydi
+
+Motor bir projeden **tek** Short üretebiliyordu. `_run_render` her zaman
+`results/render/` dizinine yazıyor, `outputs()` ise 2..N yuvaları için sabit
+`insufficient_data` döndürüyordu. Kullanıcının `Supergirl` projesi 10 çıktı isteyen
+onaylı bir plana ve 10 açılmış yuvaya sahipti; üretilen Short sayısı **0** idi.
+
+Analiz tarafı da aynı sınırı taşıyordu: `run_video_analysis` tek bir bitişik
+pencereyi (varsayılan 240 sn) inceliyordu. Aynı pencereden kesilen N Short, aynı
+sahnenin N varyasyonu olurdu.
+
+#### Tam kaynak taraması — iki geçişli
+
+| Geçiş | Ne yapar | Neden |
+|---|---|---|
+| 1 — kaba tarama | Tüm film boyunca 1 sn çözünürlüklü RMS enerji profili, **Whisper yok** | Tüm filmi görebilen tek ucuz sinyal |
+| 2 — finalist bölgeler | Yalnızca seçilen bölgelerde klip çıkarma + Whisper + sahne tespiti + skorlama | Pahalı iş `max_regions` ile sınırlı kalır |
+
+Enerji profili `wave` + numpy ile **blok blok** okunur; iki saatlik bir kaydı tek
+float dizisi olarak yüklemek yüzlerce MB tutardı, oysa 1. geçişin ihtiyacı
+saniyede tek bir değerdir. Tam uzunluktaki WAV taramadan sonra silinir.
+
+**Bölge içi normalizasyon dürüstçe ele alınır.** `score_hot_moments` bileşenlerini
+kendi klibindeki diğer pencerelere göre min-max normalize eder, dolayısıyla sessiz
+bir bölgeden gelen 92 ile filmin en gürültülü bölgesinden gelen 92 aynı şeyi
+söylemez. Birleştirme bu yüzden bölge skorunu, film genelinde **mutlak** olan tek
+sinyalle (1. geçişin kaba enerjisi) `full-source-energy-blend-v1` politikasıyla
+harmanlar; `region_score` ve `global_energy_score` her momentte ayrı ayrı saklanır.
+Kullanılabilir enerji profili yoksa bölge skoru tek başına kullanılır ve
+`global_energy_score` **null** kalır — uydurulmaz.
+
+Sesi okunamayan kaynak taramayı **durdurmaz**: bölgeler eşit dağıtılır ve bu
+`selection_policy: "uniform_fallback"` olarak raporlanır.
+
+#### Yuva izolasyonu
+
+- Slot 1 **her zaman** tarihsel `results/render/` yolunu korur (çoklu çıktı
+  planlarında da). Slot 2..N kendi `results/render/output_NN/` dizinini alır.
+  `outputs` bloğu hash'lenen `decision` bloğunun **dışında** olduğu için bu eşleme
+  değişikliği hiçbir mevcut onayı düşürmedi.
+- Yuvaya özel artefaktlar yalnızca `moment_selection` ve `render_manifest`
+  (`PER_SLOT_ARTIFACTS`). Kaynak değerlendirmesi, plan ve analiz **paylaşılır**:
+  aynı projenin iki Short'u kendi kaynağı hakkında anlaşmazlığa düşemez.
+  Anlatım artefaktları listede yok, çünkü `narrated_theory` planı `output_count=1`
+  şartı taşır.
+- Onay zinciri yuva başına değerlendirilir:
+  `processing_plan → yuva moment_selection → yuva render`.
+- Her Short kendi inceleme listesini taşır. Slot 1'de atılan 6 işaret, kimsenin
+  izlemediği slot 2'nin onay kapısını **açmaz** (test edilir).
+- Planın tanımlamadığı bir yuva reddedilir; `output_47/` dizini oluşmaz.
+- Aynı momentin iki yuvada seçilmesi seçim anında reddedilir — iki özdeş Short
+  ancak ikisi de render edilip izlendiğinde fark edilirdi.
+
+#### Batch kuyruğu
+
+`POST /api/projects/<id>/batch` hazır her yuva için bir render işi kuyruğa alır.
+"Hazır" = momenti bir insan seçmiş ve plan kapısı açık; insan bekleyen yuvalar
+**gerekçesiyle atlanır**, sessizce render edilmez. Her yuva ayrı bir iş olduğu
+için mevcut idempotency anahtarı onları zaten ayırır: çift tıklanan batch düğmesi
+yuva bazında dedup olur. Mevcut JobStore, worker, lease, heartbeat, iptal ve
+kurtarma altyapısı olduğu gibi kullanılır.
+
+Otomatik akış slotlar üzerinde yürür ve **her** slotun insan kapılarında durur;
+batch, N onayı tek onaya indirmez.
+
+#### Test kanıtı
+
+`python verify_batch_outputs.py` → `BATCH_OUTPUTS_OK`, 88 kontrol, çıkış kodu 0.
+Gerçek FFmpeg, gerçek HTTP rotaları, sentetik 150 sn'lik kaynak, sahte sağlayıcılar.
+
+Kanıtlananlar: tam tarama filmin tamamını görüyor (151 sn'lik enerji profili) ve
+adaylar film geneline yayılıyor · 3 yuva **3 ayrı SHA-256'lı** video üretti
+(`render/`, `output_02/`, `output_03/`) · her biri 540×960 dikey, video+ses akışlı ·
+üç Short üç farklı momenti kapsıyor · slot 1'in listesi slot 2'ye **sızmıyor** ·
+liste eksikken slot 2 onayı **reddediliyor** ve slot 1 onaylandıktan sonra **hâlâ**
+reddediliyor · batch idempotent · bilinmeyen yuva ve yinelenen moment reddediliyor ·
+**0 sağlayıcı çağrısı** · hiçbir manifest `production_ready` değil.
+
+Çok bölgeli yol kütüphane seviyesinde ayrıca doğrulandı: 3 bölge, adaylar birden
+fazla bölgeden geliyor, sıralama global skoru izliyor ve **kazanan ilk bölge
+değil** — filmin sonundaki yüksek enerjili an açılışı geçiyor.
+
+#### Kalan blokerler
+
+- **Hiçbir batch çıktısı insan tarafından izlenmedi.** Bu tur mekaniği kanıtlar:
+  N ayrı Short gerçekten üretiliyor ve ayrı ayrı onay bekliyor. Kadraj, kesim
+  noktası, altyazı senkronu ve momentlerin gerçekten ilgi çekici olup olmadığı
+  hakkında hiçbir şey söylemez.
+- Tam tarama gerçek bir uzun filmde (>1 saat) henüz koşulmadı; süre ve bellek
+  davranışı 150 sn'lik sentetik kaynakta ölçüldü.
+- İki geçişli tarama 1. geçişte **yalnızca ses enerjisi** kullanır; sessiz ama
+  görsel olarak güçlü bir sahne (savaş, bakışma) kaba taramada öne çıkmaz.
+- Batch tek süreçte sıralı koşuldu; harici worker'larla paralel batch denenmedi.
+- Hâlâ tek segment: bir Short bir bitişik aralıktır. Çoklu segment montaj M0.11.
+
+### M0.11 — Montaj motoru (savaş/karakter editleri)
+
+**Durum:** `not_started`
+
+Yeni mod `montage_edit` (pipeline_mode `music_bed_montage`). Bugün her iki render
+hattı da tek bir `base_clip_path` üzerinde çalışır ve **hiç concat yoktur**;
+savaş/karakter editi doğası gereği N ayrı aralığın montajıdır, yani motor bunu
+şu an üretemez.
+
+- Yeni `run_montage_pipeline`: N segment çıkar → aynı fps/çözünürlük/SAR'a
+  normalize et → concat → 9:16 → ses miksi → opsiyonel altyazı.
+- **Ses: müzik yatağı + orijinal ses, konuşmada müzik kısılır.** Mevcut
+  `build_audio_filtergraph` yeniden kullanılır; ikinci bir ducking uygulaması yazılmaz.
+- Müziği kullanıcı sağlar; sistem müzik **indirmez ve üretmez**, telif sorumluluğu
+  arayüzde açıkça yazılır.
+- Karakter farkındalığı v0: tam transkriptten isim-geçiş indeksi + segment etiketleri.
+  **Yüz tanıma kapsam dışıdır** ve öyle olduğu açıkça belirtilir.
+- `decision.segments`, `music_track`, `audio_mix` karar bloğunda → onay hash'inin parçası.
+- Script/TTS yapısal olarak kapalı → sıfır sağlayıcı çağrısı.
+
+### M0.12 — Konsol sadeleştirme
+
+**Durum:** `not_started`
+
+M0.10 ve M0.11'in fiilen zorlaştırdığı yerlere göre yapılır, tahmine göre değil.
+Beklenen kapsam: proje ana ekranı olarak batch tahtası, tek birincil akış, gelişmiş
+ayarların katlanması, üst seviye sekme sayısının azalması, her ekranda tek net
+"sıradaki eylem". Sunucu-türetimli akış haritası tek gerçek kaynağı olarak kalır;
+kural JS'e kopyalanmaz.
 
 ### M1.0 — Çoklu kanal ve Channel Brain
 
@@ -1744,7 +1888,9 @@ mümkün.
 | Faz 0 master notebook entegrasyonu | Gerçek ffmpeg + mock sağlayıcı geçti | `MASTER_NOTEBOOK_ALL_PHASES_OK` |
 | Creator Console (backend+frontend sözleşmesi) | Gerçek yerel + mock sağlayıcı geçti | `CREATOR_CONSOLE_VERIFICATION_OK` (`python verify_console.py`) |
 | Adversarial fault-injection (10 aile, 70 senaryo) | Geçti | `FAULT_INJECTION_SUITE_OK` (`python verify_faults.py`) |
-| Gerçek tarayıcı UI testleri (Chromium/Playwright) | Geçti | `BROWSER_SUITE_OK` (`python verify_browser.py`), 85 kontrol |
+| Gerçek tarayıcı UI testleri (Chromium/Playwright) | Geçti | `BROWSER_SUITE_OK` (`python verify_browser.py`), 243 kontrol |
+| Tam film taraması + batch çoklu Short | Geçti | `BATCH_OUTPUTS_OK` (`python verify_batch_outputs.py`), 88 kontrol, gerçek FFmpeg |
+| Yerel entegrasyon + UX kabul geçişi | Geçti | `ACCEPTANCE_OK` (`python verify_acceptance.py`), 109 kontrol |
 | Gerçek kaynak uçtan uca önizleme (izole) | Geçti | `REAL_PREVIEW_OK` (`python verify_real_preview.py`), ffprobe doğrulamalı |
 | Gerçek YouTube bağlantısı | Manuel temel test geçti | Kullanıcının Colab `videos.list` testi |
 | Gerçek Gemini script | **Geçti** | `LIVE_SCRIPT_OK` (`python verify_live_script.py --i-authorize-one-live-call`), 1 gerçek çağrı, `gemini-3.6-flash` |
@@ -1753,17 +1899,30 @@ mümkün.
 
 ## 15. Bir sonraki çalışma oturumu
 
-1. Güncel master notebook'u Colab'a yükle.
-2. `GeminiKey` ve `YoutubeKEY` notebook erişimlerini kontrol et.
-3. Araştırma toggle'larını kapalı tut.
-4. Gerçek kaynak videoyu Drive'a yükle ve `SOURCE_VIDEO_PATH` değerini ayarla.
-5. Yalnızca video analizini çalıştır.
-6. Moment sonuçlarını indirip/inceleyip seçim yap.
-7. Script fazını gerçek Gemini ile çalıştır ve onayla.
-8. Gemini TTS fazını çalıştır, sesi dinle ve onayla.
-9. Preview render üret ve izle.
-10. Kalite uygunsa final render üret.
-11. Bu dosyadaki M0.1–M0.6 checkbox'larını kanıta göre güncelle.
+Ana akış artık Colab notebook'u değil **Creator Console**'dur (`python -m creator_console`
+veya `Start Creator Console.exe`). Notebook yolu korunuyor ama günlük iş buradan yürüyor.
+
+**Kritik: proje bugüne kadar hiçbir Short'u insan onayına kadar götürmedi.** 13
+doğrulama paketi mekaniğin çalıştığını kanıtlıyor; kalite yargısı hâlâ verilmedi.
+Sıradaki oturum bunu kapatmalı:
+
+1. Gerçek uzun filmle bir proje aç, kaynağı yükle, Faz 0 değerlendirmesini çalıştır.
+2. Planı **final kalitede** kur: `preview_mode` kapalı (→ 1080×1920),
+   altyazı modeli `large-v3-turbo`. Çıktı sayısını gerçekten istediğin Short sayısına ayarla.
+3. Planı onayla; alt fazların açıldığını gör.
+4. Moment Explorer'da **tam kaynak taraması**nı çalıştır (`analysis_scope=full_source`) —
+   uzun filmde tek pencere yerine film genelini tarar.
+5. Her çıktı yuvası için ayrı bir moment seç (aynı moment iki yuvada reddedilir).
+6. Çıktılar ekranındaki batch panosundan tüm render'ları kuyruğa al.
+7. **Her Short'u ayrı ayrı izle** ve 6 maddelik inceleme listesini doldur:
+   klip sınırları, kadraj, altyazı senkronu, aktif kelime vurgusu, font okunabilirliği,
+   ses sürekliliği. Liste tamamlanmadan onay düğmesi açılmaz.
+8. Kabul edilen Short'ları onayla; sorunlu olanlar için hedef sekmeli revizyon iste.
+9. Bu dosyadaki M0.5/M0.6/M0.10 checkbox'larını **gözlemlenen** kanıta göre güncelle.
+
+`narrated_theory` için ayrıca: üretilmiş script okunmalı/onaylanmalı ve
+`.console_data_livetts/.../gemini_tts.wav` dosyaları dinlenip karşılaştırılmalı —
+üçü de üretildi, hiçbiri dinlenmedi.
 
 ## 16. İlerleme günlüğü
 
@@ -1822,6 +1981,10 @@ mümkün.
 | 2026-08-06 | MKV kaynak video desteği Console sözleşmesine eklendi. Dosya seçici `.mkv` uzantısını açıkça gösterir; istemci ve sunucu aynı kanonik uzantı listesini kullanır. MKV kaynak FFmpeg ile doğrudan değerlendirilip analiz edilir, tarayıcıya sunulan moment önizlemeleri ise kaynak değiştirilmeden H.264/AAC MP4 üretilir. Desteklenmeyen uzantılar dosya gövdesi okunmadan HTTP 415 ile reddedilir. | M0.1, M0.2, M0.9 | `verify_mkv_support.py` gerçek MKV yükleme/probe/MP4 çıkarımı dahil 18/18; kaynak SHA-256 değişmedi. `verify_large_upload.py` 17/17, `verify_console.py` ve `verify_local.py` exit 0, `verify_faults.py` 70/70 ve `verify_browser.py` 241/241. |
 
 | 2026-08-06 | Çok dilli metadata içeren gerçek MKV dosyalarının Windows'ta Faz 0'ı yanlışlıkla engellemesi düzeltildi. FFmpeg stderr'i sistemin `cp1254` kodlamasıyla okunurken bazı altyazı başlıklarında okuyucu thread çöküyor ve sağlam kaynak `süre=0, video yok, ses yok` görünüyordu. FFmpeg/ffprobe probe çıktısı artık UTF-8 ve güvenli replacement ile çözülür; akış tespiti yalnızca ASCII işaretleri kullandığından metadata kaybı kararları etkilemez. Kullanıcının mevcut Faz 0 artefaktı doğru probe sonucu ile yeniden üretildi. | M0.1, M0.9 | Gerçek 4.38 GB MKV: 3781.09 sn, 1920×960, H.264 video + E-AC-3 5.1 ses; iki mod da `feasible=True`, blocker listeleri boş. Çok dilli MKV `verify_mkv_support.py` 19/19; `verify_local.py` ve `verify_console.py` exit 0; `render_utils` payload'ı kullanan 3 notebook yenilendi. |
+
+| 2026-08-06 | Onay deneyimi sadeleştirildi: kullanıcı SHA-256 kopyalayıp yapıştırmıyor; tek onay düğmesi sunucunun güncel içerik hash'ini gönderiyor. Üreten kişi proje oluşturulurken bir kez zorunlu alınıyor ve plan, moment, script, inceleme, revizyon, onay ve yaşam döngüsü işlemlerinde yeniden kullanılıyor. Eski 8 yerel proje `bix` operatörü ile geriye uyumlu güncellendi. Hash/eski-içerik reddi ve insan inceleme kapıları korunuyor. | M0.9 | `verify_forms_progress.py` 111/111, `verify_console.py` exit 0, `verify_voice_review.py` 86/86, `verify_lifecycle_browser.py` 9/9; gerçek Chromium turunda yeni tek-tık onay ve tekrarlanan isim alanlarının yokluğu doğrulandı. |
+
+| 2026-08-06 | **M0.10:** Motor artık bir projeden birden fazla Short üretiyor. Önceden `_run_render` her zaman `results/render/` dizinine yazıyor ve `outputs()` 2..N yuvaları için sabit `insufficient_data` döndürüyordu; 10 çıktı isteyen onaylı bir plan 0 Short üretiyordu. Yuva başına moment seçimi, render, inceleme listesi ve onay zinciri eklendi; slot 1 tarihsel yolunu koruyor, 2..N kendi `output_NN/` dizinini alıyor. `POST /api/projects/<id>/batch` hazır yuvaları kuyruğa alıyor, insan bekleyenleri gerekçesiyle atlıyor. Ayrıca iki geçişli **tam film taraması** eklendi: 1. geçiş tüm filmi 1 sn çözünürlüklü ses enerjisiyle tarıyor (Whisper yok, blok blok okuma), 2. geçiş yalnızca finalist bölgelerde Whisper/sahne/skorlama çalıştırıyor. Bölge içi normalizasyon dürüstçe ele alınıyor: `full-source-energy-blend-v1`, `region_score` ve `global_energy_score` ayrı saklanıyor, enerji profili yoksa null bırakılıyor. | M0.10, M0.1, M0.2, M0.6, M0.9 | `verify_batch_outputs.py` (yeni, 88/88, gerçek FFmpeg + gerçek HTTP): 3 yuva → **3 ayrı SHA-256'lı** 540×960 video, slot 1'in inceleme işaretleri slot 2'ye sızmıyor, eksik listeyle slot onayı reddediliyor, batch idempotent, bilinmeyen yuva ve yinelenen moment reddediliyor, **0 sağlayıcı çağrısı**. Regresyon: `verify_local.py`, `verify_console.py`, `verify_faults.py` (70/70), `verify_browser.py` (243/243), `verify_forms_progress.py`, `verify_diagnostics.py`, `verify_acceptance.py` (109/109), `verify_voice_review.py`, `verify_content_language.py`, `verify_project_lifecycle.py` (23/23), `verify_cancel_long_video.py` (22/22), `verify_large_upload.py` (17/17), `verify_mkv_support.py` (19/19), `verify_real_preview.py` — hepsi çıkış kodu 0; gömülü payload'lar yenilendi ve senkron doğrulandı. Ayrıca `verify_acceptance.py`'nin 2026-08-06 focus-controls turundan beri kırık olan `#va-start` seçicisi düzeltildi. **Hiçbir batch çıktısı henüz insan tarafından izlenmedi.** |
 
 Yeni bir çalışma tamamlandığında bu tabloya tarih, yapılan değişiklik ve somut
 kanıt eklenmelidir. Checkbox yalnızca ilgili kanıt üretildiğinde işaretlenmelidir.

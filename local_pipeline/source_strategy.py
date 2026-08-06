@@ -452,16 +452,22 @@ def resolve_phase_gates(mode: str) -> dict:
 def build_output_slots(mode: str, output_count: int, moment_ranks, render_root) -> list:
     """Isolated output slot per Short.
 
-    A single output keeps the historical `render/` path so existing artifacts,
-    manifests and tests are unaffected. Two or more outputs each get their own
-    `render/output_NN/` directory, so one Short can never overwrite another's
-    video, subtitles or manifest.
+    Slot 1 ALWAYS keeps the historical `render/` path -- including in multi-output
+    plans -- so a project's first Short, its manifest, its subtitles and every
+    existing test path stay exactly where they have always been. Slots 2..N each
+    get their own `render/output_NN/` directory, so one Short can never overwrite
+    another's video, subtitles or manifest.
+
+    Slot 1 was previously mapped to `output_01/` whenever `output_count > 1`.
+    Nothing was ever rendered there (the engine only ever wrote the historical
+    path), and `outputs` sits OUTSIDE the hashed `decision` block, so changing
+    this mapping orphans no artifact and invalidates no approval.
     """
     render_root = Path(render_root)
     ranks = list(moment_ranks or [])
     slots = []
     for index in range(int(output_count)):
-        directory = render_root if int(output_count) == 1 else render_root / f"output_{index + 1:02d}"
+        directory = render_root if index == 0 else render_root / f"output_{index + 1:02d}"
         slots.append({
             "index": index + 1,
             "label": f"{mode}_{index + 1:02d}",

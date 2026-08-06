@@ -124,7 +124,29 @@ sekilde olmus isler kurtarilir; canli bir worker'in isi elinden alinmaz.
 7. **Voice Studio** — Gemini TTS + hash onayı
 8. **Render Studio** — render çalıştırma + teknik sonuç + final onay
 9. **Çıktılar** — üretilen Short'lar, manifestler, hata ayrıntısı, audit geçmişi
+   ve çoklu çıktı planlarında **batch panosu** (aşağıya bak)
 10. **Ayarlar** — kimlik bilgisi durumu (**değer asla gösterilmez**), sahiplik, "planlandı" listesi
+
+### Uzun filmden birden fazla Short (batch)
+
+Planda çıktı sayısı 1'den büyükse Çıktılar ekranında bir **batch panosu** çıkar: her
+Short için ayrı bir kart, durumu ve sıradaki eylemi.
+
+Uzun bir filmde önce **tam kaynak taraması** çalıştırılmalıdır. Normal analiz tek bir
+bitişik pencereye (varsayılan 240 sn) bakar; aynı pencereden kesilen beş Short aynı
+sahnenin beş varyasyonu olur. Tam tarama filmi iki geçişte inceler: önce tüm film
+boyunca ucuz ses enerjisi profili, sonra yalnızca öne çıkan bölgelerde Whisper ve
+sahne tespiti.
+
+Her Short **kendi** moment seçimini, render'ını, inceleme listesini ve onayını taşır:
+
+- Slot 1 tarihsel `results/render/` yolunu korur; 2..N kendi `results/render/output_NN/`
+  dizinine yazar, yani bir Short diğerinin videosunu, altyazısını veya manifestini ezemez.
+- Aynı moment iki yuvada seçilemez.
+- "Render'ları kuyruğa al" yalnızca **momenti seçilmiş** yuvaları çalıştırır; insan kararı
+  bekleyen yuvalar gerekçesiyle atlanır, sessizce render edilmez.
+- Bir yuvanın 6 maddelik inceleme listesi dolmadan o yuvanın onay düğmesi açılmaz —
+  ve bir yuvada atılan işaretler diğerini açmaz. N Short, N ayrı onay demektir.
 
 ### Büyük kaynak video yükleme
 

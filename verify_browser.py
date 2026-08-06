@@ -195,7 +195,6 @@ try:
         check(_service.load_artifact("processing_plan")["data"] is None,
               "phase0:no-auto-plan", "mod secmek tek basina plan OLUSTURMADI")
 
-        page.fill("#plan-by", "tarayici-test")
         page.fill("#plan-count", "1")
         page.fill("#plan-duration", "45")
         check(page.locator("#plan-subtitle-model").input_value() == "large-v3-turbo",
@@ -218,25 +217,23 @@ try:
         check(plan is not None and plan["status"] == "review_required",
               "phase0:plan-created", f"plan status={plan and plan['status']}")
 
-        # Wrong hash must be refused by the UI path too.
-        page.fill("#processing_plan-hash", "0" * 64)
-        page.fill("#processing_plan-by", "tarayici-test")
-        page.locator("[data-testid=approve-processing_plan]").click()
-        page.wait_for_timeout(900)
-        alert_text = page.inner_text("#global-alerts")
+        # Wrong digests remain rejected by the server; the UI no longer asks
+        # a person to copy/paste one.
+        wrong_status, _ = ConsoleApi(_app).handle(
+            "POST", f"/api/projects/{_PID}/approvals/processing_plan",
+            body=json.dumps({"reviewed_sha256": "0" * 64}).encode(), headers={})
+        check(wrong_status == 400, "phase0:wrong-hash-api-refused",
+              f"stale digest HTTP {wrong_status}")
         check(_service.load_artifact("processing_plan")["data"]["status"] == "review_required",
               "phase0:wrong-hash-refused", "yanlis hash ile onay VERILMEDI")
-        check("basarisiz" in alert_text.lower() or "reddedildi" in alert_text.lower(),
-              "phase0:wrong-hash-message", f"kullaniciya bildirildi: {alert_text[:60]!r}")
 
-        # Correct hash, taken from the UI itself.
+        # One click binds approval to the current server-described digest.
         goto(page, _BASE, "phase0", _PID)
-        shown_hash = page.locator("[data-testid=hash-processing_plan]").inner_text().strip()
-        real_hash = _service.describe_plan_review()["review"]["content_sha256"]
-        check(shown_hash == real_hash, "phase0:hash-displayed",
-              f"UI hash i dogru gosteriyor ({shown_hash[:16]}…)")
-        page.fill("#processing_plan-hash", shown_hash)
-        page.fill("#processing_plan-by", "tarayici-test")
+        shown_hash = _service.describe_plan_review()["review"]["content_sha256"]
+        check(len(shown_hash) == 64, "phase0:server-hash-available",
+              f"sunucuda icerik hash'i hazir ({shown_hash[:16]}…)")
+        check(page.locator("#processing_plan-hash").count() == 0,
+              "phase0:no-manual-hash", "hash kopyalama alani kaldirildi")
         page.locator("[data-testid=approve-processing_plan]").click()
         page.wait_for_timeout(1400)
         check(_service.load_artifact("processing_plan")["data"]["status"] == "approved",
@@ -903,20 +900,15 @@ try:
         check(page.locator("[data-testid=approve-render]").count() == 0,
               "review:no-approve-button", "onay dugmesi gorunmuyor")
 
-        # Tick every box through the UI; the gate must then open. The name is
-        # typed ONCE: this used to refill it before every tick, which quietly
-        # accommodated a bug where each tick's repaint wiped the input and boxes
-        # 2..6 failed with "reviewer required".
-        page.fill("[data-testid=render-reviewer]", "browser-test")
+        # Tick every box through the UI; the project operator is reused.
         for key in ("clip_boundaries", "crop", "subtitle_sync",
                      "active_word_highlight", "font_readability", "audio_continuity"):
             box = page.locator(f"[data-testid=checkbox-{key}]")
             if box.count() and not box.is_checked():
                 box.check()
                 page.wait_for_timeout(600)
-        check(page.input_value("[data-testid=render-reviewer]") == "browser-test",
-              "review:reviewer-survives-repaint",
-              "isim yeniden cizimde silindi")
+        check(page.locator("[data-testid=render-reviewer]").count() == 0,
+              "review:no-repeated-reviewer", "tekrar isim alani kaldirildi")
         page.wait_for_timeout(800)
         goto(page, _BASE, "render", _PID)
         server_review = _app.service(_app.ownership(_PID)).render_review_state()
@@ -936,7 +928,6 @@ try:
         # "Needs revision" records a note and navigates, without approving.
         page.fill("[data-testid=revision-notes]", "klip cumle ortasinda basliyor")
         page.select_option("[data-testid=revision-target]", "moments")
-        page.fill("[data-testid=render-reviewer]", "browser-test")
         page.locator("[data-testid=revision-submit]").click()
         page.wait_for_timeout(1200)
         state_after = _app.service(_app.ownership(_PID)).render_review_state()
@@ -992,6 +983,7 @@ try:
 
         # Filling it clears the error and works.
         page.fill("#new-project-title", "Zorunlu alan testi")
+        page.fill("#new-project-operator", "browser-test")
         page.locator("[data-testid=create-project]").click()
         page.wait_for_timeout(900)
         check(len(_app.project_ids()) == before_count + 1, "form:valid-submit-works",
@@ -1041,6 +1033,7 @@ try:
         goto(page, _BASE, "projects", _PID)
         page.route("**/api/projects", _reject_with_field)
         page.fill("#new-project-title", "istemci bunu kabul eder")
+        page.fill("#new-project-operator", "browser-test")
         page.locator("[data-testid=create-project]").click()
         page.wait_for_timeout(700)
         page.unroute("**/api/projects")
@@ -1215,9 +1208,12 @@ try:
         meta = page.locator("[data-testid=script-meta]").inner_text()
         check("gemini" in meta.lower(), "script:model-shown", meta[:60])
         check("sn" in meta, "script:duration-shown", meta[:80])
-        # The reviewer reads the text and approves the hash on the SAME screen.
-        check(page.locator("[data-testid=hash-script]").count() == 1,
-              "script:hash-next-to-text", "onay hash i ayni ekranda degil")
+        # The reviewer reads the text and approves it in one click; the digest
+        # binding remains server-side and is not a copy/paste chore.
+        check(page.locator("#script-hash").count() == 0,
+              "script:no-manual-hash", "manuel hash alani geri geldi")
+        check(page.locator("[data-testid=approve-script]").count() == 1,
+              "script:one-click-approval", "script onay dugmesi yok")
         check("provider_attempts" not in page.content(), "script:no-raw-artifact",
               "ham artefakt sayfaya dokuluyor")
 
@@ -1325,16 +1321,15 @@ try:
         check(page.locator("[data-testid=voice-rerun-tts]").count() == 1,
               "voice:rerun-action", "yeniden uret eylemi yok")
 
-        # The name is typed ONCE and must survive every tick's repaint.
-        page.fill("[data-testid=voice-reviewer]", "dinleyici")
+        # The project operator is reused for every checklist decision.
         for key in ("pronunciation", "naturalness", "pacing", "tone",
                      "script_match", "audio_quality"):
             box = page.locator(f"[data-testid=voice-checkbox-{key}]")
             if box.count() and not box.is_checked():
                 box.check()
                 page.wait_for_timeout(500)
-        check(page.input_value("[data-testid=voice-reviewer]") == "dinleyici",
-              "voice:reviewer-survives-repaint", "isim yeniden cizimde silindi")
+        check(page.locator("[data-testid=voice-reviewer]").count() == 0,
+              "voice:no-repeated-reviewer", "tekrar isim alani kaldirildi")
         server_state = _v_svc.voice_review_state()
         check(server_state["done_count"] == 6, "voice:checklist-persisted",
               f"sunucuda {server_state['done_count']}/6")
@@ -1346,9 +1341,8 @@ try:
         check(page.locator("[data-testid=voice-checklist-progress]").inner_text()
               .startswith("6/6"), "voice:survives-refresh",
               page.locator("[data-testid=voice-checklist-progress]").inner_text())
-        check(page.input_value("[data-testid=voice-reviewer]") == "dinleyici",
-              "voice:reviewer-survives-refresh",
-              page.input_value("[data-testid=voice-reviewer]"))
+        check(page.locator("[data-testid=voice-reviewer]").count() == 0,
+              "voice:no-reviewer-after-refresh", "isim alani geri gelmedi")
 
         # Replacing the audio must make the list stale and re-close approval.
         _v_audio = Path(_v_svc.load_artifact("selected_voiceover")["data"]["audio_path"])
@@ -1365,7 +1359,6 @@ try:
               "bayatlama kullaniciya aciklanmiyor")
 
         # Revision: recorded, navigable, and not an approval.
-        page.fill("[data-testid=voice-reviewer]", "dinleyici")
         page.fill("[data-testid=voice-revision-notes]", "Ozel isim yanlis okunuyor")
         page.select_option("[data-testid=voice-revision-target]", "script")
         page.locator("[data-testid=voice-revision-submit]").click()

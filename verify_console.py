@@ -1297,11 +1297,11 @@ check(_status == 400 and _payload["error"]["code"] == "approval_rejected",
 check(_rr_svc.load_artifact("render_manifest")["data"]["status"] == "review_required",
       "review:no-approval-leak", "liste eksikken render onaylanmadi")
 
-# An unnamed reviewer cannot tick a box.
+# Repeated reviewer fields are optional; the project operator is reused.
 _status, _payload = api_call(_rr_app, "POST", f"/api/projects/{_rr_pid}/render-review",
                              {"action": "set_item", "key": "crop", "checked": True,
                               "reviewed_by": ""})
-check(_status >= 400, "review:reviewer-required", f"HTTP {_status}")
+check(_status == 200, "review:project-operator-reused", f"HTTP {_status}")
 
 for _key in CHECKLIST_KEYS:
     api_call(_rr_app, "POST", f"/api/projects/{_rr_pid}/render-review",
