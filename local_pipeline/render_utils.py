@@ -331,7 +331,7 @@ def ffprobe_streams(ffprobe_bin: str, path) -> dict:
         raise RuntimeError('ffprobe bulunamadi.')
     proc = subprocess.run(
         [ffprobe_bin, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
     )
     if proc.returncode != 0:
         raise RuntimeError(f'ffprobe basarisiz: {proc.stderr[-2000:]}')
@@ -357,7 +357,13 @@ def probe_via_ffmpeg_fallback(ffmpeg_bin: str, path) -> dict:
         raise RuntimeError('ffmpeg bulunamadi; fallback probe da yapilamiyor.')
     proc = subprocess.run(
         [ffmpeg_bin, '-hide_banner', '-i', str(path)],
-        capture_output=True, text=True,
+        # FFmpeg prints container metadata to stderr. MKV files frequently carry
+        # subtitle titles in many alphabets; on Windows ``text=True`` otherwise
+        # uses the active ANSI code page (for example cp1254) and its reader
+        # thread can die on a single unrepresentable byte, leaving stderr empty
+        # and making a healthy video look streamless. FFmpeg metadata is UTF-8;
+        # replacement is safe because the parser only needs ASCII markers.
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
     )
     stderr = proc.stderr or ''
 

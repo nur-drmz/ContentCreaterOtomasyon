@@ -41,7 +41,10 @@ try:
     mkv = root / "Game of Thrones source.MKV"
     remux = subprocess.run([
         ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(mp4), "-map", "0", "-c", "copy", str(mkv),
+        "-i", str(mp4), "-map", "0", "-c", "copy",
+        # This title is deliberately outside Windows cp1254. Before the UTF-8
+        # probe fix, subprocess' stderr reader died and Faz 0 saw no streams.
+        "-metadata", "title=日本語 • Български", str(mkv),
     ], capture_output=True, text=True)
     check(remux.returncode == 0 and mkv.is_file(), f"MKV remux failed: {remux.stderr}")
     original_hash = hashlib.sha256(mkv.read_bytes()).hexdigest()
@@ -76,6 +79,7 @@ try:
           "source MKV changed during upload")
 
     assessment = service.run_source_assessment(actor="tester")
+    check(assessment["source"]["probe_ok"] is True, "multilingual MKV probe failed")
     check(float(assessment["source"]["duration_sec"]) >= 5.5,
           "MKV duration was not probed")
     check(assessment["source"]["has_video"] is True, "MKV video stream missing")
