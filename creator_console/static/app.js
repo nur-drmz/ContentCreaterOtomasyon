@@ -38,10 +38,19 @@ const api = {
 };
 
 function uploadSourceFile(file) {
-  const limit = Number(((state.project || {}).upload_limits || {}).max_bytes || 0);
+  const uploadRules = ((state.project || {}).upload_limits || {});
+  const limit = Number(uploadRules.max_bytes || 0);
+  const supported = (uploadRules.supported_extensions || []).map(value => String(value).toLowerCase());
   if (!file || file.size <= 0) {
     const error = new Error('Secilen video bos veya tarayici tarafindan okunamiyor.');
     error.hint = 'Dosyanin bilgisayarda tamamen indirildigini ve boyutunun 0 olmadigini kontrol et.';
+    return Promise.reject(error);
+  }
+  const dot = file.name.lastIndexOf('.');
+  const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
+  if (supported.length && !supported.includes(extension)) {
+    const error = new Error(`Bu video uzantisi desteklenmiyor: ${extension || 'uzanti yok'}.`);
+    error.hint = `Desteklenen kaynaklar: ${supported.join(', ')}`;
     return Promise.reject(error);
   }
   if (limit > 0 && file.size > limit) {
@@ -1061,6 +1070,10 @@ function screenPhase0() {
   const savedMode = phase0.plan && phase0.plan.decision && phase0.plan.decision.mode;
   const selectedPlanMode = state.selectedMode || savedMode || null;
   const uploadLimit = Number((view.upload_limits || {}).max_bytes || 0);
+  const supportedExtensions = (view.upload_limits || {}).supported_extensions || [];
+  const sourceAccept = supportedExtensions.length
+    ? `${supportedExtensions.join(',')},video/*`
+    : 'video/*';
   const uploading = state.uploadProgress;
 
   const uploadCard = el('div', { class: 'card' },
@@ -1072,7 +1085,12 @@ function screenPhase0() {
           el('div', { class: 'dim', text: `${(source.size_bytes / 1048576).toFixed(1)} MB · parmak izi ${String(source.fingerprint_sha256).slice(0, 16)}…` }))
       : el('div', { class: 'stack' },
           el('p', { class: 'muted', text: 'Bu projede henuz kaynak video yok.' }),
-          uploading ? null : el('input', { type: 'file', id: 'source-file', accept: 'video/*' }),
+          uploading ? null : el('input', {
+            type: 'file', id: 'source-file', accept: sourceAccept,
+            'data-testid': 'source-file',
+          }),
+          el('div', { class: 'dim',
+            text: `Desteklenen kaynaklar: ${supportedExtensions.join(', ').toUpperCase()}. MKV yuklenebilir; moment onizlemeleri tarayicinin oynatabilecegi MP4 olarak uretilir.` }),
           uploadLimit > 0
             ? el('div', { class: 'dim', text: `En fazla ${formatBytes(uploadLimit)}; buyuk videolar RAM'e alinmadan dogrudan diske yazilir.` })
             : null,

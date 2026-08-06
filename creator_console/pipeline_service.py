@@ -58,6 +58,19 @@ SOURCE_DIRNAME = "source_videos"
 RESULTS_DIRNAME = "results"
 RUNTIME_DIRNAME = ".runtime"
 
+# Keep upload validation on the exact same allow-list used by the analysis
+# resolver.  MKV is a source container: browsers do not reliably play it, but
+# FFmpeg reads it and the pipeline emits browser-compatible MP4 previews.
+SUPPORTED_SOURCE_VIDEO_EXTENSIONS = frozenset(
+    video_analysis.SUPPORTED_SOURCE_VIDEO_EXTENSIONS
+)
+
+
+def is_supported_source_video_filename(filename: str) -> bool:
+    """Return whether an untrusted upload name has a supported video suffix."""
+    display = safe_filename(filename, default="source")
+    return Path(display).suffix.lower() in SUPPORTED_SOURCE_VIDEO_EXTENSIONS
+
 #: Artifact kind -> the schema fields that must exist for it to be usable at all.
 REQUIRED_FIELDS = {
     "source_assessment": ("artifact_type", "status", "source", "mode_scores"),
@@ -537,7 +550,14 @@ class PipelineService:
             raise PipelineServiceError("yukleme boyutu gecersiz") from exc
         if expected <= 0:
             raise PipelineServiceError("bos dosya yuklenemez")
-        display = safe_filename(filename, default="source.mp4")
+        display = safe_filename(filename, default="source")
+        extension = Path(display).suffix.lower()
+        if extension not in SUPPORTED_SOURCE_VIDEO_EXTENSIONS:
+            supported = ", ".join(sorted(SUPPORTED_SOURCE_VIDEO_EXTENSIONS))
+            raise PipelineServiceError(
+                f"desteklenmeyen kaynak video uzantisi: {extension or '(yok)'}; "
+                f"desteklenenler: {supported}"
+            )
         stored_name = f"{new_id('source')}__{display}"
         path = self.storage.resolve(self.ownership, SOURCE_DIRNAME, stored_name,
                                      create_parent=True)
@@ -579,6 +599,7 @@ class PipelineService:
             "display_name": display,
             "stored_path": self.relative(path),
             "size_bytes": received,
+            "container_extension": extension,
             "content_sha256": digest.hexdigest(),
             "fingerprint_sha256": source_strategy.source_fingerprint_sha256(path),
             "registered_at": _now_iso(),

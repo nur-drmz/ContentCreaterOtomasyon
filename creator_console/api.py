@@ -26,7 +26,11 @@ from .errors import ApiError
 from .progress import load_progress
 from .ids import InvalidIdentifier
 from .jobs import JobConflict, JobError, JobNotFound
-from .pipeline_service import ArtifactProblem, PipelineServiceError
+from .pipeline_service import (
+    ArtifactProblem,
+    PipelineServiceError,
+    is_supported_source_video_filename,
+)
 from .storage import StorageViolation
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -179,6 +183,8 @@ class ConsoleApi:
         if rest == ["source"] and method == "POST":
             filename = _header(headers, "x-filename") or _first(query.get("filename")) or "source.mp4"
             filename = unquote(filename)
+            if not is_supported_source_video_filename(filename):
+                raise ApiError("unsupported_video_type")
             if body_stream is not None:
                 try:
                     length = int(content_length)

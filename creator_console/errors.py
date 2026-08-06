@@ -108,6 +108,10 @@ CATALOG = {
     "upload_too_large": _spec(
         "upload_too_large", 413,
         "Dosya boyutu sinirini asiyor.", ""),
+    "unsupported_video_type": _spec(
+        "unsupported_video_type", 415,
+        "Bu kaynak video uzantisi desteklenmiyor.",
+        "MP4, MOV, MKV, WebM, AVI veya M4V biciminde bir video sec."),
     "artifact_problem": _spec(
         "artifact_problem", 422,
         "Artefakt bozuk, eksik veya bu surumle uyumsuz.",

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from local_pipeline import google_ai, narration_presets, source_strategy
+from local_pipeline import google_ai, narration_presets, source_strategy, video_analysis
 
 from . import APP_NAME, __version__
 from .audit import AuditLog
@@ -716,7 +716,9 @@ class ConsoleApp:
             ],
             "not_uploaded": True,
             "upload_limits": {"max_bytes": self.config.max_upload_bytes,
-                              "streamed_to_disk": True},
+                              "streamed_to_disk": True,
+                              "supported_extensions": sorted(
+                                  video_analysis.SUPPORTED_SOURCE_VIDEO_EXTENSIONS)},
         }
 
     def project_view(self, ownership: Ownership) -> dict:
@@ -825,7 +827,9 @@ class ConsoleApp:
             "planned_not_implemented": [dict(item) for item in PLANNED_NOT_IMPLEMENTED],
             "not_uploaded": True,
             "upload_limits": {"max_bytes": self.config.max_upload_bytes,
-                              "streamed_to_disk": True},
+                              "streamed_to_disk": True,
+                              "supported_extensions": sorted(
+                                  video_analysis.SUPPORTED_SOURCE_VIDEO_EXTENSIONS)},
             # The script a human is being asked to approve. Approving a hash for
             # content you cannot read is not a review, so the text itself has to
             # reach the page -- a curated slice of it, not the whole artifact.

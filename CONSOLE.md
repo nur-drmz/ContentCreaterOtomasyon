@@ -134,6 +134,10 @@ göndermeden önce bu sınırı gösterip doğrular. Yükleme sırasında gerçe
 ve **Yüklemeyi durdur** düğmesi görünür. Tamamlanmayan aktarım `.part` dosyasını temizler;
 proje kaydına yalnızca eksiksiz dosya atomik olarak bağlanır.
 
+Kaynak biçimleri **MP4, MOV, MKV, WebM, AVI ve M4V** olarak doğrulanır. MKV kaynak
+FFmpeg tarafından doğrudan analiz edilir; tarayıcı uyumluluğu için aday momentler ve
+nihai Short kaynak dosyayı değiştirmeden H.264/AAC MP4 olarak üretilir.
+
 Bir proje açıkken sayfanın üstündeki **Otomatik akışı başlat** düğmesi sıradaki güvenli
 makine fazını çalıştırır. Plan türü, moment ve hash onayları insan kararı olarak kalır;
 otomasyon bu noktalarda durur ve kullanıcı işleminden sonra aynı düğmeyle devam eder.
