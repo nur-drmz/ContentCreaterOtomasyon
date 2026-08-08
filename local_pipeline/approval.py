@@ -31,7 +31,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-APPROVABLE_KINDS = ("processing_plan", "script", "voiceover", "render")
+APPROVABLE_KINDS = ("processing_plan", "script", "voiceover", "transcript", "render")
 
 # The processing plan is a DECISION artifact, not a media artifact: what a human
 # reviews is the decision itself (mode, source, moments, theory angle, output
@@ -144,6 +144,7 @@ def content_hash_for(kind: str, artifact: dict) -> str:
     this artifact kind:
       processing_plan -> the DECISION block (mode, source, moments, theory, config)
       script          -> the script text itself
+      transcript      -> the caption words WITH their timings
       voiceover       -> the generated audio FILE bytes
       render          -> the final video FILE bytes
 
@@ -174,6 +175,22 @@ def content_hash_for(kind: str, artifact: dict) -> str:
                 "onaylanacak bir icerik uretilmemis."
             )
         return sha256_text(script_text)
+
+    if kind == "transcript":
+        # The reviewable content is the caption text itself, WITH its word
+        # timings: approving "the same words at different times" would approve a
+        # caption the reviewer never saw. Corrections are inside the words, so a
+        # later correction correctly invalidates the approval.
+        words = artifact.get("words") or []
+        cues = artifact.get("cues") or []
+        if not words and not cues:
+            raise ValueError(
+                "moment_transcript.json icinde kelime/cue yok; bu momentte konusma "
+                "tespit edilmemis, onaylanacak bir altyazi metni uretilmemis."
+            )
+        payload = ([{"t": w.get("text"), "s": w.get("start"), "e": w.get("end")} for w in words]
+                   or [{"t": c.get("text"), "s": c.get("start"), "e": c.get("end")} for c in cues])
+        return sha256_canonical_json(payload)
 
     if kind == "voiceover":
         audio_path = artifact.get("audio_path")

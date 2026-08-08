@@ -186,6 +186,11 @@ WORKFLOW_STEPS = (
      "tab": "moments", "modes": None, "phase": "video_analysis"},
     {"key": "moment", "label": "Moment", "long_label": "Moment secimi",
      "tab": "moments", "modes": None, "phase": None},
+    # The caption step of a clip series: the source's OWN words, read and
+    # corrected by a human before the render burns them in.
+    {"key": "transcript", "label": "Altyazi", "long_label": "Altyazi transkripti onayi",
+     "tab": "script", "modes": (source_strategy.MODE_DIRECT_CLIP_SERIES,),
+     "phase": "transcript"},
     {"key": "script", "label": "Script", "long_label": "Script onayi",
      "tab": "script", "modes": (source_strategy.MODE_NARRATED_THEORY,),
      "phase": "script_generation"},
@@ -299,6 +304,21 @@ def build_workflow_map(service, ownership, jobs=None) -> dict:
         repair="Analiz degistiyse momenti yeniden incele ve secimi guncelle.",
         detail=(f"rank {selection['data']['selected_moment_rank']}"
                 if selection["data"] else ""))
+
+    transcript = service.load_artifact("moment_transcript")
+    transcript_state = approvals.get("transcript") or {}
+    transcript_data = transcript["data"] or {}
+    outcomes["transcript"] = outcome(
+        transcript_state.get("effective_valid"),
+        action=("Altyazi sekmesinde transkripti uret." if not transcript["data"] else
+                "Altyazi sekmesinde metni oku, yanlis duyulan kelimeleri duzelt ve onayla."),
+        problem=transcript["problem"] or "",
+        repair="Transkripti yeniden uret, duzeltmeleri uygula ve onayla.",
+        detail=(f"{transcript_data.get('word_count')} kelime"
+                if transcript_data.get("word_count") else ""),
+        failed=(("Bu momentte konusma yok; altyazi uretilemez. "
+                 "Konusma iceren bir moment sec.")
+                if transcript["data"] and not transcript_data.get("has_speech") else ""))
 
     script_state = approvals.get("script") or {}
     script_data = script["data"] or {}

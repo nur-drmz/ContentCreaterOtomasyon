@@ -763,3 +763,24 @@ video { max-width: 100%; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+
+/* ---- Altyazi transkripti (direct_clip_series) --------------------------- */
+/* The caption as it will read. Unsure words are marked with an underline AND a
+   colour, never colour alone, so the signal survives a colourblind reader. */
+.transcript-text { margin: 12px 0; line-height: 2.1; font-size: 1.05rem; }
+.transcript-word { padding: 1px 2px; border-radius: 3px; }
+.transcript-word--unsure {
+  color: var(--c-warn); border-bottom: 2px dotted var(--c-warn); cursor: help;
+}
+.transcript-word--fixed {
+  color: var(--c-ok); border-bottom: 2px solid var(--c-ok);
+}
+.transcript-nomatch { color: var(--c-warn); font-size: 0.85rem; }
+.correction-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0;
+}
+.correction-row input { flex: 1 1 160px; min-width: 0; }
+@media (max-width: 900px) {
+  .correction-row { flex-direction: column; align-items: stretch; }
+}

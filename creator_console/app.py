@@ -342,6 +342,7 @@ class ConsoleApp:
     JOB_EXECUTORS = {
         "source_assessment": "run_source_assessment",
         "video_analysis": "run_video_analysis",
+        "transcript": "run_transcript",
         "script_generation": "run_script_generation",
         "tts": "run_tts",
         "render": "run_render",
@@ -479,6 +480,29 @@ class ConsoleApp:
             if not slot_selection["data"] or slot_selection["problem"]:
                 return {"state": "blocked", "blocker": "moment_selection", "slot": index,
                         "message": f"Moment Explorer'da{slot_label} bir moment sec."}
+
+            # A clip Short's caption text is a human decision. Automation may
+            # RUN the recognition, but it stops for the reading and the fix --
+            # burning in words nobody checked is exactly what this gate prevents.
+            if mode != source_strategy.MODE_NARRATED_THEORY:
+                transcript = service.load_artifact("moment_transcript", slot=index)
+                transcript_state = service.approval_chain(index).get("transcript") or {}
+                if not transcript["data"] or transcript["problem"]:
+                    render_cfg = dict(decision.get("render") or {})
+                    return self._automatic_job(
+                        ownership, "transcript", {
+                            "subtitle_whisper_model_size": render_cfg.get(
+                                "subtitle_whisper_model_size", "small"),
+                            "subtitle_language": render_cfg.get("subtitle_language", "auto"),
+                            "caption_theme": render_cfg.get("caption_theme", "auto"),
+                            "slot": index,
+                        }, submit=submit,
+                        message=f"Altyazi transkripti baslatildi{slot_label}.")
+                if not transcript_state.get("effective_valid"):
+                    return {"state": "blocked", "blocker": "transcript_approval",
+                            "slot": index,
+                            "message": f"Altyazi sekmesinde{slot_label} metni oku, "
+                                       "yanlis duyulan kelimeleri duzelt ve onayla."}
 
             render = service.load_artifact("render_manifest", slot=index)
             if not render["data"] or render["problem"]:
@@ -921,6 +945,9 @@ class ConsoleApp:
             # content you cannot read is not a review, so the text itself has to
             # reach the page -- a curated slice of it, not the whole artifact.
             "script": _script_review_view(service),
+            # The caption text of a clip Short, for the screen that lets a human
+            # read it and fix misheard names before it is burned in.
+            "transcript": service.transcript_view(),
             # The selectable narration styles, with the documented voice
             # characteristic behind each -- so the picker can explain itself
             # instead of listing opaque names.

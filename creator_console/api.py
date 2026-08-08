@@ -272,6 +272,19 @@ class ConsoleApi:
                 slot=slot)
             return 201, {"moment_selection": selection, "slot": slot}
 
+        if rest == ["transcript"] and method == "GET":
+            return 200, {"transcript": service.transcript_view(_slot(query))}
+
+        if rest == ["transcript", "corrections"] and method == "POST":
+            payload = _json_body(body)
+            slot = _slot(payload)
+            artifact = service.set_transcript_corrections(
+                corrections=payload.get("corrections") or [],
+                edited_by=payload.get("edited_by") or service.project_actor(),
+                slot=slot)
+            return 200, {"transcript": service.transcript_view(slot),
+                         "corrections": artifact.get("corrections") or []}
+
         if rest == ["outputs"] and method == "GET":
             return 200, {"outputs": service.outputs(), "batch": service.batch_state()}
 

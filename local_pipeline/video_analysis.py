@@ -183,11 +183,29 @@ def extract_clip_and_audio(ffmpeg_bin: str, raw_video_path, video_out_path, audi
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        # Downmix to stereo. A 5.1 source survives this encode as six channels
+        # whose LAYOUT metadata is lost, and the next AAC encode in the chain --
+        # preview cutting, render -- then refuses it with 'Unsupported channel
+        # layout "6 channels"'. A vertical Short is a phone-and-browser artifact
+        # anyway, so stereo is both the correct target and the only layout every
+        # downstream encoder is guaranteed to accept.
+        "-ac", "2",
         "-c:a", "aac", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
         str(video_out_path),
     ]
     report = progress if progress is not None else _NullProgress()
-    proc = _run_process_checked(clip_cmd, report)
+    if progress is not None:
+        # The source window can itself be many minutes long. Surface FFmpeg's
+        # measured output time so preparation does not look frozen at 0/6.
+        from . import render_utils
+        try:
+            proc = render_utils.run_ffmpeg(
+                ffmpeg_bin, clip_cmd[5:], progress=report,
+                total_duration_sec=float(duration_sec))
+        except RuntimeError as exc:
+            raise RuntimeError(f"video klibi olusturulamadi: {exc}") from exc
+    else:
+        proc = _run_process_checked(clip_cmd, report)
     if proc.returncode != 0:
         raise RuntimeError(f"video klibi olusturulamadi: {proc.stderr[-3000:]}")
 
@@ -474,11 +492,18 @@ def score_hot_moments(transcript_segments: list[dict], times, rms, scene_boundar
             candidate["source_start_sec"] = round(clip_start_sec + aligned_start, 3)
             candidate["source_end_sec"] = round(clip_start_sec + aligned_end, 3)
             candidate["boundary_context"] = boundary_context
+            # A window can be loud and wordless -- music, battle, a dragon. Audio
+            # energy carries 0.30 of the score, so such a window ranks like any
+            # other candidate and only reveals itself after a render comes back
+            # with no subtitles. State it on the candidate, where the human
+            # actually chooses.
+            candidate["has_speech"] = bool(candidate.get("word_count"))
             candidate["reason"] = (
                 f"audio={candidate['component_scores']['audio_energy']}, "
                 f"scene={candidate['component_scores']['scene_density']}, "
                 f"speech={candidate['component_scores']['speech_density']}, "
                 f"emotion={candidate['component_scores']['emotion_density']}"
+                + ("" if candidate["has_speech"] else " | KONUSMA YOK (altyazi uretilemez)")
             )
             hot_moments.append(candidate)
         if len(hot_moments) == top_n:
@@ -513,7 +538,16 @@ def generate_preview_clips(ffmpeg_bin: str, video_path, hot_moments: list[dict],
             ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
             "-ss", str(moment[start_key]), "-i", str(video_path),
             "-t", str(preview_duration),
+            # Map explicitly. With no -map, FFmpeg picks the audio stream with
+            # the MOST channels, so a source carrying both a stereo and a 5.1
+            # track would give the preview different audio than analysis and
+            # render use. '?' keeps silent sources working.
+            "-map", "0:v:0", "-map", "0:a:0?",
             "-vf", "scale=-2:720", "-c:v", "libx264", "-preset", "ultrafast",
+            # Stereo for the same reason as the analysis clip: an unknown 6-channel
+            # layout makes the AAC encoder fail, which would silently cost every
+            # preview and then block moment selection.
+            "-ac", "2",
             "-c:a", "aac", "-movflags", "+faststart", str(preview_path),
         ]
         proc = _run_process_checked(cmd, report)

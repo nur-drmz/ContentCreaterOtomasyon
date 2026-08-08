@@ -150,6 +150,11 @@ def technical_summary(manifest: dict | None) -> dict:
         "subtitle_source": subtitles.get("source"),
         "subtitle_cues": subtitles.get("cue_count"),
         "subtitle_words": subtitles.get("word_count"),
+        # A render that produced zero subtitle words did half of what this mode
+        # promises. Carried to the panel so the reviewer is told, rather than
+        # discovering it by watching a silent-captioned Short.
+        "no_speech_detected": subtitles.get("no_speech_detected"),
+        "subtitle_warning": subtitles.get("subtitle_warning"),
         "dynamic_word_highlight": subtitles.get("dynamic_word_highlight"),
         "active_word_color": subtitles.get("active_word_color"),
         "caption_theme": config.get("caption_theme_resolved"),

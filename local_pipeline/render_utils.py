@@ -262,7 +262,9 @@ def run_ffmpeg(ffmpeg_bin: str, args: list[str], *, progress=None,
     """
     if progress is None or not total_duration_sec or total_duration_sec <= 0:
         cmd = [ffmpeg_bin, '-y', '-hide_banner', '-loglevel', 'error', *args]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding='utf-8', errors='replace')
         if proc.returncode != 0:
             raise RuntimeError(f'ffmpeg basarisiz (exit {proc.returncode}): {proc.stderr[-3000:]}')
         return proc
@@ -270,8 +272,9 @@ def run_ffmpeg(ffmpeg_bin: str, args: list[str], *, progress=None,
     cmd = [ffmpeg_bin, '-y', '-hide_banner', '-loglevel', 'error',
            '-progress', 'pipe:1', '-nostats', *args]
     total = float(total_duration_sec)
-    popen = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, bufsize=1)
+    popen = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding='utf-8', errors='replace', bufsize=1)
     # stderr is drained on its own thread: with -loglevel error it is normally
     # empty, but a failing run can emit enough to fill the pipe and deadlock the
     # stdout reader below.
@@ -564,6 +567,140 @@ def transcribe_for_subtitles(narration_audio_path, fallback_text: str = '', max_
         return cues, 'proportional-fallback'
 
 
+#: A word Whisper is unsure about is where a proper noun usually goes wrong
+#: ("Rhaenyra" -> "Renira"). Surfaced for review rather than silently burned in.
+#:
+#: Set deliberately high. Whisper routinely reports 0.5-0.8 on names it got
+#: wrong, so a stricter threshold would leave exactly the errors this review
+#: exists to catch unflagged. The flag only draws the reviewer's eye -- it gates
+#: nothing -- so over-flagging costs a glance while under-flagging costs a
+#: misspelled name burned into the video.
+LOW_CONFIDENCE_WORD_THRESHOLD = 0.75
+
+#: Splits a token into (leading punctuation, core, trailing punctuation) so a
+#: correction can replace the word without eating its comma.
+_WORD_PARTS = re.compile(r'^(\W*)(.*?)(\W*)$', re.UNICODE | re.DOTALL)
+
+
+def _replace_word_core(token: str, mapping: dict) -> tuple:
+    """Apply a correction to one token, preserving its punctuation.
+
+    Returns (token, replaced). Matching is case-insensitive on the word core;
+    the replacement is used verbatim, because a proper noun's capitalisation is
+    part of the correction the human typed.
+    """
+    match = _WORD_PARTS.match(str(token))
+    if not match:
+        return token, False
+    lead, core, trail = match.groups()
+    replacement = mapping.get(core.casefold())
+    if replacement is None or not core:
+        return token, False
+    return f'{lead}{replacement}{trail}', True
+
+
+def apply_transcript_corrections(words: list, cues: list, corrections) -> tuple:
+    """Fix misheard words WITHOUT touching their timings.
+
+    This is the whole reason corrections are word-level rather than free-text:
+    the active-word highlight is driven by per-word start/end times obtained
+    from forced alignment. Rewriting the transcript as prose would throw those
+    away and drop the caption back to proportional guessing. Replacing word
+    cores in place keeps every timestamp exactly as the aligner produced it.
+
+    Returns (corrected_words, corrected_cues, applied) where `applied` reports
+    the hit count per correction -- a correction that matched nothing is
+    reported with count 0 rather than silently accepted.
+    """
+    pairs = []
+    for entry in (corrections or []):
+        source = str((entry or {}).get('from') or '').strip()
+        target = str((entry or {}).get('to') or '').strip()
+        if source and target:
+            pairs.append((source, target))
+    if not pairs:
+        return list(words or []), list(cues or []), []
+
+    mapping = {source.casefold(): target for source, target in pairs}
+    counts = {source.casefold(): 0 for source, _ in pairs}
+
+    corrected_words = []
+    for word in (words or []):
+        item = dict(word)
+        token, replaced = _replace_word_core(item.get('text', ''), mapping)
+        if replaced:
+            core = _WORD_PARTS.match(str(word.get('text', ''))).group(2).casefold()
+            counts[core] = counts.get(core, 0) + 1
+            item['text'] = token
+            item['corrected'] = True
+        corrected_words.append(item)
+
+    corrected_cues = []
+    for cue in (cues or []):
+        item = dict(cue)
+        tokens = str(item.get('text', '')).split()
+        item['text'] = ' '.join(_replace_word_core(tok, mapping)[0] for tok in tokens)
+        corrected_cues.append(item)
+
+    applied = [{'from': source, 'to': target, 'count': counts.get(source.casefold(), 0)}
+               for source, target in pairs]
+    return corrected_words, corrected_cues, applied
+
+
+def build_moment_transcript_artifact(words: list, cues: list, *, source: str,
+                                      language, moment_rank, moment_selection_sha256,
+                                      whisper_model_size: str, initial_prompt_used: bool,
+                                      corrections=None) -> dict:
+    """The reviewable transcript of ONE moment's original audio.
+
+    Deliberately NOT called a script: no model wrote this text. It is what the
+    source already says, aligned to the frame it says it on, and the only human
+    edit it accepts is fixing a word the recogniser misheard.
+    """
+    corrected_words, corrected_cues, applied = apply_transcript_corrections(
+        words, cues, corrections)
+    probabilities = [float(w.get('probability') or 0.0) for w in (words or [])]
+    low_confidence = [
+        {'text': w.get('text'), 'start_sec': w.get('start'),
+         'probability': w.get('probability')}
+        for w in (words or [])
+        if float(w.get('probability') or 0.0) < LOW_CONFIDENCE_WORD_THRESHOLD
+    ]
+    text = ' '.join(str(w.get('text', '')) for w in corrected_words).strip()
+    if not text:
+        text = ' '.join(str(c.get('text', '')) for c in corrected_cues).strip()
+    return {
+        'schema_version': 1,
+        'artifact_type': 'moment_transcript',
+        # Never auto-approved: a transcript exists to be read before it is burned
+        # into a video.
+        'status': 'review_required',
+        'status_reason': ('orijinal sesten transkript uretildi; insan incelemesi bekleniyor'
+                          if words or cues else
+                          'bu momentte konusma tespit edilmedi; altyazi uretilemez'),
+        'not_uploaded': True,
+        'source': source,
+        'language': language,
+        'moment_rank': moment_rank,
+        'moment_selection_sha256': moment_selection_sha256,
+        'whisper_model_size': whisper_model_size,
+        'initial_prompt_used': bool(initial_prompt_used),
+        'word_count': len(corrected_words),
+        'cue_count': len(corrected_cues),
+        'has_speech': bool(corrected_words or [c for c in corrected_cues if c.get('text')]),
+        'average_word_probability': (round(sum(probabilities) / len(probabilities), 4)
+                                     if probabilities else None),
+        'low_confidence_words': low_confidence[:50],
+        'low_confidence_count': len(low_confidence),
+        'corrections': applied,
+        'words': corrected_words,
+        'cues': corrected_cues,
+        'text': text,
+        'human_approval': {'approved': False, 'approved_by': None, 'approved_at': None,
+                           'notes': None, 'approved_content_sha256': None},
+    }
+
+
 def transcribe_for_dynamic_captions(audio_path, fallback_text: str = '',
                                     max_chars_per_cue: int = 42,
                                     whisper_model_size: str = 'small',
@@ -797,6 +934,111 @@ def resolve_render_source(hot_moments_data: dict, selected_moment: dict, source_
     return chosen_path, resolution_mode, seek_start, seek_duration, description
 
 
+def _transcript_usable(transcript) -> bool:
+    """A transcript may drive a render only when a human approved THAT text.
+
+    An unapproved or empty transcript is ignored rather than trusted: the point
+    of the review step is that nothing reaches the burned-in caption without
+    somebody having read it.
+    """
+    if not isinstance(transcript, dict):
+        return False
+    if not (transcript.get('human_approval') or {}).get('approved'):
+        return False
+    return bool(transcript.get('words') or transcript.get('cues'))
+
+
+def run_moment_transcription(
+        hot_moments_data: dict, moment_selection: dict, runtime_dir,
+        subtitle_whisper_model_size: str = 'small', subtitle_language: str = 'auto',
+        subtitle_max_chars_per_cue: int = 42, caption_theme: str = 'auto',
+        source_video_path_override: str = '', progress=None) -> dict:
+    """Transcribe the SELECTED moment's original audio for human review.
+
+    This is the step that makes `direct_clip_series` reviewable. Until now the
+    transcript was produced inside the render and burned straight into the
+    video, so a misheard proper noun ("Rhaenyra" -> "Renira") reached the
+    finished Short with no point at which a human could catch it.
+
+    It deliberately cuts the moment with the SAME seek the render uses and
+    transcribes with the SAME model and prompt, so what the reviewer approves is
+    what the render will draw -- reviewing a different transcription than the
+    one that gets rendered would be theatre.
+
+    Calls no provider: faster-whisper runs locally.
+    """
+    report = progress if progress is not None else _NullProgress()
+    from . import video_analysis
+
+    selection_errors = video_analysis.validate_moment_selection(
+        moment_selection, hot_moments_data, require_preview=True)
+    if selection_errors:
+        raise ValueError(f'Moment secimi gecersiz: {selection_errors}')
+
+    selected_rank = moment_selection.get('selected_moment_rank')
+    moments_by_rank = {moment['rank']: moment for moment in hot_moments_data['hot_moments']}
+    if selected_rank not in moments_by_rank:
+        raise ValueError(f'Secilen rank={selected_rank} hot_moments.json icinde yok.')
+    selected_moment = moments_by_rank[selected_rank]
+
+    runtime_dir = Path(runtime_dir)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    report.stage('preparation', 'Moment sesi hazirlaniyor')
+    ffmpeg_bin, ffprobe_bin = resolve_ffmpeg_binaries()
+    chosen_path, _mode, seek_start, seek_duration, source_description = resolve_render_source(
+        hot_moments_data, selected_moment, source_video_path_override)
+
+    if subtitle_whisper_model_size not in SUBTITLE_WHISPER_MODELS:
+        raise ValueError(
+            f'desteklenmeyen subtitle Whisper modeli: {subtitle_whisper_model_size!r}')
+    requested_language = str(subtitle_language or 'auto').strip().lower()
+    if requested_language == 'auto':
+        detected = str(hot_moments_data.get('transcript_language') or '').strip().lower()
+        resolved_language = detected or None
+    elif re.fullmatch(r'[a-z]{2}', requested_language):
+        resolved_language = requested_language
+    else:
+        raise ValueError("subtitle_language 'auto' veya iki harfli dil kodu olmali")
+
+    theme_context = ' '.join([str(chosen_path), str(source_description),
+                              str(selected_moment.get('transcript') or '')])
+    profile = resolve_caption_theme(caption_theme, theme_context)['profile']
+    transcription_prompt = str(profile.get('transcription_prompt') or '').strip()
+
+    clip_path = runtime_dir / 'transcript_clip.mp4'
+    report.note('Secilen moment kesiliyor')
+    run_ffmpeg(ffmpeg_bin, [
+        '-ss', str(seek_start), '-i', str(chosen_path), '-t', str(seek_duration),
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-pix_fmt', 'yuv420p',
+        '-ac', '2', '-c:a', 'aac', str(clip_path),
+    ], progress=report, total_duration_sec=seek_duration)
+
+    report.stage('whisper', f'faster-whisper-{subtitle_whisper_model_size} calisiyor')
+    words, cues, source = transcribe_for_dynamic_captions(
+        clip_path, (selected_moment.get('transcript') or '').strip(),
+        subtitle_max_chars_per_cue,
+        whisper_model_size=subtitle_whisper_model_size,
+        language=resolved_language, initial_prompt=transcription_prompt)
+
+    report.stage('write', 'Transkript yaziliyor')
+    artifact = build_moment_transcript_artifact(
+        words, cues, source=source, language=resolved_language,
+        moment_rank=selected_rank,
+        moment_selection_sha256=video_analysis.hot_moments_content_sha256(moment_selection),
+        whisper_model_size=subtitle_whisper_model_size,
+        initial_prompt_used=bool(transcription_prompt))
+    try:
+        clip_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    report.count(artifact['word_count'], artifact['word_count'], unit='kelime',
+                 message=(f"{artifact['word_count']} kelime, "
+                          f"{artifact['low_confidence_count']} dusuk guvenli"
+                          if artifact['has_speech'] else 'konusma yok'))
+    return artifact
+
+
 def run_original_audio_subtitle_pipeline(
         hot_moments_data: dict, moment_selection: dict, hot_moments_path,
         moment_selection_path, render_dir, render_mode: str = 'blurred_background',
@@ -811,7 +1053,7 @@ def run_original_audio_subtitle_pipeline(
         caption_active_color_ass: str | None = None,
         caption_base_color_ass: str | None = None,
         caption_max_words: int | None = None, caption_max_chars: int | None = None,
-        caption_margin_v: int | None = None,
+        caption_margin_v: int | None = None, moment_transcript: dict | None = None,
         source_video_path_override: str = '', progress=None) -> dict:
     """Render the selected source moment with its ORIGINAL audio and subtitles.
 
@@ -897,6 +1139,12 @@ def run_original_audio_subtitle_pipeline(
         '-ss', str(seek_start), '-i', str(chosen_path), '-t', str(seek_duration),
         '-map', '0:v:0', '-map', '0:a:0?',
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+        # Stereo: a 5.1 source re-encoded to AAC keeps six channels but LOSES
+        # its layout metadata, and the next AAC encode in the chain then fails
+        # with 'Unsupported channel layout "6 channels"'. A vertical Short is a
+        # phone artifact, so stereo is the correct target and the only layout
+        # every downstream encoder reliably accepts.
+        '-ac', '2',
         '-c:a', 'aac', str(base_clip_path),
     ], progress=report, total_duration_sec=seek_duration)
     base_info, _base_backend = probe_media(ffmpeg_bin, ffprobe_bin, base_clip_path)
@@ -906,18 +1154,46 @@ def run_original_audio_subtitle_pipeline(
 
     fallback_text = (selected_moment.get('transcript') or '').strip()
     report.stage('subtitles', 'Orijinal sesten dinamik altyazi')
-    words, cues, subtitle_source = transcribe_for_dynamic_captions(
-        base_clip_path, fallback_text, subtitle_max_chars_per_cue,
-        whisper_model_size=subtitle_whisper_model_size,
-        language=resolved_subtitle_language,
-        initial_prompt=transcription_prompt,
-    )
+    # An APPROVED transcript wins. It was produced from the same seek with the
+    # same model, a human read it and fixed the words the recogniser misheard,
+    # and re-transcribing here would silently throw those corrections away --
+    # and pay for a second Whisper pass to do it.
+    approved_transcript = moment_transcript if _transcript_usable(moment_transcript) else None
+    if approved_transcript:
+        words = list(approved_transcript.get('words') or [])
+        cues = list(approved_transcript.get('cues') or [])
+        subtitle_source = (f"approved-transcript:{approved_transcript.get('source') or 'unknown'}")
+        report.note(f"Onayli transkript kullaniliyor ({len(words)} kelime, "
+                    f"{len(approved_transcript.get('corrections') or [])} duzeltme)")
+    else:
+        words, cues, subtitle_source = transcribe_for_dynamic_captions(
+            base_clip_path, fallback_text, subtitle_max_chars_per_cue,
+            whisper_model_size=subtitle_whisper_model_size,
+            language=resolved_subtitle_language,
+            initial_prompt=transcription_prompt,
+        )
     if not cues:
         raise RuntimeError('Orijinal sesten altyazi cue uretilemedi.')
+    # Zero transcribed words means this moment carries no speech. The pipeline
+    # still renders it -- a wordless action beat is a valid Short -- but the
+    # manifest, the panel and the review checklist must all say so, because the
+    # promise of this mode is "original audio PLUS timed subtitles" and only half
+    # of that was delivered.
+    no_speech_detected = not words and not fallback_text
+    subtitle_warning = None
+    if no_speech_detected:
+        subtitle_warning = (
+            'Bu momentte konusma tespit edilmedi; Short ALTYAZISIZ uretildi. '
+            'Ses var ama sozel icerik yok (muzik/aksiyon sahnesi olabilir). '
+            'Altyazili bir Short istiyorsan Moment Explorer\'da konusma iceren '
+            'bir aday sec.')
+        report.note(subtitle_warning)
     subtitles_srt_path = render_dir / 'subtitles.srt'
     write_srt(cues, subtitles_srt_path)
     report.count(len(cues), len(cues), unit='altyazi',
-                 message=f'{len(cues)} altyazi satiri ({subtitle_source})')
+                 message=(f'{len(cues)} altyazi satiri ({subtitle_source})'
+                          if not no_speech_detected
+                          else 'konusma yok - altyazi uretilmedi'))
 
     vertical_graph = build_vertical_filtergraph(render_mode, render_width, render_height)
     subtitles_ass_path = render_dir / 'subtitles_dynamic.ass'
@@ -961,6 +1237,7 @@ def run_original_audio_subtitle_pipeline(
         '-i', str(base_clip_path), '-filter_complex', filter_complex,
         '-map', '[vout]', '-map', '0:a:0',
         '-c:v', 'libx264', '-preset', encode_preset, '-crf', str(encode_crf), '-pix_fmt', 'yuv420p',
+        '-ac', '2',
         '-c:a', 'aac', '-movflags', '+faststart', str(final_output_path),
     ], progress=report, total_duration_sec=seek_duration)
     render_latency_sec = _time.time() - started_at
@@ -1002,7 +1279,10 @@ def run_original_audio_subtitle_pipeline(
     return {
         'status': final_status,
         'status_reason': (
-            'orijinal ses korundu ve altyazilar videoya gomuldu; insan incelemesi bekleniyor'
+            ('orijinal ses korundu ancak bu momentte KONUSMA YOK; Short altyazisiz '
+             'uretildi, insan incelemesi bekleniyor'
+             if no_speech_detected else
+             'orijinal ses korundu ve altyazilar videoya gomuldu; insan incelemesi bekleniyor')
             if render_validation['passed'] else
             'orijinal-ses altyazi renderi teknik dogrulamadan gecemedi'
         ),
@@ -1065,6 +1345,19 @@ def run_original_audio_subtitle_pipeline(
             'average_word_probability': average_word_probability,
             'low_confidence_word_ratio': low_confidence_word_ratio,
             'fallback_transcript': fallback_text,
+            # A moment can be loud and still contain no speech -- music, battle,
+            # a dragon. The audio-energy signal ranks such a window highly, so it
+            # reaches selection looking like any other candidate, and the render
+            # then produces a Short with NO subtitles. That is a legitimate Short
+            # (an action beat needs no captions) but it is NOT what this mode
+            # claims to deliver, so it is stated instead of left for the viewer
+            # to discover.
+            'no_speech_detected': no_speech_detected,
+            'subtitle_warning': subtitle_warning,
+            # Which text the burned-in caption came from: a human-approved
+            # transcript, or a fresh recognition nobody read.
+            'from_approved_transcript': bool(approved_transcript),
+            'applied_corrections': ((approved_transcript or {}).get('corrections') or []),
         },
         'output': {
             'final_video_path': str(final_output_path),
@@ -1168,6 +1461,12 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
         '-ss', str(seek_start), '-i', str(chosen_path), '-t', str(seek_duration),
         '-map', '0:v:0', '-map', '0:a:0?',
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+        # Stereo: a 5.1 source re-encoded to AAC keeps six channels but LOSES
+        # its layout metadata, and the next AAC encode in the chain then fails
+        # with 'Unsupported channel layout "6 channels"'. A vertical Short is a
+        # phone artifact, so stereo is the correct target and the only layout
+        # every downstream encoder reliably accepts.
+        '-ac', '2',
         '-c:a', 'aac', str(base_clip_path),
     ], progress=report, total_duration_sec=seek_duration)
     base_info, _base_backend = probe_media(ffmpeg_bin, ffprobe_bin, base_clip_path)
@@ -1200,6 +1499,7 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
         '-filter_complex', filter_complex,
         '-map', '[vout]', '-map', '[aout]',
         '-c:v', 'libx264', '-preset', encode_preset, '-crf', str(encode_crf), '-pix_fmt', 'yuv420p',
+        '-ac', '2',
         '-c:a', 'aac', '-movflags', '+faststart',
         str(final_output_path),
     ], progress=report, total_duration_sec=seek_duration)

@@ -76,6 +76,12 @@ ACTIVITIES = {
                           ("scoring", "Moment skorlama"),
                           ("previews", "Onizleme klipleri")),
     },
+    "transcript": {
+        "label": "Altyazi transkripti", "tab": "script",
+        "stages": _stages(("preparation", "Moment sesi hazirlaniyor"),
+                          ("whisper", "Orijinal ses yaziya dokuluyor"),
+                          ("write", "Transkript yaziliyor")),
+    },
     "script_generation": {
         "label": "Script uretimi", "tab": "script",
         "stages": _stages(("preparation", "Girdi dogrulama"),

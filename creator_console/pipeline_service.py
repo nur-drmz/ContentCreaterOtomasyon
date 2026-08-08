@@ -51,6 +51,7 @@ ARTIFACTS = {
     "moment_selection": "results/moment_selection.json",
     "selected_script": "results/selected_script.json",
     "selected_voiceover": "results/selected_voiceover.json",
+    "moment_transcript": "results/moment_transcript.json",
     "render_manifest": "results/render/render_manifest.json",
 }
 
@@ -63,7 +64,7 @@ ARTIFACTS = {
 #: Narration artifacts are absent on purpose: `build_processing_plan` refuses a
 #: `narrated_theory` plan with output_count != 1, so a narrated project has
 #: exactly one slot and its script/voiceover cannot be ambiguous.
-PER_SLOT_ARTIFACTS = frozenset({"moment_selection", "render_manifest"})
+PER_SLOT_ARTIFACTS = frozenset({"moment_selection", "moment_transcript", "render_manifest"})
 
 #: A full-source scan does not run the window pipeline's stages, so it declares
 #: its own. Showing a window run's "Whisper transkript" stage during a scan that
@@ -100,6 +101,7 @@ REQUIRED_FIELDS = {
     "moment_selection": ("artifact_type", "status", "selected_moment_rank"),
     "selected_script": ("status", "provider_attempts"),
     "selected_voiceover": ("status",),
+    "moment_transcript": ("artifact_type", "status", "words", "cues"),
     "render_manifest": ("status", "output", "approval"),
 }
 
@@ -871,6 +873,7 @@ class PipelineService:
         "processing_plan": "processing_plan",
         "script": "selected_script",
         "voiceover": "selected_voiceover",
+        "transcript": "moment_transcript",
         "render": "render_manifest",
     }
 
@@ -1160,6 +1163,11 @@ class PipelineService:
         chain = ["processing_plan"]
         if mode == source_strategy.MODE_NARRATED_THEORY:
             chain += ["script", "voiceover"]
+        else:
+            # The caption text of a clip Short is as much a human decision as a
+            # narrated script is, so it belongs in the chain: correcting a word
+            # after approving the render must invalidate that render.
+            chain.append("transcript")
         chain.append("render")
 
         upstream_problems: list = []
@@ -1580,6 +1588,146 @@ class PipelineService:
             tracker.finish(message=f"{artifact.get('duration_sec', 0)}s ses hazir")
         return artifact
 
+    def transcript_view(self, slot: int = 1) -> dict:
+        """A curated slice for the caption screen.
+
+        The raw artifact carries every word with its timings; dumping that into
+        the page would bury the two things a reviewer needs -- the text, and
+        which words the recogniser was unsure about.
+        """
+        slot = int(slot or 1)
+        loaded = self.load_artifact("moment_transcript", slot=slot)
+        data = loaded["data"] or {}
+        allowed, gate_reason = self.plan_gate("transcript")
+        state = self.approval_state("transcript", slot) if data else {}
+        selection = self.load_artifact("moment_selection", slot=slot)["data"] or {}
+        return {
+            "slot": slot,
+            "available": bool(data),
+            "problem": loaded["problem"],
+            "phase_allowed": bool(allowed),
+            "phase_reason": gate_reason,
+            "moment_rank": data.get("moment_rank") or selection.get("selected_moment_rank"),
+            "status": data.get("status"),
+            "status_reason": data.get("status_reason"),
+            "language": data.get("language"),
+            "whisper_model_size": data.get("whisper_model_size"),
+            "source": data.get("source"),
+            "text": data.get("text"),
+            "word_count": data.get("word_count"),
+            "cue_count": data.get("cue_count"),
+            "has_speech": data.get("has_speech"),
+            "average_word_probability": data.get("average_word_probability"),
+            "low_confidence_words": data.get("low_confidence_words") or [],
+            "low_confidence_count": data.get("low_confidence_count"),
+            "corrections": data.get("corrections") or [],
+            # Words carry the highlight timings, so the page can show the caption
+            # the way it will actually appear, with unsure words marked.
+            "words": [
+                {"text": w.get("text"), "start_sec": w.get("start"),
+                 "probability": w.get("probability"),
+                 "low_confidence": float(w.get("probability") or 0.0)
+                                   < render_utils.LOW_CONFIDENCE_WORD_THRESHOLD,
+                 "corrected": bool(w.get("corrected"))}
+                for w in (data.get("words") or [])[:2000]
+            ],
+            "approval": state,
+        }
+
+    def run_transcript(self, *, subtitle_whisper_model_size="small",
+                       subtitle_language="auto", caption_theme="auto",
+                       job_id=None, actor="console", slot=1) -> dict:
+        """Transcribe the selected moment's ORIGINAL audio for human review.
+
+        This is `direct_clip_series`'s caption step. It calls no provider: the
+        text is what the source already says, recognised locally. Existing
+        corrections are carried over, because re-running the recognition should
+        not silently discard the names a human already fixed.
+        """
+        self.require_phase("transcript")
+        slot = self.require_slot(slot)
+        tracker = self.tracker("transcript", job_id=job_id)
+        tracker.start("Transkript uretimi basladi")
+        try:
+            hot = self.load_artifact("hot_moments", required=True)
+            selection = self.load_artifact("moment_selection", required=True, slot=slot)
+            for loaded in (hot, selection):
+                if loaded["problem"]:
+                    raise ArtifactProblem(loaded["problem"])
+            previous = self.load_artifact("moment_transcript", slot=slot)["data"] or {}
+            runtime_dir = self.storage.resolve(self.ownership, RUNTIME_DIRNAME,
+                                               create_parent=True)
+            artifact = render_utils.run_moment_transcription(
+                hot["data"], selection["data"], runtime_dir,
+                subtitle_whisper_model_size=subtitle_whisper_model_size,
+                subtitle_language=subtitle_language, caption_theme=caption_theme,
+                source_video_path_override=str(self.source_path()),
+                progress=tracker)
+            carried = [
+                {"from": item.get("from"), "to": item.get("to")}
+                for item in (previous.get("corrections") or [])
+                if item.get("from") and item.get("to")
+            ]
+            if carried:
+                artifact = self._apply_transcript_corrections(artifact, carried)
+                tracker.note(f"{len(carried)} onceki duzeltme yeniden uygulandi")
+            self.write_artifact("moment_transcript", artifact, job_id=job_id,
+                                actor=actor, slot=slot)
+            tracker.finish(message=(f"{artifact['word_count']} kelime, inceleme bekliyor"
+                                    if artifact["has_speech"] else "konusma yok"))
+            return artifact
+        except Exception as exc:  # noqa: BLE001
+            tracker.fail(f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _apply_transcript_corrections(self, artifact: dict, corrections) -> dict:
+        """Re-derive the corrected text from the ORIGINAL recognition.
+
+        Corrections are always applied to the untouched recognition rather than
+        on top of a previous pass, so removing a correction really removes it
+        instead of leaving its effect baked in.
+        """
+        base_words = [
+            {k: v for k, v in word.items() if k != "corrected"}
+            for word in (artifact.get("words") or [])
+        ]
+        rebuilt = render_utils.build_moment_transcript_artifact(
+            base_words, artifact.get("cues") or [],
+            source=artifact.get("source"), language=artifact.get("language"),
+            moment_rank=artifact.get("moment_rank"),
+            moment_selection_sha256=artifact.get("moment_selection_sha256"),
+            whisper_model_size=artifact.get("whisper_model_size"),
+            initial_prompt_used=artifact.get("initial_prompt_used"),
+            corrections=corrections)
+        return rebuilt
+
+    def set_transcript_corrections(self, *, corrections, edited_by: str, slot: int = 1) -> dict:
+        """Replace this slot's correction list and re-derive the caption text.
+
+        Any existing approval is dropped by construction: the approval hash
+        covers the words, so changed words cannot stay approved.
+        """
+        slot = self.require_slot(slot)
+        loaded = self.load_artifact("moment_transcript", required=True, slot=slot)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        cleaned = []
+        for item in (corrections or []):
+            source = str((item or {}).get("from") or "").strip()
+            target = str((item or {}).get("to") or "").strip()
+            if not source or not target:
+                continue
+            if len(source) > 80 or len(target) > 80:
+                raise PipelineServiceError("duzeltme kelimeleri 80 karakteri gecemez")
+            cleaned.append({"from": source, "to": target})
+        if len(cleaned) > 100:
+            raise PipelineServiceError("en fazla 100 duzeltme tanimlanabilir")
+        artifact = self._apply_transcript_corrections(loaded["data"], cleaned)
+        relative = self.write_artifact("moment_transcript", artifact, actor=edited_by, slot=slot)
+        self.audit.record("artifact.written", actor=edited_by, artifact=relative,
+                          detail={"corrections": len(cleaned), "slot": slot})
+        return artifact
+
     def run_render(self, *, render_mode="blurred_background", preview_mode=True,
                    subtitle_whisper_model_size="small", subtitle_language="auto",
                    caption_style="active_word_yellow", caption_theme="auto",
@@ -1626,10 +1774,22 @@ class PipelineService:
             selection = self.load_artifact("moment_selection", required=True, slot=slot)
             if selection["problem"]:
                 raise ArtifactProblem(selection["problem"])
+            # The caption text is a human decision in this mode, exactly as the
+            # script is in the narrated mode. Rendering without it would burn in
+            # words nobody read -- the failure this phase was added to stop.
+            transcript = self.load_artifact("moment_transcript", slot=slot)
+            if transcript["problem"]:
+                raise ArtifactProblem(transcript["problem"])
+            transcript_state = self.approval_state("transcript", slot)
+            if not transcript_state.get("valid"):
+                raise PipelineServiceError(
+                    "Render acilmadi: once Altyazi sekmesinde bu ciktinin transkriptini "
+                    "uret, oku ve onayla. " + (transcript_state.get("reason") or ""))
             manifest = render_utils.run_original_audio_subtitle_pipeline(
                 hot["data"], selection["data"],
                 self.relative(self.path("hot_moments")),
                 self.relative(self.path("moment_selection", slot)),
+                moment_transcript=transcript["data"],
                 render_dir=render_dir, render_mode=render_mode, preview_mode=preview_mode,
                 subtitle_whisper_model_size=subtitle_whisper_model_size,
                 subtitle_language=subtitle_language,

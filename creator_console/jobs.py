@@ -62,6 +62,7 @@ TERMINAL_STATUSES = (STATUS_REVIEW_REQUIRED, STATUS_FAILED, STATUS_COMPLETED,
 JOB_TYPES = (
     "source_assessment",
     "video_analysis",
+    "transcript",
     "script_generation",
     "tts",
     "render",

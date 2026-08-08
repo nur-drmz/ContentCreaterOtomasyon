@@ -1488,8 +1488,18 @@ function screenMoments() {
               el('strong', { text: `Aday #${moment.rank}` }),
               el('span', { text: `${formatMediaTime(moment.source_start_sec)} - ${formatMediaTime(moment.source_end_sec)}` }),
               el('span', { text: `Skor ${moment.score}` }),
+              // A loud but wordless window scores like any other candidate, and
+              // only reveals itself after a render comes back with no subtitles.
+              // Said here, where the choice is actually made.
+              moment.has_speech === false
+                ? badge('failed', 'konusma yok') : null,
               selection && selection.selected_moment_rank === moment.rank && !staleSelection
                 ? badge('approved', 'kayitli') : null),
+            moment.has_speech === false
+              ? el('div', { class: 'dim', 'data-testid': `no-speech-${moment.rank}`,
+                  text: 'Bu adayda konusma yok (muzik/aksiyon olabilir). Secilirse Short '
+                        + 'ALTYAZISIZ uretilir; altyazi istiyorsan konusma iceren bir aday sec.' })
+              : null,
             moment.preview_problem
               ? el('div', { class: 'dim', text: moment.preview_problem })
               : moment.preview_path
@@ -1833,8 +1843,138 @@ function phaseRunCard(jobType, title, description, params, extraFields) {
     el('div', { style: 'margin-top:16px' }, phaseStatusPanel(jobType)));
 }
 
+/* The caption screen of `direct_clip_series`.
+ *
+ * This is NOT script generation: no model writes anything here and no provider
+ * is called. It shows what the source audio already says, recognised locally,
+ * so a human can fix a misheard proper noun before it is burned into the video.
+ * Corrections are word-level on purpose -- they keep the alignment timings that
+ * drive the yellow active-word highlight, which free-text editing would destroy.
+ */
+function screenTranscript() {
+  const t = state.project.transcript || {};
+  const corrections = (t.corrections || []).slice();
+  return el('div', {},
+    el('div', { class: 'page-head' }, el('div', {},
+      el('h1', { text: 'Altyazi (orijinal ses)' }),
+      el('p', { class: 'subtitle',
+                text: 'Kaynak videonun kendi sesi yaziya dokulur. Model yeni metin '
+                      + 'YAZMAZ, hicbir API cagrilmaz. Render bu metni kullanir.' }))),
+    !t.phase_allowed
+      ? alertBox('info', 'Bu planda altyazi transkripti kullanilmiyor',
+                 t.phase_reason || '')
+      : null,
+    phaseRunCard('transcript', 'Transkripti uret',
+      'Secilen momentin orijinal sesi yerel Whisper ile yaziya dokulur.', () => ({
+        subtitle_whisper_model_size: planSubtitleModel(),
+        subtitle_language: planSubtitleLanguage(),
+        caption_theme: planCaptionTheme(),
+      })),
+    t.problem ? alertBox('danger', 'Transkript okunamadi', t.problem) : null,
+    t.available && t.has_speech === false
+      ? alertBox('warn', 'Bu momentte konusma yok',
+                 'Altyazi uretilemez. Altyazili bir Short istiyorsan Moment '
+                 + 'Explorer\'da konusma iceren bir aday sec.')
+      : null,
+    t.available && t.has_speech
+      ? el('div', { class: 'card' },
+          el('div', { class: 'card__head' },
+            el('h2', { text: 'Altyazi metni' }),
+            badge(t.status === 'approved' ? 'approved' : 'review_required', t.status)),
+          el('div', { class: 'dim' },
+            `${t.word_count} kelime - ${t.cue_count} satir - dil ${t.language || '?'} - `
+            + `${t.whisper_model_size} - ortalama guven `
+            + `${t.average_word_probability != null ? t.average_word_probability : '?'}`),
+          t.low_confidence_count
+            ? el('div', { class: 'dim', 'data-testid': 'low-confidence-note',
+                text: `${t.low_confidence_count} kelime dusuk guvenli (asagida isaretli). `
+                      + 'Ozel isimler genelde burada yanlis cikar.' })
+            : null,
+          // The caption as it will read, with unsure words marked so the eye
+          // lands on exactly the words that need checking.
+          el('div', { class: 'transcript-text', 'data-testid': 'transcript-text' },
+            (t.words || []).map(w => el('span', {
+              class: 'transcript-word'
+                     + (w.low_confidence ? ' transcript-word--unsure' : '')
+                     + (w.corrected ? ' transcript-word--fixed' : ''),
+              title: `${w.start_sec}s - guven ${w.probability}`,
+            }, `${w.text} `))),
+          el('div', { class: 'dim mono', 'data-testid': 'transcript-plain',
+                      text: t.text || '' }))
+      : null,
+    t.available && t.has_speech ? transcriptCorrectionsPanel(corrections) : null,
+    t.available && t.has_speech
+      ? el('div', { class: 'card' }, el('h2', { text: 'Altyazi onayi' }),
+          el('p', { class: 'dim',
+                    text: 'Onaylanmadan render acilmaz. Duzeltme eklersen onay duser.' }),
+          approvalPanel('transcript', 'Altyaziyi onayla'))
+      : null);
+}
+
+function transcriptCorrectionsPanel(corrections) {
+  const rows = corrections.length ? corrections : [{ from: '', to: '', count: null }];
+  return el('div', { class: 'card', 'data-testid': 'transcript-corrections' },
+    el('h2', { text: 'Kelime duzeltmeleri' }),
+    el('p', { class: 'dim',
+      text: 'Yanlis duyulan kelimeyi dogrusuyla degistir (ornek: Renira -> Rhaenyra). '
+            + 'Zaman damgalari korunur, aktif-kelime vurgusu bozulmaz.' }),
+    el('div', { class: 'stack', id: 'corrections-rows' },
+      rows.map((row, index) => el('div', { class: 'correction-row' },
+        el('input', { type: 'text', id: `corr-from-${index}`,
+                      value: row.from || '', placeholder: 'yanlis duyulan',
+                      maxlength: 80 }),
+        el('span', { class: 'dim', text: '->' }),
+        el('input', { type: 'text', id: `corr-to-${index}`,
+                      value: row.to || '', placeholder: 'dogrusu', maxlength: 80 }),
+        row.count != null
+          ? el('span', { class: row.count ? 'dim' : 'transcript-nomatch',
+              'data-testid': `corr-count-${index}`,
+              text: row.count ? `${row.count} yerde` : 'eslesme yok' })
+          : null))),
+    el('div', { class: 'row' },
+      el('button', { class: 'btn btn--sm', 'data-testid': 'corr-add',
+        onclick: () => {
+          state.transcriptRows = (state.transcriptRows || rows.length) + 1;
+          render();
+        } }, 'Satir ekle'),
+      el('button', { class: 'btn btn--primary', 'data-testid': 'corr-save',
+        onclick: async (event) => {
+          event.currentTarget.disabled = true;
+          const total = state.transcriptRows || rows.length;
+          const payload = [];
+          for (let i = 0; i < total; i += 1) {
+            const from = (document.getElementById(`corr-from-${i}`) || {}).value || '';
+            const to = (document.getElementById(`corr-to-${i}`) || {}).value || '';
+            if (from.trim() && to.trim()) payload.push({ from: from.trim(), to: to.trim() });
+          }
+          await guard(() => api.post(
+            `/api/projects/${state.projectId}/transcript/corrections`,
+            { corrections: payload }));
+          state.transcriptRows = null;
+          await refresh();
+        } }, 'Duzeltmeleri uygula')));
+}
+
+function planSubtitleModel() {
+  const cfg = (((state.project.phase0 || {}).plan || {}).decision || {}).render || {};
+  return cfg.subtitle_whisper_model_size || 'large-v3-turbo';
+}
+function planSubtitleLanguage() {
+  const cfg = (((state.project.phase0 || {}).plan || {}).decision || {}).render || {};
+  return cfg.subtitle_language || 'auto';
+}
+function planCaptionTheme() {
+  const cfg = (((state.project.phase0 || {}).plan || {}).decision || {}).render || {};
+  return cfg.caption_theme || 'auto';
+}
+
 function screenScript() {
   const decision = ((state.project.phase0 || {}).plan || {}).decision || {};
+  // One tab, two meanings, decided by the approved plan: a clip series captions
+  // the source's own words, a narrated theory speaks a written script. Showing
+  // the narrated panel to a clip project is what made "open script generation"
+  // look like the way to get subtitles.
+  if (decision.mode && decision.mode !== 'narrated_theory') return screenTranscript();
   return el('div', {},
     el('div', { class: 'page-head' }, el('div', {},
       el('h1', { text: 'Script Studio' }),
@@ -2327,6 +2467,13 @@ function renderTechnicalSummary(tech) {
       el('h2', { text: 'Teknik ozet' }),
       badge(tech.validation_passed ? 'completed' : 'failed',
             tech.validation_passed ? 'teknik dogrulama gecti' : 'teknik dogrulama BASARISIZ')),
+    // Technically valid and still not what the mode promised: a Short with no
+    // subtitles because the chosen moment had no speech.
+    tech.no_speech_detected
+      ? alertBox('warn', 'Bu Short ALTYAZISIZ uretildi',
+                 tech.subtitle_warning
+                 || 'Secilen momentte konusma tespit edilmedi.')
+      : null,
     el('div', { class: 'tech-grid', 'data-testid': 'render-technical' },
       techCell('Sure', tech.duration_sec ? `${Number(tech.duration_sec).toFixed(2)} sn` : null),
       techCell('Cozunurluk', tech.resolution + (tech.vertical ? ' (9:16)' : ' (DIKEY DEGIL)')),
@@ -2606,6 +2753,17 @@ const RENDERERS = {
   settings: screenSettings,
 };
 
+/* The script tab means different things in the two modes, so it is named for
+ * what it actually does in the plan that was approved. Calling it "Script
+ * Studio" on a clip project is what suggested subtitles needed a generated
+ * script. */
+function screenLabel(screen) {
+  if (screen.key !== 'script') return screen.label;
+  const mode = (((state.project || {}).phase0 || {}).plan || {}).decision || {};
+  if (mode.mode && mode.mode !== 'narrated_theory') return 'Altyazi';
+  return screen.label;
+}
+
 /* ------------------------------------------------------------ rendering */
 function renderNav() {
   const nav = document.getElementById('nav');
@@ -2614,7 +2772,7 @@ function renderNav() {
     'aria-current': String(state.screen === screen.key),
     disabled: screen.needsProject && !state.projectId,
     onclick: () => goto(screen.key),
-  }, screen.label,
+  }, screenLabel(screen),
     screen.key === 'jobs' && state.project
       ? badge('running', String((state.project.job_summary || {}).active || 0))
       : null)));

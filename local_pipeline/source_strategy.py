@@ -66,7 +66,13 @@ MODE_NARRATED_THEORY = "narrated_theory"
 PROCESSING_MODES = (MODE_DIRECT_CLIP_SERIES, MODE_NARRATED_THEORY)
 
 #: Phase 0 decides which downstream phases may run at all.
-GATED_PHASES = ("video_analysis", "moment_selection", "script_generation", "tts", "render")
+#:
+#: `transcript` is the ORIGINAL audio written down for review -- no model writes
+#: it and no provider is called. It exists only where the caption comes from the
+#: source itself; a narrated plan draws its captions from the script it already
+#: approved, so transcribing there would review the wrong text.
+GATED_PHASES = ("video_analysis", "moment_selection", "transcript",
+                "script_generation", "tts", "render")
 
 #: Mode -> the render pipeline this project already implements. Phase 0 does not
 #: invent a new render path; it selects between the two that exist.
@@ -80,21 +86,29 @@ MODE_PHASE_POLICY = {
     MODE_DIRECT_CLIP_SERIES: {
         "video_analysis": (True, ""),
         "moment_selection": (True, ""),
+        # The altyazi step of this mode: the source's OWN words, transcribed
+        # locally and read by a human before they are burned in.
+        "transcript": (True, ""),
         "script_generation": (
             False,
-            "mod=direct_clip_series: orijinal ses korunur, yeni script uretilmez; "
-            "hicbir script API cagrisi yapilmaz",
+            "mod=direct_clip_series: altyazi orijinal sesin transkriptinden gelir "
+            "(Transkript fazi), model yeni metin YAZMAZ; hicbir script API cagrisi yapilmaz",
         ),
         "tts": (
             False,
-            "mod=direct_clip_series: orijinal ses korunur, seslendirme uretilmez; "
-            "hicbir TTS API cagrisi yapilmaz",
+            "mod=direct_clip_series: orijinal ses korunur, sentetik seslendirme "
+            "uretilmez; hicbir TTS API cagrisi yapilmaz",
         ),
         "render": (True, ""),
     },
     MODE_NARRATED_THEORY: {
         "video_analysis": (True, ""),
         "moment_selection": (True, ""),
+        "transcript": (
+            False,
+            "mod=narrated_theory: altyazi onaylanan anlatim scriptinden uretilir, "
+            "kaynak sesin transkriptinden degil",
+        ),
         "script_generation": (True, ""),
         "tts": (True, ""),
         "render": (True, ""),
