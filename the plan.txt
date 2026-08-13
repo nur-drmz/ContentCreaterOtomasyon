@@ -1,0 +1,2074 @@
+# AI Content Intelligence & Production Platform
+
+## Master Product and Technical Planning Document
+
+**Status:** Planning phase  
+**Intended reader:** Claude Code, software architects, developers, AI engineers, product designers, and future contributors.
+
+## Important Instruction
+
+This document is the current source of truth for product planning.
+
+Do not begin implementation directly from this document.
+
+Before coding:
+
+1. Define the approved MVP scope.
+2. Create explicit user stories and acceptance criteria.
+3. Finalize the technology stack.
+4. Create architecture decision records.
+5. Define repository structure and development rules.
+6. Create versioned implementation milestones.
+7. Obtain explicit approval before modifying files or running terminal commands.
+
+Do not silently resolve open decisions.
+
+---
+
+# 1. Product Vision
+
+Build a cloud-first web and mobile platform for entertainment-focused YouTube content creators.
+
+The platform should help users:
+
+1. Discover currently promising movies, series, episodes, characters, scenes, and content topics.
+2. Select the YouTube channel and content concept for which the content will be produced.
+3. Upload a user-provided long-form movie or series video.
+4. Analyze the source video for:
+   - Narrative importance
+   - Emotional peaks
+   - Music rises
+   - Visual movement
+   - Action
+   - Character reactions
+   - Dialogue
+   - Story turning points
+   - Theory potential
+   - Short-form suitability
+5. Extract approximately 20–40 strong candidate moments.
+6. Present the moments as preview cards, usually around 30 seconds long.
+7. Allow the user to select multiple moments.
+8. Allow the user to describe the intended video using a natural-language prompt.
+9. Generate an editable rough cut from the selected moments.
+10. Generate multiple evidence-linked script alternatives.
+11. Generate voice-over through providers such as ElevenLabs.
+12. Edit the video through the platform's cloud editor.
+13. Keep CapCut or external editors optional.
+14. Estimate viral potential.
+15. Provide probabilistic view forecasts.
+16. Upload the final video to the selected YouTube channel as private or unlisted.
+17. Require explicit authorized human approval before public publishing.
+18. Learn from user decisions and post-publication analytics.
+
+The system must support:
+
+- Web application
+- Mobile application
+- Multiple users
+- Multiple workspaces
+- Multiple channels per workspace
+- Multiple content concepts per channel
+- Channel-specific AI behavior
+- Channel-specific analytics and prediction calibration
+
+---
+
+# 2. Product Positioning
+
+The product must not be positioned as a generic AI clipping tool.
+
+Existing products already provide combinations of:
+
+- Long-form video clipping
+- Auto captions
+- Vertical reframing
+- Basic virality scoring
+- Prompt-based editing
+- General YouTube trend discovery
+- Social publishing and scheduling
+
+The intended positioning is:
+
+> An entertainment content intelligence and production operating system that determines what content should be created, from which scenes, for which channel, with which narrative structure, and at what time.
+
+The main competitive advantages should be:
+
+- Entertainment Opportunity Radar
+- Narrative-aware moment detection
+- Channel Brain
+- Scene Genome
+- Narrative Graph
+- Human-directed story composition
+- Evidence-linked scripts
+- Theory Guard
+- Cross-channel portfolio optimization
+- Scene Reuse Guard
+- Variant Arena
+- Retention learning loop
+- Probabilistic performance forecasting
+
+---
+
+# 3. Non-Negotiable Product Principles
+
+## 3.1 Human-in-the-loop publishing
+
+The platform must never publish a video publicly without explicit human approval.
+
+AI may:
+
+- Recommend topics
+- Analyze videos
+- Select candidate moments
+- Generate rough cuts
+- Generate scripts
+- Generate voice-over
+- Suggest edits
+- Estimate performance
+
+The user remains responsible for:
+
+- Selecting the target channel
+- Selecting the channel concept
+- Selecting moments
+- Approving the prompt
+- Approving or editing the script
+- Approving voice-over
+- Approving the final render
+- Approving public publication
+
+## 3.2 User-provided media only
+
+The platform must not include:
+
+- Netflix downloaders
+- HBO/Max downloaders
+- Prime Video downloaders
+- DRM bypass tools
+- Screen recording protection bypasses
+- Streaming platform credential storage
+- Automated capture of protected streaming content
+
+The user uploads the video file.
+
+The platform should request a source-rights declaration, but the declaration must not be presented as legal clearance.
+
+## 3.3 Cloud-first media workflow
+
+The user should not need a permanent local project folder.
+
+The platform should use:
+
+- Direct browser-to-object-storage uploads
+- Mobile upload support
+- Temporary cloud storage
+- Short-lived signed URLs
+- Automatic media lifecycle deletion
+- Cloud-based analysis
+- Cloud-based preview rendering
+- Cloud-based final rendering
+
+## 3.4 Analyze once, reuse many times
+
+A long source video should be deeply analyzed once.
+
+The analysis should be reusable for:
+
+- Multiple prompts
+- Multiple rough cuts
+- Multiple scripts
+- Multiple channels
+- Multiple channel concepts
+- Multiple languages
+- Multiple output formats
+- Multiple future projects
+
+## 3.5 Cost-aware AI model routing
+
+The strongest and most expensive model must not be used for every task.
+
+Recommended processing order:
+
+1. FFmpeg and deterministic CPU analysis
+2. Speech-to-text and audio signal processing
+3. Lightweight embeddings and classifiers
+4. Candidate filtering
+5. Medium models for narrative and semantic analysis
+6. Strong multimodal models only for top candidate scenes
+7. Strong LLM only for final script reasoning and quality review
+
+## 3.6 Evidence over hallucination
+
+Every factual script statement should be linked to:
+
+- A source timestamp
+- A selected moment
+- A transcript segment
+- Or a verified external source
+
+Each statement should be classified as:
+
+- Confirmed by source
+- Reasonable inference
+- User interpretation
+- Speculative theory
+
+## 3.7 Provider independence
+
+Domain logic must not depend directly on one provider.
+
+Provider interfaces should exist for:
+
+- LLM
+- Vision model
+- Speech-to-text
+- Text-to-speech
+- Object storage
+- Trend data
+- Video rendering
+- Social publishing
+- Analytics
+
+---
+
+# 4. Multi-Tenant Product Structure
+
+```text
+Platform
+└── User
+    └── Workspace Membership
+        └── Workspace
+            ├── Members
+            ├── Subscription
+            ├── Channels
+            │   ├── Channel Memberships
+            │   ├── Channel Concepts
+            │   │   └── Channel Model Versions
+            │   ├── Projects
+            │   └── Publications
+            ├── Media Assets
+            ├── Provider Usage
+            ├── Billing Usage
+            └── Audit Logs
+```
+
+## 4.1 Workspace
+
+The workspace is the primary tenant boundary.
+
+A workspace contains:
+
+- Users
+- Roles
+- Connected channels
+- Channel concepts
+- Projects
+- Uploaded media
+- Provider usage
+- Subscription information
+- Billing records
+- Audit logs
+- Shared templates
+
+## 4.2 Channel
+
+A workspace may contain multiple YouTube channels.
+
+Each channel has its own:
+
+- OAuth connection
+- External channel identifier
+- Channel name
+- Language
+- Target audience
+- Connected account status
+- Historical analytics
+- Publishing permissions
+- Content concepts
+- Performance baseline
+
+## 4.3 Channel Concept
+
+A channel may support one or more content concepts.
+
+Examples:
+
+- Fan theories
+- Character analysis
+- Cinematic edits
+- Hidden details
+- Episode recap
+- Funny moments
+- Behind-the-scenes commentary
+- Spoiler-free content
+
+Each concept should define:
+
+- Name
+- Description
+- Language
+- Tone
+- Target duration range
+- Spoiler policy
+- Theory policy
+- Caption style
+- Editing rhythm
+- Hook preferences
+- Music preferences
+- Character priorities
+- Prompt profile
+- Hot-moment scoring weights
+- Prediction calibration settings
+
+## 4.4 Channel Model Version
+
+Each channel concept may have versioned model settings.
+
+A model version may contain:
+
+- Prompt templates
+- Feature weights
+- Scene-ranking weights
+- Script rules
+- Prediction settings
+- Retention learnings
+- Editing style constraints
+
+The platform should support:
+
+- Draft versions
+- Published versions
+- Rollback
+- Metric comparison
+- Controlled migration of future projects
+
+---
+
+# 5. User Roles and Authorization
+
+## Platform roles
+
+- Platform Admin
+- Support Admin
+
+## Workspace roles
+
+- Owner
+- Admin
+- Creator
+- Editor
+- Analyst
+- Viewer
+
+## Channel roles
+
+- Channel Owner
+- Channel Manager
+- Publisher
+- Creator
+- Editor
+- Analyst
+- Viewer
+
+## Suggested granular permissions
+
+```text
+workspace.manage_members
+workspace.manage_billing
+workspace.view_usage
+
+channel.connect_youtube
+channel.disconnect_youtube
+channel.manage_members
+channel.manage_concepts
+channel.view_analytics
+
+project.create
+project.archive
+project.assign
+
+media.upload
+media.delete
+
+analysis.start
+analysis.cancel
+analysis.view
+
+moment.select
+moment.reject
+moment.manage
+
+prompt.create
+prompt.manage_templates
+
+rough_cut.generate
+rough_cut.edit
+rough_cut.approve
+
+script.generate
+script.edit
+script.approve
+
+voice.generate
+voice.approve
+
+video.edit
+video.render
+video.approve
+
+publication.upload_private
+publication.approve_public
+publication.publish
+
+analytics.view
+
+model.create_version
+model.publish_version
+model.rollback_version
+```
+
+Only authorized users may approve public publication.
+
+---
+
+# 6. Main User Workflow
+
+## Stage 1 — Opportunity Radar
+
+The user selects:
+
+- Workspace
+- YouTube channel
+- Channel concept
+
+The system recommends movies, series, episodes, characters, and content ideas with strong current potential.
+
+Example:
+
+```text
+House of the Dragon — New Episode Opportunity
+
+Episode age: 36 hours
+Shorts view velocity: Very high
+Competition: Medium-high
+Content gap: Character theories and dragon scenes
+Recommended publishing window: Next 12 hours
+Opportunity score: 87/100
+Recommended channel: Theory Channel
+Recommended format: 38–48 second Short
+```
+
+The user may:
+
+- Start a project
+- Save the recommendation
+- Dismiss it
+- Request similar ideas
+- Switch channel
+- Switch concept
+
+## Stage 2 — Project Creation
+
+The project should contain:
+
+- Selected channel
+- Selected concept
+- Movie or series title
+- Season
+- Episode
+- Source language
+- Target language
+- Output format
+- Target duration
+- Content mode
+- Spoiler level
+- Theory level
+- Rights declaration
+
+## Stage 3 — Source Video Upload
+
+Initial supported formats:
+
+- MP4
+- MKV
+- MOV
+
+Upload requirements:
+
+- Direct upload to object storage
+- Multipart or chunked upload
+- Resume after network failure
+- Upload progress
+- File hash validation
+- Duplicate detection
+- Corruption detection
+- Upload session expiration
+
+The application server should not proxy the entire video file unless technically unavoidable.
+
+## Stage 4 — Source Processing
+
+The platform should generate:
+
+- Low-resolution proxy
+- Audio track
+- Extracted embedded subtitles
+- Automatic transcript
+- Shot boundaries
+- Scene boundaries
+- Keyframes
+- Audio intensity curve
+- Music rise curve
+- Dialogue segments
+- Face or character clusters
+- Motion features
+- Narrative features
+- Scene Genome
+- Narrative Graph
+
+## Stage 5 — Hot Moment Extraction
+
+For a typical long movie or episode, return approximately 20–40 candidate moments.
+
+Each moment card should contain:
+
+- Preview start and end
+- Recommended core range
+- Scene summary
+- Selection reasons
+- Hot Moment score
+- Spoiler level
+- Characters
+- Tags
+
+Example:
+
+```text
+Moment 15
+
+Preview:
+00:46:21–00:46:51
+
+Recommended core:
+00:46:28–00:46:42
+
+Reasons:
+- Music rise
+- High visual motion
+- Main character close-up
+- Strong short-form opening
+
+Hot Moment Score: 92
+Spoiler Level: Medium
+```
+
+Moment actions:
+
+- Select
+- Favorite
+- Reject
+- Find similar moments
+- Show previous context
+- Show following context
+- Extend the moment
+- Filter by character
+- Filter by emotion
+- Filter by action
+- Filter by dialogue
+- Filter by theory potential
+- Filter by spoiler level
+
+## Stage 6 — Moment Selection
+
+The user may:
+
+- Select multiple moments
+- Reorder moments
+- Lock a moment
+- Add a note
+- Replace a moment
+- Ask AI to find a bridging moment
+
+## Stage 7 — Prompt Studio
+
+Example prompt:
+
+> Use Moment 15 and Moment 8. Create a 45-second theory video connecting Aegon's growing power with the conflict between Rhaenyra and Daemon. Use a strong hook in the first two seconds. Present the idea as a theory, not as confirmed information.
+
+Supported content modes:
+
+- Logical Montage
+- Theory
+- Scene Explanation
+- Character Arc
+- Comparison
+- Emotional Edit
+- Episode Recap
+- Hidden Detail
+- Custom Prompt
+
+Future quick-action buttons:
+
+- Connect these scenes logically
+- Turn this into a theory
+- Strengthen the first two seconds
+- Make it more dramatic
+- Reduce spoilers
+- Keep original audio
+- Fit into 45 seconds
+- Focus on a selected character
+- Make the order chronological
+- Convert to viral Shorts structure
+
+## Stage 8 — Rough Cut Generation
+
+The rough cut must be stored as structured timeline data, not only as a flattened video.
+
+```json
+{
+  "duration": 44.8,
+  "format": "9:16",
+  "clips": [
+    {
+      "momentId": "moment-15",
+      "sourceStart": 2808.2,
+      "sourceEnd": 2816.5,
+      "timelineStart": 0,
+      "cropMode": "face_tracking",
+      "originalAudio": 0.75
+    },
+    {
+      "momentId": "moment-8",
+      "sourceStart": 1342.1,
+      "sourceEnd": 1351.6,
+      "timelineStart": 8.3,
+      "cropMode": "center",
+      "originalAudio": 0.30
+    }
+  ]
+}
+```
+
+The user can:
+
+- Reorder clips
+- Change trim points
+- Lock clips
+- Replace clips
+- Change crop mode
+- Adjust original audio
+- Regenerate selected sections only
+
+## Stage 9 — Script Studio
+
+Generate at least three initial script variants:
+
+- Viral and fast
+- Analytical
+- Cinematic
+
+Each script sentence should contain:
+
+- Timeline range
+- Supporting source moment
+- Confidence
+- Statement type
+- User-authored or AI-generated flag
+
+The user can:
+
+- Select a script
+- Merge scripts
+- Edit text
+- Lock sentences
+- Regenerate one sentence
+- Shorten or expand
+- Change tone
+- Reduce spoilers
+- Increase or reduce theory strength
+
+## Stage 10 — Voice Studio
+
+Initial target provider:
+
+- ElevenLabs
+
+The architecture must allow alternative providers.
+
+Controls:
+
+- Voice
+- Model
+- Speed
+- Stability
+- Expressiveness
+- Pauses
+- Pronunciation rules
+- Segment-level regeneration
+
+Only changed voice segments should be regenerated where possible.
+
+## Stage 11 — Cloud Timeline Editor
+
+Initial features:
+
+- Clip trimming
+- Clip reorder
+- 9:16 crop
+- Face-tracking crop
+- Keyframe zoom
+- Original audio level
+- Voice-over level
+- Music level
+- Audio ducking
+- Captions
+- Caption timing
+- Caption style
+- Basic transitions
+- Basic sound effects
+- Preview rendering
+
+CapCut should remain optional.
+
+The MVP must not depend on an undocumented or unstable CapCut integration.
+
+## Stage 12 — Variant Arena
+
+Generate low-resolution alternatives such as:
+
+- Action-first hook
+- Dialogue-first hook
+- Text-first hook
+
+Only the selected alternative should receive a full-quality render.
+
+## Stage 13 — Viral Potential Report
+
+Example:
+
+```text
+Viral Potential: 78/100
+
+Hook: Strong
+Topic timing: Very strong
+Visual pacing: Strong
+Originality: Medium
+Competition: High
+
+Recommendation:
+Shorten the first sentence and reduce the duration from 44 seconds to 37 seconds.
+```
+
+## Stage 14 — View Forecast
+
+Never claim an exact guaranteed view number.
+
+Example:
+
+```text
+First 24 hours
+
+P10: 1,200
+P50: 4,800
+P90: 18,000
+
+First 7 days
+
+P10: 3,500
+P50: 14,000
+P90: 65,000
+
+Probability of beating channel average: 71%
+Probability of exceeding 10,000 views: 58%
+Confidence: Medium
+```
+
+## Stage 15 — YouTube Upload and Publication
+
+The platform uploads the final video as private or unlisted first.
+
+Public publishing requires a separate authorized action.
+
+```text
+DRAFT
+→ CONCEPT_APPROVED
+→ SOURCE_UPLOADED
+→ ANALYZED
+→ MOMENTS_SELECTED
+→ PROMPT_APPROVED
+→ ROUGH_CUT_APPROVED
+→ SCRIPT_APPROVED
+→ VOICE_APPROVED
+→ EDIT_APPROVED
+→ RENDERED
+→ FINAL_APPROVED
+→ UPLOADED_PRIVATE
+→ PUBLISH_APPROVED
+→ PUBLIC
+```
+
+## Stage 16 — Analytics and Learning
+
+Collect:
+
+- First 3-second retention
+- First 30-second retention
+- Average percentage viewed
+- Completion rate
+- Rewatch regions
+- Shares
+- Comments
+- Likes
+- Subscriber conversion
+- Traffic sources
+- Selected moments
+- Rejected moments
+- Script edits
+- Timeline edits
+- Replaced clips
+- Hook type
+- Character usage
+- Scene type
+- Publication time
+- Channel
+- Concept
+
+---
+
+# 7. Opportunity Radar
+
+## Input categories
+
+- Trending movies and series
+- New episode and release schedules
+- YouTube search results
+- Recent Shorts performance
+- View velocity
+- Engagement rate
+- Competition density
+- Character topic frequency
+- Scene topic frequency
+- Channel fit
+- Historical channel performance
+- Estimated production effort
+
+## Initial Opportunity Score
+
+```text
+25% Topic view velocity
+20% Release recency
+15% Competitor engagement
+15% Content gap
+10% Channel-topic fit
+10% Weekly trend score
+ 5% Estimated monetization suitability
+```
+
+Weights must be configurable and versioned.
+
+## Opportunity Window
+
+Estimate whether an opportunity is:
+
+- Emerging
+- Near peak
+- Decaying
+- Saturated
+- High demand
+- Low competition
+- High competition
+- No longer worth producing
+
+## Cost-efficient data collection
+
+1. Build a limited list of trending entertainment entities.
+2. Query YouTube only for those entities.
+3. Focus on recent time windows.
+4. Store periodic snapshots.
+5. Perform deeper analysis only for high-scoring entities.
+
+---
+
+# 8. Hot Moment Engine
+
+## Audio and technical signals
+
+- Shot changes
+- Scene changes
+- Audio amplitude
+- Music rise
+- Beat changes
+- Sudden silence
+- Laughter
+- Shouting
+- Explosions
+- Impact sounds
+- Dialogue density
+
+## Visual signals
+
+- Motion intensity
+- Close-ups
+- Facial reactions
+- Character presence
+- Scene composition
+- Action
+- Camera movement
+- Vertical crop suitability
+
+## Narrative signals
+
+- Conflict
+- Decision
+- Reveal
+- Emotional turn
+- Character objective
+- Consequence
+- Unresolved question
+- Setup
+- Payoff
+- Theory potential
+
+## Initial Hot Moment Score
+
+```text
+22% Narrative importance
+18% Emotional intensity
+15% Audio and music rise
+15% Visual movement or action
+10% Character importance
+10% Discussion or theory potential
+ 5% Short-form hook suitability
+ 5% Independent comprehensibility
+```
+
+Weights should change by content mode.
+
+---
+
+# 9. Scene Genome
+
+Each scene should receive a reusable structured representation.
+
+```json
+{
+  "sceneId": "scene-342",
+  "characters": ["Aegon", "Sunfyre"],
+  "actions": ["dragon_flight", "takeoff"],
+  "emotions": ["triumph", "tension"],
+  "audio": {
+    "musicRise": 0.91,
+    "dialogue": 0.12,
+    "impact": 0.72
+  },
+  "narrativeRole": "power_display",
+  "spoilerLevel": 2,
+  "visualIntensity": 0.88,
+  "theoryPotential": 0.79,
+  "shortHookScore": 0.93,
+  "verticalCropScore": 0.84,
+  "reuseCount": 0
+}
+```
+
+Scene Genome should make it possible to retrieve scenes without reprocessing the entire source.
+
+---
+
+# 10. Narrative Graph
+
+Possible node types:
+
+- Character
+- Goal
+- Conflict
+- Event
+- Decision
+- Reveal
+- Consequence
+- Relationship
+- Unresolved question
+- Location
+
+Possible edge types:
+
+- causes
+- follows
+- contradicts
+- supports
+- weakens
+- parallels
+- foreshadows
+- resolves
+- escalates
+
+The graph should help answer:
+
+- Are selected scenes causally connected?
+- Are they only thematically related?
+- Is a bridging scene required?
+- Does the theory contradict the source?
+- Is the scene order chronological?
+- Which scene best supports a script sentence?
+
+---
+
+# 11. Evidence-Linked Script and Theory Guard
+
+Each script sentence should store:
+
+- Source moment ID
+- Source timestamp
+- Evidence type
+- Confidence
+- User-authored or AI-generated flag
+
+Theory Guard should detect:
+
+- Theory presented as fact
+- Unsupported character relationships
+- Hallucinated events
+- Wrong chronology
+- Unrelated source evidence
+- Excessive certainty
+- Possible leak or spoiler claims
+- Contradictions with transcript
+
+Warnings should not silently overwrite locked user text.
+
+---
+
+# 12. Channel Brain
+
+## Static channel profile
+
+- Audience
+- Language
+- Tone
+- Theory policy
+- Spoiler policy
+- Hook style
+- Caption style
+- Music preference
+- Editing rhythm
+- Target duration
+
+## Learned channel profile
+
+- Best-performing characters
+- Best-performing scene types
+- Best-performing hook types
+- Retention patterns
+- Ideal duration
+- Publication-time performance
+- User accept and reject patterns
+- Preferred script wording
+- Preferred voice settings
+- Preferred crop behavior
+
+Learning must remain isolated by channel and concept unless a deliberate cross-channel rule is applied.
+
+---
+
+# 13. Cross-Channel Intelligence
+
+## Portfolio Optimizer
+
+Recommend the best channel based on:
+
+- Concept fit
+- Recent publication frequency
+- Similarity to recent videos
+- Scene reuse
+- Character saturation
+- Audience overlap
+- Cannibalization risk
+- Opportunity window
+- Expected performance
+- Production effort
+
+Example:
+
+```text
+This idea fits the Theory Channel, but a similar video was published yesterday.
+
+The Character Analysis Channel has lower cannibalization risk and a stronger historical fit.
+```
+
+## Scene Reuse Guard
+
+Track:
+
+- Scene use count
+- Total used duration
+- Channel usage
+- Cross-channel usage
+- Similar crop
+- Similar starting frame
+- Similar topic
+- Similar hook
+- Recent reuse period
+
+Example:
+
+```text
+This scene has been used four times in the last 30 days.
+
+Moment 22 has similar emotional intensity and has not been used before.
+```
+
+---
+
+# 14. Prediction System
+
+## V0 — Rule-based score
+
+Use weighted content, trend, competition, and channel-fit features.
+
+## V1 — Public-data regression
+
+Possible models:
+
+- CatBoost
+- LightGBM
+- Quantile Regression
+
+## V2 — Channel calibration
+
+Add:
+
+- Channel baseline
+- Historical retention
+- Character performance
+- Hook performance
+- Publication timing
+- Topic performance
+
+## V3 — Personalized production model
+
+Learn from:
+
+- Moment selections
+- Rejections
+- Script edits
+- Voice selections
+- Timeline edits
+- Final performance
+
+Every prediction output must include:
+
+- Prediction interval
+- Confidence
+- Channel-relative probability
+- Data sufficiency indicator
+
+---
+
+# 15. Web and Mobile Responsibilities
+
+## Web application
+
+- Full project setup
+- Large media upload
+- Moment Explorer
+- Narrative Graph
+- Advanced prompting
+- Script editor
+- Timeline editor
+- Channel settings
+- Workspace management
+- Analytics
+- Model versions
+- Usage and cost reports
+
+## Mobile application
+
+- Notifications
+- Opportunity Radar
+- Channel switching
+- Concept switching
+- Project status
+- Moment preview
+- Moment selection
+- Prompt input
+- Script approval
+- Voice selection
+- Viral report
+- Publication approval
+- Analytics overview
+
+Do not build an advanced mobile timeline editor before validating the web workflow.
+
+---
+
+# 16. Suggested Technical Architecture
+
+This is a planning baseline and not a final stack commitment.
+
+## Clients
+
+- Web: likely React and Next.js
+- Mobile: React Native or Flutter
+- Admin: web-based
+- Shared API contracts
+- Shared design tokens
+
+## Backend
+
+Start with a modular monolith and background workers.
+
+Suggested modules:
+
+- Identity
+- Workspace and RBAC
+- Channel Integration
+- Channel Concept
+- Opportunity Radar
+- Project Workflow
+- Upload and Media Lifecycle
+- Video Analysis
+- Moment Ranking
+- Prompt and Script Generation
+- Voice Generation
+- Timeline and Rendering
+- Prediction
+- Publication
+- Analytics
+- Billing and Usage
+- Audit
+- Notifications
+
+## Data layer
+
+- PostgreSQL for transactional metadata
+- Object storage for media
+- Redis or equivalent for queues, cache, and locks
+- Vector index for transcript and scene retrieval
+- Analytics store when scale requires it
+
+PostgreSQL vector support may be sufficient for the MVP.
+
+## Long-running background jobs
+
+- Upload validation
+- Proxy generation
+- Audio extraction
+- Subtitle extraction
+- Transcription
+- Scene detection
+- Keyframe extraction
+- Audio analysis
+- Scene Genome generation
+- Narrative Graph generation
+- Hot Moment ranking
+- Rough-cut generation
+- Script generation
+- Voice generation
+- Preview rendering
+- Final rendering
+- YouTube upload
+- Analytics collection
+- Prediction recalibration
+- Media deletion
+
+Every job should support:
+
+- Idempotency
+- Retries
+- Checkpoints
+- Progress reporting
+- Cancellation
+- Timeouts
+- Failure reasons
+- Cost recording
+
+## External integrations
+
+- YouTube Data API
+- YouTube Analytics API
+- TMDB or similar metadata provider
+- LLM providers
+- Vision providers
+- Speech-to-text provider
+- ElevenLabs or alternative TTS
+- Optional CapCut integration
+
+---
+
+# 17. Media Lifecycle
+
+## Asset types
+
+- Original source video
+- Proxy video
+- Audio track
+- Extracted subtitles
+- Transcript
+- Keyframes
+- Scene previews
+- Selected high-quality clips
+- Rough-cut previews
+- Voice-over audio
+- Final render
+- Thumbnail candidates
+
+## Initial retention proposal
+
+| Asset | Default retention |
+|---|---:|
+| Original source | Until project completion, maximum 24 hours by default |
+| Analysis proxy | 3 days |
+| Transcript and timestamps | Until project deletion |
+| Keyframes | 7 days or regenerated |
+| Selected clips | 7 days |
+| Rough preview | 3 days |
+| Final render | 24 hours after confirmed YouTube upload |
+| Analytics metadata | Persistent |
+| Audit records | According to policy |
+
+Do not delete the original source before required high-quality clips are extracted and final upload is confirmed, unless the user explicitly requests deletion.
+
+---
+
+# 18. Cost Optimization Strategy
+
+1. Use signed multipart uploads directly to object storage.
+2. Use proxy-first analysis.
+3. Use sparse keyframes instead of processing every frame.
+4. Use cascaded inference.
+5. Cache by content hash and configuration version.
+6. Deduplicate identical videos and artifacts.
+7. Regenerate only changed TTS segments.
+8. Re-render only affected timeline sections where practical.
+9. Generate preview-quality variants before final rendering.
+10. Use scale-to-zero workers where possible.
+11. Record costs per workspace, channel, project, job, provider, model, TTS segment, render minute, and storage duration.
+
+Recommended inference cascade:
+
+```text
+1. FFmpeg and deterministic CPU analysis
+2. Transcript and audio feature extraction
+3. Lightweight embeddings and classifiers
+4. Candidate filtering
+5. Strong multimodal analysis on top candidates
+6. Strong LLM for final narrative and script review
+```
+
+---
+
+# 19. Security Requirements
+
+## Authentication
+
+- Secure authentication
+- Email verification
+- Session management
+- Session revocation
+- Optional MFA later
+
+## Tenant isolation
+
+Every tenant-owned record must be scoped to a workspace directly or through a verifiable foreign-key chain.
+
+Use:
+
+- Database-level protection
+- Service-layer authorization
+- Channel-level permission checks
+
+## YouTube OAuth
+
+- Encrypt tokens at rest
+- Never return tokens to clients
+- Use minimum required scopes
+- Support token revocation
+- Support token refresh
+- Restrict token access to the integration module
+
+## Media security
+
+- Private storage buckets
+- Short-lived signed URLs
+- Authorization before URL generation
+- No public raw media buckets
+
+## Audit logging
+
+Log:
+
+- Login
+- Membership changes
+- Role changes
+- Channel connections
+- OAuth revocation
+- Media uploads
+- Rights declarations
+- AI generations
+- Script modifications
+- Final approvals
+- Private uploads
+- Public approvals
+- Publications
+- Deletions
+- Model version changes
+
+## Publication safety
+
+Public publication requires:
+
+- Final video approval
+- Metadata approval
+- Authorized permission
+- Explicit confirmation
+- Audit record
+
+---
+
+# 20. Copyright and Risk Assistance
+
+The platform cannot guarantee:
+
+- Fair use
+- Copyright clearance
+- YouTube monetization
+- Absence of Content ID claims
+
+It may provide advisory metrics:
+
+- Source clip ratio
+- Voice-over ratio
+- Longest uninterrupted source segment
+- Original audio ratio
+- Repeated scene count
+- Scene reuse history
+- Transformative narration score
+- Evidence-linked commentary ratio
+- Rights declaration status
+
+Example:
+
+```text
+Source clip ratio: 42%
+Original narration ratio: 68%
+Longest uninterrupted source segment: 7.2 seconds
+Original audio usage: 21%
+Repeated scenes: 2
+Transformative contribution: Medium
+Publication risk: Medium-high
+```
+
+---
+
+# 21. Core Domain Entities
+
+```text
+User
+Workspace
+WorkspaceMembership
+Channel
+ChannelMembership
+ChannelConcept
+ChannelModelVersion
+ContentOpportunity
+Project
+ProjectAssignment
+SourceVideo
+UploadSession
+MediaAsset
+RightsDeclaration
+VideoAnalysis
+TranscriptSegment
+Scene
+SceneGenome
+NarrativeNode
+NarrativeEdge
+HotMoment
+MomentSelection
+UserPrompt
+PromptTemplate
+RoughCut
+TimelineVersion
+ScriptOption
+ScriptSentence
+EvidenceLink
+VoiceOver
+VoiceSegment
+VideoEdit
+FinalVideo
+ViralScore
+ViewPrediction
+CompetitorSnapshot
+Publication
+AnalyticsSnapshot
+RetentionSegment
+UserFeedbackSignal
+Job
+JobAttempt
+ProviderUsage
+AuditLog
+Notification
+Subscription
+UsageRecord
+```
+
+---
+
+# 22. Full Project State Machine
+
+```text
+DRAFT
+CONCEPT_APPROVED
+UPLOAD_PENDING
+UPLOADING
+SOURCE_UPLOADED
+SOURCE_VALIDATED
+ANALYSIS_QUEUED
+ANALYZING
+ANALYZED
+MOMENTS_REVIEW
+MOMENTS_SELECTED
+PROMPT_DRAFT
+PROMPT_APPROVED
+ROUGH_CUT_GENERATING
+ROUGH_CUT_READY
+ROUGH_CUT_APPROVED
+SCRIPT_DRAFT
+SCRIPT_APPROVED
+VOICE_GENERATING
+VOICE_READY
+VOICE_APPROVED
+EDITING
+EDIT_APPROVED
+RENDERING
+RENDERED
+FINAL_REVIEW
+FINAL_APPROVED
+UPLOAD_TO_YOUTUBE_QUEUED
+UPLOADED_PRIVATE
+PUBLISH_APPROVAL_PENDING
+PUBLISH_APPROVED
+PUBLIC
+ARCHIVED
+FAILED
+CANCELLED
+```
+
+All transitions must be validated server-side.
+
+---
+
+# 23. MVP Scope
+
+## Included in MVP
+
+1. User authentication
+2. Schema ready for multiple workspaces
+3. Multiple YouTube channels
+4. Channel switching
+5. Multiple concepts per channel
+6. Basic roles
+7. Opportunity Radar
+8. Large video upload
+9. Proxy generation
+10. Transcript extraction
+11. Scene detection
+12. Music and audio analysis
+13. Basic narrative analysis
+14. 20–40 Hot Moments
+15. Moment Explorer
+16. Moment selection
+17. Custom prompt input
+18. Logical Montage mode
+19. Theory mode
+20. Editable rough cut
+21. Three script variants
+22. Evidence-linked sentences
+23. Theory Guard v0
+24. ElevenLabs provider integration
+25. Basic cloud timeline
+26. Preview rendering
+27. Final rendering
+28. Rule-based viral score
+29. Basic competitor comparison
+30. Low-confidence probabilistic forecast
+31. YouTube private upload
+32. Explicit public approval
+33. Basic analytics
+34. Temporary media cleanup
+35. Audit logging
+
+## Excluded from MVP
+
+- Advanced native mobile timeline editor
+- Custom large foundation model
+- Full CapCut automation
+- Automatic public publishing
+- General social media management suite
+- Advanced agency billing
+- White-label SaaS
+- Large-scale fine-tuning
+- Guaranteed accurate view prediction
+- Fully automatic unconfirmed character recognition
+- Support for every content category
+
+---
+
+# 24. Release Phases
+
+## Phase 0 — Planning and validation
+
+- Final MVP PRD
+- User flows
+- Authorization matrix
+- Upload proof of concept
+- Scene and audio pipeline proof of concept
+- Rough-cut render proof of concept
+- YouTube private upload proof of concept
+- Provider cost validation
+
+## Phase 0.1 — Technical prototype
+
+- One user
+- One channel
+- One source video
+- Transcript
+- Scene detection
+- Basic moment ranking
+- Manual selection
+- Simple rough cut
+
+## Phase 0.2 — Moment Explorer
+
+- Preview cards
+- Filters
+- Similar moments
+- Scene Genome v0
+- Music rise scoring
+- Narrative importance v0
+
+## Phase 0.3 — Prompt and script
+
+- Prompt Studio
+- Logical Montage
+- Theory mode
+- Script variants
+- Evidence links
+- Theory Guard v0
+
+## Phase 0.4 — Voice, edit, and publication
+
+- TTS provider
+- Basic timeline
+- Final render
+- YouTube private upload
+- Public approval gate
+
+## Phase 0.5 — Multi-channel
+
+- Multiple channels
+- Channel and concept switching
+- Channel Brain v0
+- Channel-specific settings
+- Scene Reuse Guard
+
+## Phase 0.6 — Web and mobile beta
+
+- Responsive web
+- Mobile approval and monitoring
+- Notifications
+- Workspace roles
+- Audit logs
+
+## Phase 1.0 — SaaS foundation
+
+- Multiple workspaces
+- Invitations
+- Fine-grained RBAC
+- Usage tracking
+- Subscription plans
+- Admin console
+- Tenant security review
+
+## Phase 1.1 — Intelligence advantage
+
+- Narrative Graph
+- Portfolio Optimizer
+- Variant Arena
+- Retention learning
+- Channel-calibrated prediction
+
+## Phase 2.0 — Scale
+
+- Agency plan
+- White label
+- Public API
+- Provider marketplace
+- Localization
+- Multi-language channel variants
+- Advanced mobile editing
+
+---
+
+# 25. Architecture Evolution
+
+Start with:
+
+> Modular monolith plus background workers.
+
+Reasons:
+
+- Lower operational complexity
+- Lower infrastructure cost
+- Faster development
+- Easier local development
+- Easier domain refactoring
+- Easier testing
+
+Keep clear module boundaries so the following may later become independent services:
+
+- Video Analysis
+- Rendering
+- Trend Collection
+- Prediction
+- YouTube Integration
+
+Extract services only when justified by:
+
+- Independent scaling
+- Failure isolation
+- Different runtime requirements
+- Security isolation
+- Cost optimization
+- Team ownership
+
+---
+
+# 26. Provisional Monorepo Direction
+
+```text
+/apps
+  /web
+  /mobile
+  /admin
+  /api
+
+/workers
+  /media
+  /analysis
+  /render
+  /integrations
+
+/packages
+  /domain
+  /contracts
+  /auth
+  /ui
+  /config
+  /observability
+  /testing
+
+/infrastructure
+
+/docs
+```
+
+Do not create this structure until the stack and roadmap are explicitly approved.
+
+---
+
+# 27. Observability
+
+Track:
+
+- API request traces
+- Background job traces
+- Job duration
+- Provider latency
+- Provider cost
+- Queue wait time
+- Upload throughput
+- Rendering time
+- Error rate
+- Retry rate
+- Storage usage
+- Prediction drift
+- Publication failures
+- OAuth refresh failures
+
+Every background job should have a correlation ID linked to:
+
+- Workspace
+- Channel
+- Project
+- Media asset
+- User action
+
+Never log:
+
+- OAuth tokens
+- Provider secrets
+- Raw private media
+- Signed URLs with long validity
+- Sensitive user information
+
+---
+
+# 28. Testing Strategy
+
+## Unit tests
+
+- Score calculations
+- State transitions
+- Permission checks
+- Retention policies
+- Provider adapters
+- Prompt validation
+- Theory classification
+
+## Integration tests
+
+- Multipart upload
+- Object lifecycle
+- Queue and worker flow
+- YouTube OAuth
+- Private upload
+- TTS generation
+- Tenant isolation
+
+## End-to-end tests
+
+- Registration to private upload
+- Multiple channel switching
+- Unauthorized public approval attempt
+- Failed analysis recovery
+- Failed render retry
+- Media deletion workflow
+
+## AI evaluation
+
+- Moment relevance
+- Narrative connection quality
+- Script factuality
+- Evidence coverage
+- Theory certainty calibration
+- Hallucination rate
+- User acceptance rate
+- Regeneration rate
+
+AI evaluation must use versioned datasets and human review rubrics.
+
+---
+
+# 29. Product Metrics
+
+## Activation
+
+- Time to first upload
+- Time to first Hot Moment result
+- Time to first rough cut
+- Time to first private upload
+
+## Production efficiency
+
+- Analysis time
+- Cost per source hour
+- Cost per finished Short
+- Manual editing time
+- Regeneration count
+- Analysis reuse rate
+
+## Quality
+
+- Moment selection rate
+- Script acceptance rate
+- AI suggestion rejection rate
+- Final approval rate
+- Evidence coverage
+- Theory Guard warning rate
+
+## Business
+
+- Active workspaces
+- Connected channels
+- Videos produced
+- Videos published
+- Retention by plan
+- Gross margin per workspace
+
+## Performance
+
+- Channel-average beat rate
+- Prediction calibration
+- Forecast interval coverage
+- Retention improvement
+- View velocity improvement
+
+---
+
+# 30. Open Decisions
+
+These decisions must not be silently assumed.
+
+## Product
+
+- Final product name
+- Initial language
+- Initial target market
+- Private alpha or public beta
+- Opportunity Radar inclusion in the first prototype
+- Maximum source duration
+- Maximum source file size
+- Default media retention policy
+
+## Web and mobile
+
+- React Native or Flutter
+- Mobile upload in first release
+- Offline mobile prompt drafts
+
+## Backend
+
+- Programming language
+- Backend framework
+- Authentication provider or custom auth
+- Database hosting
+- Object storage provider
+- Queue provider
+- Worker runtime
+- Vector storage approach
+
+## AI
+
+- Speech-to-text model
+- Embedding model
+- Vision model
+- Narrative model
+- Final script model
+- Local versus API models
+- Character clustering approach
+
+## Rendering
+
+- FFmpeg-only or FFmpeg plus Remotion
+- Browser timeline implementation
+- Preview strategy
+- Segment render cache
+
+## Integrations
+
+- Entertainment metadata provider
+- YouTube quota strategy
+- TTS commercial plan
+- CapCut feasibility
+
+## Commercial
+
+- Free plan limits
+- Credit model
+- Subscription pricing
+- Overage pricing
+- Team pricing
+- Storage pricing
+
+---
+
+# 31. Explicit Non-Goals
+
+The platform is not intended to:
+
+- Download DRM-protected streaming content
+- Store streaming account credentials
+- Guarantee copyright clearance
+- Guarantee YouTube monetization
+- Guarantee an exact view count
+- Replace every CapCut or Premiere feature in MVP
+- Publish automatically without approval
+- Become a general social media suite immediately
+- Train a large foundation model from scratch initially
+
+---
+
+# 32. Claude Code Implementation Guardrails
+
+1. Do not implement unresolved architecture decisions without approval.
+2. Do not add automatic public publishing.
+3. Do not add DRM bypass or protected-stream downloading.
+4. Do not hard-code one AI or TTS provider into domain logic.
+5. Do not run long media jobs inside synchronous API handlers.
+6. Do not expose OAuth tokens.
+7. Do not expose unauthorized media URLs.
+8. Do not skip workspace authorization.
+9. Do not skip channel authorization.
+10. Do not retain media beyond approved lifecycle rules.
+11. Do not build advanced mobile editing before web validation.
+12. Do not introduce microservices prematurely.
+13. Do not claim deterministic view prediction.
+14. Do not present AI-generated theories as confirmed facts.
+15. Do not regenerate expensive valid cached artifacts.
+16. Do not start coding before the current phase and acceptance criteria are approved.
+17. Keep changes small, reviewable, tested, and documented.
+18. Follow the project's Agent 1 procedure for planning, approval, file changes, terminal actions, testing, and reporting.
+
+---
+
+# 33. Required Documents Before Coding
+
+Create and approve:
+
+1. MVP Product Requirements Document
+2. User stories and acceptance criteria
+3. Role and permission matrix
+4. State transition specification
+5. Domain model
+6. Database schema
+7. API boundary specification
+8. Job and queue specification
+9. Media lifecycle policy
+10. AI model-routing specification
+11. Cost model per source hour
+12. Cost model per finished video
+13. Security threat model
+14. Repository structure
+15. Development workflow
+16. Testing plan
+17. AI evaluation plan
+18. Versioned implementation milestones
+
+---
+
+# 34. Current Planning Status
+
+Defined at planning level:
+
+- Product vision
+- Core user workflow
+- Competitive differentiation
+- Multi-user structure
+- Multi-channel structure
+- Channel concept model
+- Channel model versioning
+- AI analysis strategy
+- Hot Moment strategy
+- Scene Genome
+- Narrative Graph
+- Evidence-linked scripts
+- Theory Guard
+- Publication safety
+- Cost optimization
+- Media lifecycle direction
+- Security direction
+- MVP scope
+- Release phases
+
+Not finalized:
+
+- Technology stack
+- Provider selection
+- Exact database schema
+- API contracts
+- Final acceptance criteria
+- Repository rules
+- Development milestones
+
+The next required planning deliverable is an approved MVP PRD with explicit acceptance criteria and selected architecture decisions.

@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ project.title }} · Moment Explorer · Framewise{% endblock %}
+{% block eyebrow %}PROJECT ANALYSIS{% endblock %}
+{% block heading %}{{ project.title }} — Moment Explorer{% endblock %}
+{% block topbar_actions %}
+  <a class="button button-ghost" href="{% url 'studio:project-detail' project.id %}">Back to project</a>
+{% endblock %}
+{% block content %}
+  <section class="explorer-sourcebar">
+    <div class="source-identity">
+      <span class="source-mini-icon">▶</span>
+      <div><strong>{{ project.source.filename }}</strong><small>{{ moments|length }} persisted moment{{ moments|length|pluralize }} · Real project data</small></div>
+    </div>
+    {% if has_moments %}
+      <div class="analysis-complete"><i></i><span>MOMENTS PERSISTED</span></div>
+    {% else %}
+      <span class="preview-badge">NO ANALYSIS YET</span>
+    {% endif %}
+  </section>
+
+  {% if has_moments %}
+    {% if moments.0.is_demo %}
+      <div class="callout demo-callout">
+        These moments were created by the demo seeder for interface testing —
+        they were not produced by a real analysis run of this source video.
+      </div>
+    {% endif %}
+
+    <form method="post" action="{% url 'studio:queue-rerank' project.id %}" class="focus-prompt-panel" data-role="focus-prompt-form">
+      {% csrf_token %}
+      {{ focus_prompt_form.focus_prompt.label_tag }}
+      {{ focus_prompt_form.focus_prompt }}
+      <small>{{ focus_prompt_form.focus_prompt.help_text }}</small>
+      <button class="button" type="submit" {% if active_rerank_job %}disabled{% endif %}>
+        {% if active_rerank_job %}Re-rank running…{% else %}Re-rank moments{% endif %}
+      </button>
+      {% if latest_ranking_run %}
+        <small data-role="latest-ranking-prompt">Last ranked for: “{{ latest_ranking_run.prompt_text }}”</small>
+      {% endif %}
+    </form>
+
+    <div class="explorer-layout no-filter-rail">
+      <main class="moment-workspace">
+        <div class="moment-toolbar">
+          <div>
+            <strong><span>{{ moments|length }}</span> moments</strong>
+            <span>{% if latest_ranking_run %}Ranked by focus prompt relevance{% else %}Ranked by base score{% endif %}</span>
+          </div>
+        </div>
+
+        <div class="moment-list">
+          {% for moment in moments %}
+            <article class="moment-card {% if moment.decision == 'SELECTED' %}selected{% elif moment.decision == 'REJECTED' %}rejected{% endif %}">
+              <div class="rank-column"><span>#{{ moment.rank|stringformat:"02d" }}</span><div class="score-ring" style="--score: {{ moment.score }}"><strong>{{ moment.score }}</strong><small>SCORE</small></div></div>
+              <button class="moment-visual visual-{{ forloop.counter }}" type="button" data-action="inspect" aria-expanded="false" aria-controls="project-inspect-{{ moment.id }}" aria-label="Inspect moment at {{ moment.start }}">
+                <span class="visual-time">{{ moment.start }} — {{ moment.end }}</span>
+                <span class="visual-play">▶</span>
+                <span class="visual-duration">{{ moment.duration }} SEC</span>
+                <span class="scan-line"></span>
+              </button>
+              <div class="moment-copy">
+                <div class="moment-meta">
+                  {% if moment.reasons %}<span>{{ moment.reasons.0|upper }}</span><i></i>{% endif %}
+                  <span>{{ moment.characters|join:", "|default:"UNKNOWN"|upper }}</span><i></i>
+                  <span class="spoiler-{{ moment.spoiler|lower }}">{{ moment.spoiler|upper }} SPOILER</span>
+                  {% if moment.is_demo %}<i></i><span class="demo-tag">DEMO SEED</span>{% endif %}
+                </div>
+                <h2>Moment #{{ moment.rank }}</h2>
+                <p>{{ moment.summary }}</p>
+                {% if moment.transcript %}<blockquote>“{{ moment.transcript }}”</blockquote>{% endif %}
+                {% if moment.reasons %}
+                  <div class="signal-tags">{% for signal in moment.reasons %}<span>{{ signal }}</span>{% endfor %}</div>
+                {% endif %}
+                {% if moment.score_components %}
+                  <div class="inspect-panel" id="project-inspect-{{ moment.id }}" hidden>
+                    <span class="inspect-heading">Score breakdown <small>{% if moment.is_demo %}Demo seed values{% else %}Analysis output{% endif %}</small></span>
+                    <dl class="score-breakdown">
+                      {% for component in moment.score_components %}
+                        <div class="score-breakdown-row">
+                          <dt>{{ component.label }} <small>{{ component.weight }}%</small></dt>
+                          <dd><i style="--value: {{ component.value }}"></i><span>{{ component.value }}</span></dd>
+                        </div>
+                      {% endfor %}
+                    </dl>
+                  </div>
+                {% endif %}
+              </div>
+              <div class="moment-actions">
+                <form method="post" action="{% url 'studio:moment-decision' project.id moment.id %}" class="decision-form">
+                  {% csrf_token %}
+                  <input type="hidden" name="decision" value="REJECTED">
+                  <button class="decision-button reject-button" type="submit" aria-label="Reject moment">×</button>
+                </form>
+                <form method="post" action="{% url 'studio:moment-decision' project.id moment.id %}" class="decision-form">
+                  {% csrf_token %}
+                  <input type="hidden" name="decision" value="SELECTED">
+                  <button class="decision-button select-button" type="submit" aria-label="Select moment">✓</button>
+                </form>
+                <form method="post" action="{% url 'studio:moment-decision' project.id moment.id %}" class="decision-form restore-form" {% if moment.decision == "UNDECIDED" %}hidden{% endif %}>
+                  {% csrf_token %}
+                  <input type="hidden" name="decision" value="UNDECIDED">
+                  <button class="detail-button restore-button" type="submit">Restore</button>
+                </form>
+                <form method="post" action="{% url 'studio:moment-lock-toggle' project.id moment.id %}" class="decision-form" {% if moment.decision != "SELECTED" %}hidden{% endif %}>
+                  {% csrf_token %}
+                  <button class="detail-button" type="submit">{% if moment.locked %}Unlock{% else %}Lock{% endif %}</button>
+                </form>
+              </div>
+            </article>
+          {% endfor %}
+        </div>
+      </main>
+    </div>
+
+    <div class="selection-summary-bar" data-role="selection-summary">
+      <div class="selection-summary-figure">
+        <span>Selected</span>
+        <strong id="pm-selected-count" data-role="selected-count">{{ selected_count }}</strong>
+      </div>
+      <div class="selection-summary-figure">
+        <span>Rejected</span>
+        <strong id="pm-rejected-count" data-role="rejected-count">{{ rejected_count }}</strong>
+      </div>
+      <div class="selection-summary-figure selection-summary-duration">
+        <span>Selected duration</span>
+        <strong>
+          <span id="pm-selected-duration" data-role="selected-duration">{{ selected_duration }}</span>s /
+          <span id="pm-target-duration" data-role="target-duration">{{ target_duration }}</span>s
+        </strong>
+      </div>
+      <div class="duration-track">
+        <i id="pm-duration-fill" data-role="duration-fill" style="width: {{ duration_percent }}%"></i>
+      </div>
+    </div>
+  {% else %}
+    <div class="empty-state">
+      <div class="empty-icon">◇</div>
+      <h4>No moments yet</h4>
+      <p>
+        Real analysis hasn't produced any Hot Moments for this project yet.
+        Queue analysis from the project page once the local worker is active.
+      </p>
+      <p class="subtle">
+        Testing the interface only? An administrator can seed clearly-labeled
+        demo moments with <code>python manage.py seed_demo_moments {{ project.id }}</code>.
+        This never analyzes or modifies the source video.
+      </p>
+      <a href="{% url 'studio:project-detail' project.id %}">Back to project →</a>
+    </div>
+  {% endif %}
+{% endblock %}
+{% block scripts %}<script src="{% static 'js/project-moment-explorer.js' %}"></script>{% endblock %}

@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}New project · Framewise{% endblock %}
+{% block eyebrow %}PROJECT SETUP{% endblock %}
+{% block heading %}Create a new project{% endblock %}
+{% block topbar_actions %}<a class="button button-ghost" href="{% url 'studio:dashboard' %}">Cancel</a>{% endblock %}
+{% block content %}
+  <div class="form-layout">
+    <section class="panel form-panel">
+      <div class="step-indicator"><span class="active">1</span><i></i><span>2</span><i></i><span>3</span></div>
+      <div class="section-heading">
+        <div><span class="eyebrow">STEP 1 OF 3</span><h3>Source and intent</h3></div>
+      </div>
+      <form method="post" class="project-form">
+        {% csrf_token %}
+        {% if form.non_field_errors %}<div class="form-errors">{{ form.non_field_errors }}</div>{% endif %}
+
+        <div class="field-group">
+          <label for="{{ form.source_relative_path.id_for_label }}">{{ form.source_relative_path.label }}</label>
+          {{ form.source_relative_path }}
+          {% for error in form.source_relative_path.errors %}<span class="field-error">{{ error }}</span>{% endfor %}
+          <small>Files are referenced in place and never moved or modified.</small>
+        </div>
+
+        <div class="field-group">
+          <label for="{{ form.title.id_for_label }}">{{ form.title.label }}</label>
+          {{ form.title }}
+          {% for error in form.title.errors %}<span class="field-error">{{ error }}</span>{% endfor %}
+        </div>
+
+        <div class="field-row">
+          <div class="field-group"><label for="{{ form.season.id_for_label }}">Season <em>Optional</em></label>{{ form.season }}</div>
+          <div class="field-group"><label for="{{ form.episode.id_for_label }}">Episode <em>Optional</em></label>{{ form.episode }}</div>
+          <div class="field-group"><label for="{{ form.target_duration_seconds.id_for_label }}">Target seconds</label>{{ form.target_duration_seconds }}</div>
+        </div>
+
+        <div class="field-group">
+          <label for="{{ form.known_characters_text.id_for_label }}">{{ form.known_characters_text.label }} <em>Optional</em></label>
+          {{ form.known_characters_text }}
+          <small>{{ form.known_characters_text.help_text }}</small>
+        </div>
+
+        <div class="field-group">
+          <label for="{{ form.focus_prompt.id_for_label }}">{{ form.focus_prompt.label }} <em>Optional</em></label>
+          {{ form.focus_prompt }}
+          <small>{{ form.focus_prompt.help_text }}</small>
+        </div>
+
+        <label class="check-card">
+          {{ form.rights_accepted }}
+          <span><strong>Source rights acknowledgement</strong><small>{{ form.rights_accepted.label }}</small></span>
+        </label>
+        {% for error in form.rights_accepted.errors %}<span class="field-error">{{ error }}</span>{% endfor %}
+
+        <div class="form-actions">
+          <span class="privacy-note"><i></i> Local processing only</span>
+          <button class="button button-primary button-large" type="submit">Create project <span>→</span></button>
+        </div>
+      </form>
+    </section>
+
+    <aside class="form-aside">
+      <span class="eyebrow">WHAT HAPPENS NEXT</span>
+      <ol class="process-list">
+        <li class="active"><span>01</span><div><strong>Register source</strong><small>The original stays untouched in your library.</small></div></li>
+        <li><span>02</span><div><strong>Analyze locally</strong><small>Transcript, scenes, audio and motion.</small></div></li>
+        <li><span>03</span><div><strong>Review moments</strong><small>20–40 evidence-backed candidates.</small></div></li>
+        <li><span>04</span><div><strong>Build rough cut</strong><small>An editable 45-second vertical timeline.</small></div></li>
+      </ol>
+      <div class="system-card">
+        <span class="pulse-dot"></span>
+        <div><strong>Windows engine ready</strong><small>RTX 3080 · CUDA available</small></div>
+      </div>
+    </aside>
+  </div>
+{% endblock %}
+

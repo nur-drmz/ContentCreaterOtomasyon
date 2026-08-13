@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}{{ project.title }} · Timeline · Framewise{% endblock %}
+{% block eyebrow %}PROJECT TIMELINE{% endblock %}
+{% block heading %}{{ project.title }} — Timeline &amp; rough cut{% endblock %}
+{% block topbar_actions %}
+  <a class="button button-ghost" href="{% url 'studio:project-moment-explorer' project.id %}">Moment Explorer</a>
+  <a class="button button-ghost" href="{% url 'studio:project-detail' project.id %}">Back to project</a>
+{% endblock %}
+{% block content %}
+  <section class="detail-grid">
+    <div class="panel">
+      <div class="section-heading">
+        <div><span class="eyebrow">STEP 1</span><h3>Propose a timeline</h3></div>
+      </div>
+      {% if not has_selected_moments %}
+        <div class="callout">Select at least one moment in the Moment Explorer before proposing a timeline.</div>
+      {% endif %}
+      <form method="post" action="{% url 'studio:queue-timeline' project.id %}">
+        {% csrf_token %}
+        <button class="button button-primary" type="submit" {% if active_timeline_job or not has_selected_moments %}disabled{% endif %}>
+          {% if active_timeline_job %}Proposing…{% elif timeline_version %}Re-propose timeline{% else %}Propose timeline{% endif %}
+        </button>
+      </form>
+
+      {% if timeline_version %}
+        <div class="metadata-row">
+          <span>Version {{ timeline_version.version_number }}</span>
+          <span>{{ clips|length }} clip{{ clips|length|pluralize }}</span>
+          <span>Target {{ timeline_version.target_duration_seconds }}s</span>
+        </div>
+        <div class="moment-list">
+          {% for clip in clips %}
+            <article class="moment-card">
+              <div class="rank-column"><span>#{{ forloop.counter|stringformat:"02d" }}</span></div>
+              <div class="moment-copy">
+                <div class="moment-meta">
+                  <span>{{ clip.start }} — {{ clip.end }}</span><i></i>
+                  <span>{{ clip.duration }} SEC</span>
+                  {% if clip.locked %}<i></i><span class="demo-tag">LOCKED</span>{% endif %}
+                </div>
+                <p>{{ clip.summary|default:"No summary available." }}</p>
+              </div>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="subtle">No timeline proposed yet.</p>
+      {% endif %}
+    </div>
+
+    <div class="panel">
+      <div class="section-heading">
+        <div><span class="eyebrow">STEP 2</span><h3>Render rough cut</h3></div>
+      </div>
+      <form method="post" action="{% url 'studio:queue-render' project.id %}">
+        {% csrf_token %}
+        <button class="button button-primary" type="submit" {% if active_render_job or not timeline_version %}disabled{% endif %}>
+          {% if active_render_job %}Rendering…{% else %}Render rough cut{% endif %}
+        </button>
+      </form>
+
+      {% if latest_render %}
+        <div class="metadata-row">
+          <span>{{ latest_render.width }}×{{ latest_render.height }}</span>
+          <span>{{ latest_render.duration_seconds|floatformat:0 }}s</span>
+          <span>{{ latest_render.codec }}</span>
+        </div>
+        <video controls style="width: 100%; max-width: 360px; border-radius: 12px;" src="{% url 'studio:render-preview' project.id latest_render.id %}"></video>
+      {% else %}
+        <p class="subtle">No rough cut rendered yet.</p>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

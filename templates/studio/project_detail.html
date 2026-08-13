@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}{{ project.title }} · Framewise{% endblock %}
+{% block eyebrow %}PROJECT{% endblock %}
+{% block heading %}{{ project.title }}{% endblock %}
+{% block topbar_actions %}
+  <a class="button button-ghost" href="{% url 'studio:project-moment-explorer' project.id %}">Moment Explorer</a>
+  <a class="button button-ghost" href="{% url 'studio:project-timeline' project.id %}">Timeline</a>
+  <a class="button button-ghost" href="{% url 'studio:voice-studio' project.id %}">Voice Studio</a>
+  <form method="post" action="{% url 'studio:queue-analysis' project.id %}">
+    {% csrf_token %}
+    <button class="button button-primary" type="submit">Queue analysis <span>→</span></button>
+  </form>
+{% endblock %}
+{% block content %}
+  <section class="project-header-card">
+    <div class="source-preview"><div class="play-ring">▶</div><span>{{ project.source.container|upper }}</span></div>
+    <div class="source-copy">
+      <span class="eyebrow">REGISTERED SOURCE</span>
+      <h2>{{ project.source.filename }}</h2>
+      <div class="metadata-row">
+        <span>{{ source_size }}</span>
+        <span>{{ project.target_duration_seconds }} sec target</span>
+        {% if project.season %}<span>Season {{ project.season }}</span>{% endif %}
+        {% if project.episode %}<span>Episode {{ project.episode }}</span>{% endif %}
+      </div>
+      <p class="path-text">G:\Youtube kaynak videolar\{{ project.source.relative_path }}</p>
+    </div>
+    <div class="source-safety"><span>READ ONLY</span><small>Original protected</small></div>
+  </section>
+
+  <section class="detail-grid">
+    <div class="panel">
+      <div class="section-heading"><div><span class="eyebrow">PIPELINE</span><h3>Analysis progress</h3></div></div>
+      <div class="pipeline">
+        <div class="pipeline-step {% if latest_job %}active{% endif %}"><span>01</span><div><strong>Preflight</strong><small>File, disk, model and VRAM checks</small></div></div>
+        <div class="pipeline-step"><span>02</span><div><strong>Transcript &amp; scenes</strong><small>Subtitle/Whisper cascade, scene, audio and motion signals</small></div></div>
+        <div class="pipeline-step"><span>03</span><div><strong>VLM enrichment &amp; scoring</strong><small>Qwen2.5-VL enrichment where available, weighted Hot Moment score</small></div></div>
+        <div class="pipeline-step"><span>04</span><div><strong>Moment ranking</strong><small>Adaptive evidence-backed candidates</small></div></div>
+      </div>
+      {% if latest_job %}
+        <div class="job-status">
+          <div><span class="state-badge {{ latest_job.status|lower }}">{{ latest_job.get_status_display }}</span><strong>{{ latest_job.current_stage }}</strong></div>
+          <span>{{ latest_job.progress }}%</span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuenow="{{ latest_job.progress }}" aria-valuemin="0" aria-valuemax="100" aria-label="Analysis progress">
+          <i style="width: {{ latest_job.progress }}%"></i>
+        </div>
+        {% if latest_job.status == "FAILED" %}
+          <div class="job-error">
+            <strong>{{ latest_job.failure_code|default:"Analysis failed" }}</strong>
+            <p>{{ latest_job.failure_detail|default:"No further detail was recorded for this attempt." }}</p>
+          </div>
+        {% elif latest_job.status == "SUCCEEDED" %}
+          <div class="callout">Analysis complete. <a href="{% url 'studio:project-moment-explorer' project.id %}">Review moments →</a></div>
+        {% elif latest_job.status == "PAUSED" %}
+          <div class="callout">Paused mid-pipeline. Run the local worker again to resume from the last completed stage.</div>
+        {% elif not latest_job.started_at %}
+          <div class="callout">Queued. Run the bounded local worker to perform source preflight; no AI model will be loaded.</div>
+        {% endif %}
+        {% if preflight_summary %}
+          <div class="metadata-row" aria-label="Completed preflight metadata">
+            <span>{{ preflight_summary.duration }}</span>
+            <span>{{ preflight_summary.resolution }}</span>
+            <span>{{ preflight_summary.video_codec }} / {{ preflight_summary.audio_codec }}</span>
+            <span>{{ preflight_summary.file_size }}</span>
+            <span>{{ preflight_summary.gpu_name }}</span>
+            <span>{{ preflight_summary.free_vram }} VRAM free</span>
+          </div>
+        {% endif %}
+      {% else %}
+        <div class="callout">Ready when you are. Queuing does not start a model until the worker is enabled.</div>
+      {% endif %}
+    </div>
+
+    <div class="panel intent-panel">
+      <div class="section-heading"><div><span class="eyebrow">CREATIVE INTENT</span><h3>Theory focus</h3></div></div>
+      {% if project.focus_prompt %}<blockquote>{{ project.focus_prompt }}</blockquote>{% else %}<p class="subtle">No focus prompt yet. The first pass will rank general theory and scene-explanation moments.</p>{% endif %}
+      {% if project.known_characters %}
+        <div class="tag-list">{% for character in project.known_characters %}<span>{{ character }}</span>{% endfor %}</div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

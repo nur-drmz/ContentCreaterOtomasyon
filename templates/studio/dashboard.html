@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Overview · Framewise{% endblock %}
+{% block topbar_actions %}
+  <a class="button button-primary" href="{% url 'studio:project-create' %}">
+    <span class="button-plus">+</span> New project
+  </a>
+{% endblock %}
+{% block content %}
+  <section class="hero-panel">
+    <div class="hero-copy">
+      <span class="status-pill"><i></i> PRE-ALPHA · LOCAL ENGINE</span>
+      <h2>Find the story hidden<br>inside every scene.</h2>
+      <p>Turn long-form entertainment footage into evidence-backed moments and editable vertical cuts — entirely on your PC.</p>
+      <a class="button button-primary button-large" href="{% url 'studio:project-create' %}">Start from a source video <span>→</span></a>
+    </div>
+    <div class="signal-art" aria-hidden="true">
+      <div class="signal-orbit orbit-one"></div>
+      <div class="signal-orbit orbit-two"></div>
+      <div class="signal-core">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <div class="signal-label signal-a">TRANSCRIPT</div>
+      <div class="signal-label signal-b">SCENES</div>
+      <div class="signal-label signal-c">MOMENTS</div>
+    </div>
+  </section>
+
+  <section class="stat-grid">
+    <article class="stat-card"><span>PROJECTS</span><strong>{{ project_count|stringformat:"02d" }}</strong><small>Saved locally</small></article>
+    <article class="stat-card"><span>SOURCE FILES</span><strong>{{ source_count|stringformat:"02d" }}</strong><small>In approved library</small></article>
+    <article class="stat-card"><span>QUEUED JOBS</span><strong>{{ queued_count|stringformat:"02d" }}</strong><small>Waiting for local worker</small></article>
+    <article class="stat-card accent"><span>PRIVACY</span><strong>100%</strong><small>No media leaves this PC</small></article>
+  </section>
+
+  <section class="content-grid">
+    <div class="panel">
+      <div class="section-heading">
+        <div><span class="eyebrow">RECENT WORK</span><h3>Projects</h3></div>
+        {% if projects %}<span class="subtle">{{ projects|length }} shown</span>{% endif %}
+      </div>
+      {% if projects %}
+        <div class="project-list">
+          {% for project in projects %}
+            <a class="project-row" href="{% url 'studio:project-detail' project.id %}">
+              <div class="project-thumb"><span>{{ project.source.container|upper }}</span></div>
+              <div class="project-info">
+                <strong>{{ project.title }}</strong>
+                <span>{{ project.source.filename }}</span>
+              </div>
+              <div class="project-state">
+                {% with job=project.jobs.first %}
+                  {% if job %}<span class="state-badge {{ job.status|lower }}">{{ job.get_status_display }}</span>{% else %}<span class="state-badge draft">Draft</span>{% endif %}
+                {% endwith %}
+                <small>{{ project.updated_at|timesince }} ago</small>
+              </div>
+              <span class="row-arrow">→</span>
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state">
+          <div class="empty-icon">◇</div>
+          <h4>No projects yet</h4>
+          <p>Choose a source video and create your first intelligence project.</p>
+          <a href="{% url 'studio:project-create' %}">Create a project →</a>
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="panel library-panel">
+      <div class="section-heading">
+        <div><span class="eyebrow">READ-ONLY LIBRARY</span><h3>Source videos</h3></div>
+        <span class="drive-badge">G:\</span>
+      </div>
+      {% if videos %}
+        <div class="library-list">
+          {% for video in videos|slice:":5" %}
+            <div class="library-row">
+              <div class="file-icon">▶</div>
+              <div><strong>{{ video.filename }}</strong><span>{{ video.extension }} · {{ video.size_label }}</span></div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state compact">
+          <h4>No supported videos found</h4>
+          <p>Add MP4, MKV or MOV files to <code>G:\Youtube kaynak videolar</code>.</p>
+        </div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}
+

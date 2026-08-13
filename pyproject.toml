@@ -1,0 +1,51 @@
+[project]
+name = "youtube-content-intelligence-pre-alpha"
+version = "0.1.0"
+description = "Local Windows Pre-Alpha for entertainment video intelligence"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "django>=5.2,<5.3",
+    "waitress>=3.0,<4",
+    "faster-whisper>=1.2,<2",
+    "torch>=2.7,<2.8",
+    "torchvision>=0.22,<0.23",
+    "opencv-python-headless>=4.11,<5",
+    "scenedetect>=0.6.6,<0.7",
+    "librosa>=0.11,<0.12",
+    "numpy>=2.1,<3",
+    "pydantic>=2.11,<3",
+    "psutil>=7,<8",
+    "transformers>=4.49,<5",
+    "pillow>=11,<12",
+    "accelerate>=1.0,<2",
+]
+
+# Not pinned here: an AWQ quantization backend (e.g. autoawq) for
+# Qwen/Qwen2.5-VL-7B-Instruct-AWQ (see studio/pipeline/vlm.py). Official
+# Windows wheels are not reliably available, so it is a manual/optional
+# install; VLM enrichment degrades to "unavailable" (deterministic-only
+# scoring) rather than failing the job when it is missing.
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4,<9",
+    "pytest-django>=4.11,<5",
+    "ruff>=0.12,<0.13",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "content_studio.settings"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}Moment Explorer · Framewise{% endblock %}
+{% block eyebrow %}INTELLIGENCE WORKSPACE{% endblock %}
+{% block heading %}Moment Explorer{% endblock %}
+{% block topbar_actions %}
+  <span class="preview-badge">DESIGN PREVIEW</span>
+  <button class="button button-primary" id="build-cut" disabled>Build rough cut <span>→</span></button>
+{% endblock %}
+{% block content %}
+  <section class="explorer-sourcebar">
+    <div class="source-identity">
+      <span class="source-mini-icon">▶</span>
+      <div><strong>{{ source_name }}</strong><small>22:08 · 6 preview candidates · Local source</small></div>
+    </div>
+    <div class="analysis-complete"><i></i><span>ANALYSIS PREVIEW READY</span></div>
+  </section>
+
+  <section class="focus-bar">
+    <div class="focus-title">
+      <span class="focus-spark">✦</span>
+      <div><span class="eyebrow">THEORY FOCUS</span><strong>What should the model look for?</strong></div>
+    </div>
+    <div class="focus-input-wrap">
+      <input id="focus-input" type="text" value="Explain the choices that reveal Daemon's real motivation." aria-label="Theory focus prompt">
+      <button id="rerank-button" type="button">Re-rank</button>
+    </div>
+    <span class="no-reanalysis">NO RE-ANALYSIS</span>
+  </section>
+
+  <div class="explorer-layout">
+    <aside class="filter-rail">
+      <div class="filter-heading"><span>FILTERS</span><button type="button" id="reset-filters">Reset</button></div>
+
+      <fieldset class="filter-group">
+        <legend>Decision</legend>
+        <label><input type="radio" name="decision" value="all" checked><span>All moments</span><b>6</b></label>
+        <label><input type="radio" name="decision" value="selected"><span>Selected</span><b id="selected-filter-count">0</b></label>
+        <label><input type="radio" name="decision" value="rejected"><span>Rejected</span><b id="rejected-filter-count">0</b></label>
+      </fieldset>
+
+      <fieldset class="filter-group">
+        <legend>Character</legend>
+        <label><input type="checkbox" name="character" value="Daemon"><span>Daemon</span></label>
+        <label><input type="checkbox" name="character" value="Rhaenyra"><span>Rhaenyra</span></label>
+        <label><input type="checkbox" name="character" value="Viserys"><span>Viserys</span></label>
+      </fieldset>
+
+      <fieldset class="filter-group">
+        <legend>Spoiler level</legend>
+        <label><input type="checkbox" name="spoiler" value="Low"><span>Low</span><i class="level-dot low"></i></label>
+        <label><input type="checkbox" name="spoiler" value="Medium"><span>Medium</span><i class="level-dot medium"></i></label>
+        <label><input type="checkbox" name="spoiler" value="High"><span>High</span><i class="level-dot high"></i></label>
+      </fieldset>
+
+      <fieldset class="filter-group">
+        <legend>Minimum score</legend>
+        <div class="range-row"><input id="score-filter" type="range" min="70" max="95" value="70"><output id="score-output">70+</output></div>
+      </fieldset>
+    </aside>
+
+    <main class="moment-workspace">
+      <div class="moment-toolbar">
+        <div><strong><span id="visible-count">6</span> moments</strong><span>Ranked for theory potential</span></div>
+        <div class="view-controls">
+          <button class="active" type="button" aria-label="Card view">
+            <svg viewBox="0 0 24 24"><path d="M4 5h16v5H4zM4 14h16v5H4z"/></svg>
+          </button>
+          <select aria-label="Sort moments"><option>Highest score</option><option>Earliest first</option><option>Shortest first</option></select>
+        </div>
+      </div>
+
+      <div class="moment-list" id="moment-list">
+        {% for moment in moments %}
+          <article class="moment-card" data-id="{{ moment.id }}" data-character="{{ moment.character }}" data-spoiler="{{ moment.spoiler }}" data-score="{{ moment.score }}" data-decision="undecided">
+            <div class="rank-column"><span>#{{ moment.rank|stringformat:"02d" }}</span><div class="score-ring" style="--score: {{ moment.score }}"><strong>{{ moment.score }}</strong><small>SCORE</small></div></div>
+            <button class="moment-visual visual-{{ forloop.counter }}" type="button" data-action="inspect" aria-expanded="false" aria-controls="inspect-{{ moment.id }}" aria-label="Preview and inspect moment at {{ moment.start }}">
+              <span class="visual-time">{{ moment.start }} — {{ moment.end }}</span>
+              <span class="visual-play">▶</span>
+              <span class="visual-duration">{{ moment.duration }} SEC</span>
+              <span class="scan-line"></span>
+            </button>
+            <div class="moment-copy">
+              <div class="moment-meta"><span>{{ moment.reason|upper }}</span><i></i><span>{{ moment.character|upper }}</span><i></i><span class="spoiler-{{ moment.spoiler|lower }}">{{ moment.spoiler|upper }} SPOILER</span></div>
+              <h2>{{ moment.title }}</h2>
+              <p>{{ moment.summary }}</p>
+              <blockquote>“{{ moment.transcript }}”</blockquote>
+              <div class="signal-tags">{% for signal in moment.signals %}<span>{{ signal }}</span>{% endfor %}</div>
+              <div class="inspect-panel" id="inspect-{{ moment.id }}" hidden>
+                <span class="inspect-heading">Score breakdown <small>Design preview values</small></span>
+                <dl class="score-breakdown">
+                  {% for component in moment.score_components %}
+                    <div class="score-breakdown-row">
+                      <dt>{{ component.label }} <small>{{ component.weight }}%</small></dt>
+                      <dd><i style="--value: {{ component.value }}"></i><span>{{ component.value }}</span></dd>
+                    </div>
+                  {% endfor %}
+                </dl>
+              </div>
+            </div>
+            <div class="moment-actions">
+              <button class="decision-button reject-button" type="button" data-action="reject" aria-label="Reject moment">×</button>
+              <button class="decision-button select-button" type="button" data-action="select" aria-label="Select moment">✓</button>
+              <button class="detail-button" type="button" data-action="inspect" aria-expanded="false" aria-controls="inspect-{{ moment.id }}">Inspect <span>→</span></button>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+
+      <div class="no-results" id="no-results" hidden>
+        <span>◇</span><strong>No moments match these filters</strong><p>Reset filters or lower the minimum score.</p>
+      </div>
+    </main>
+
+    <aside class="selection-rail">
+      <div class="selection-heading">
+        <div><span class="eyebrow">ROUGH CUT INPUT</span><h3>Selected moments</h3></div>
+        <strong id="selected-count">0</strong>
+      </div>
+      <div class="selection-empty" id="selection-empty">
+        <span>＋</span>
+        <p>Select moments to begin shaping your rough cut.</p>
+      </div>
+      <ol class="selection-list" id="selection-list"></ol>
+      <div class="selection-summary">
+        <div><span>Selected duration</span><strong><b id="selected-duration">0</b>s / 45s</strong></div>
+        <div class="duration-track"><i id="duration-fill"></i></div>
+        <small>A 3–6 clip sequence works best.</small>
+      </div>
+      <button class="button button-primary selection-build" id="build-cut-secondary" disabled>Build rough cut <span>→</span></button>
+    </aside>
+  </div>
+{% endblock %}
+{% block scripts %}<script src="{% static 'js/moment-explorer.js' %}"></script>{% endblock %}
+

@@ -1,0 +1,62 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Framewise{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'css/app.css' %}">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="{% url 'studio:dashboard' %}">
+        <span class="brand-mark"><span></span></span>
+        <span>FRAMEWISE<small>LOCAL STUDIO</small></span>
+      </a>
+      <nav class="main-nav" aria-label="Main navigation">
+        <a class="{% if request.resolver_match.url_name == 'dashboard' %}active{% endif %}" href="{% url 'studio:dashboard' %}" {% if request.resolver_match.url_name == 'dashboard' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-5H4v5Zm10 0h6v-9h-6v9Zm0-16v5h6V4h-6Z"/></svg>
+          Overview
+        </a>
+        <a href="{% url 'studio:project-create' %}" {% if request.resolver_match.url_name == 'project-create' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          New project
+        </a>
+        <a class="{% if request.resolver_match.url_name == 'moment-explorer' %}active{% endif %}" href="{% url 'studio:moment-explorer' %}" {% if request.resolver_match.url_name == 'moment-explorer' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 17 4-5 4 3 4-7 4 4M4 20h16"/></svg>
+          Moment explorer
+        </a>
+      </nav>
+      <div class="sidebar-spacer"></div>
+      <div class="local-status">
+        <span class="pulse-dot"></span>
+        <div><strong>Local only</strong><small>127.0.0.1 · Windows</small></div>
+      </div>
+      <div class="sidebar-note">Media stays on this PC.</div>
+    </aside>
+
+    <main class="main" id="main-content">
+      <header class="topbar">
+        <div>
+          <span class="eyebrow">{% block eyebrow %}CONTENT INTELLIGENCE{% endblock %}</span>
+          <h1>{% block heading %}Studio overview{% endblock %}</h1>
+        </div>
+        <div class="topbar-actions">{% block topbar_actions %}{% endblock %}</div>
+      </header>
+
+      {% if messages %}
+        <div class="messages" role="status" aria-live="polite">
+          {% for message in messages %}
+            <div class="message {{ message.tags }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

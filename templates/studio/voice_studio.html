@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}{{ project.title }} · Voice Studio · Framewise{% endblock %}
+{% block eyebrow %}PROJECT VOICE STUDIO{% endblock %}
+{% block heading %}{{ project.title }} — Voice-over{% endblock %}
+{% block topbar_actions %}
+  <a class="button button-ghost" href="{% url 'studio:project-detail' project.id %}">Back to project</a>
+{% endblock %}
+{% block content %}
+  <div class="callout">
+    Voice-over calls an external provider over the network. Nothing is sent
+    until you explicitly approve a request below, and every request is
+    recorded in this project's local audit log. The default provider
+    (<strong>No provider configured</strong>) never contacts the network.
+  </div>
+
+  <section class="detail-grid">
+    <div class="panel">
+      <div class="section-heading">
+        <div><span class="eyebrow">SCRIPT</span><h3>Narration text</h3></div>
+      </div>
+      <form method="post" action="{% url 'studio:queue-voiceover' project.id %}">
+        {% csrf_token %}
+        {{ script_form.text.label_tag }}
+        {{ script_form.text }}
+        <small>{{ script_form.text.help_text }}</small>
+
+        <div class="section-heading" style="margin-top: 1.5rem;">
+          <div><span class="eyebrow">PROVIDER</span><h3>Choose an app to generate voice</h3></div>
+        </div>
+        {{ generation_form.provider_key.label_tag }}
+        {{ generation_form.provider_key }}
+        <p class="subtle">
+          Cost limit for this project: ${{ cost_limit }}. Generation is
+          refused before any provider is called if the estimated cost of the
+          changed sentences exceeds this limit.
+        </p>
+
+        <div class="check-card">
+          <label>
+            {{ generation_form.approved }}
+            {{ generation_form.approved.label }}
+          </label>
+        </div>
+
+        <button class="button button-primary" type="submit" {% if active_job %}disabled{% endif %}>
+          {% if active_job %}Generating…{% else %}Generate voice-over <span>→</span>{% endif %}
+        </button>
+      </form>
+    </div>
+
+    <div class="panel">
+      <div class="section-heading">
+        <div><span class="eyebrow">SEGMENTS</span><h3>Generated audio</h3></div>
+      </div>
+      {% if voice_over %}
+        <div class="metadata-row">
+          <span>Provider: {{ voice_over.provider_key }}</span>
+        </div>
+      {% endif %}
+      {% if sentence_rows %}
+        <div class="moment-list">
+          {% for row in sentence_rows %}
+            <article class="moment-card">
+              <div class="moment-copy">
+                <div class="moment-meta">
+                  {% if row.segment %}
+                    <span class="spoiler-{{ row.segment.status|lower }}">{{ row.segment.get_status_display|upper }}</span>
+                    {% if row.segment.duration_seconds %}<i></i><span>{{ row.segment.duration_seconds|floatformat:1 }}s</span>{% endif %}
+                    {% if row.segment.cost_estimate %}<i></i><span>${{ row.segment.cost_estimate }}</span>{% endif %}
+                  {% else %}
+                    <span>NOT GENERATED</span>
+                  {% endif %}
+                </div>
+                <p>{{ row.text }}</p>
+                {% if row.segment.status == "READY" %}
+                  <audio controls src="{% url 'studio:voice-segment-preview' project.id row.segment.id %}"></audio>
+                {% endif %}
+              </div>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="subtle">No sentences yet. Write a script and generate to see segments here.</p>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

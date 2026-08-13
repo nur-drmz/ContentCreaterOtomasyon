@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+htmlcov/
+
+# Django / local runtime
+*.sqlite3
+*.sqlite3-*
+local_settings.py
+staticfiles/
+media/
+logs/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# AI models and caches
+models/
+.cache/
+huggingface/
+*.safetensors
+*.gguf
+*.onnx
+
+# Video, audio, image and generated artifacts
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.srt
+*.vtt
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Backups and temporary files
+backups/
+tmp/
+temp/
+*.bak
+*.tmp
+*.part
+
+# Windows / editors
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+
+# Codex/local agent state
+.agents/
+.codex/
+.claude/
+
+# Local process state
+data/runtime/
