@@ -58,11 +58,15 @@ TERMINAL_STATUSES = (STATUS_REVIEW_REQUIRED, STATUS_FAILED, STATUS_COMPLETED)
 #: Job types the console can submit. Each maps to one canonical pipeline entry
 #: point in `pipeline_service`; there is no free-form "run arbitrary code" job.
 JOB_TYPES = (
+    "source_ingest",
     "source_assessment",
     "video_analysis",
     "script_generation",
     "tts",
     "render",
+    "metadata_generation",
+    "publish_upload",
+    "visibility_change",
 )
 
 JOBS_DIRNAME = "jobs"

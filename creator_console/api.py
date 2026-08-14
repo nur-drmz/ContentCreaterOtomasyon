@@ -343,6 +343,189 @@ class ConsoleApi:
             from .audit import AuditLog
             return 200, {"events": AuditLog(self.app.storage, ownership).events(limit=200)}
 
+        # ---------------------------------------------------- faz 2 scene editor
+        if rest == ["edl"] and method == "POST":
+            payload = _json_body(body)
+            return 201, {"edl": service.build_edl(
+                source_path=payload.get("source_path"),
+                source_duration=float(payload.get("source_duration", 0)),
+                title=payload.get("title", ""),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["edl"] and method == "GET":
+            return 200, {"edl": service.load_artifact("edl")["data"]}
+
+        if rest == ["edl", "clips"] and method == "POST":
+            payload = _json_body(body)
+            return 201, {"edl": service.add_edl_clip(
+                source_path=_required(payload, "source_path"),
+                source_start_sec=float(payload.get("source_start_sec", 0)),
+                source_end_sec=float(_required(payload, "source_end_sec")),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if len(rest) == 3 and rest[0] == "edl" and rest[1] == "clips" and method == "PATCH":
+            payload = _json_body(body)
+            return 200, {"edl": service.update_edl_clip(
+                clip_index=int(rest[2]),
+                start=payload.get("start"),
+                end=payload.get("end"),
+                crop=payload.get("crop"),
+                zoom=payload.get("zoom"),
+                caption_style=payload.get("caption_style"),
+                add_b_roll=payload.get("add_b_roll"),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["edl", "music"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"edl": service.set_edl_music(
+                music_path=_required(payload, "music_path"),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["edl", "preview"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"preview_command": service.build_edl_preview(
+                output_name=payload.get("output_name", "preview.mp4"),
+            )}
+
+        if rest == ["edl", "render"] and method == "POST":
+            payload = _json_body(body)
+            return 200, service.render_edl_preview(
+                output_name=payload.get("output_name", "preview.mp4"),
+            )
+
+        # ------------------------------------------------- trend ingest routes
+        if rest == ["source-candidates"] and method == "POST":
+            payload = _json_body(body)
+            return 201, {"source_candidates": service.discover_source_candidates(
+                terms=payload.get("terms"),
+                manual_urls=payload.get("manual_urls"),
+                max_search_calls=int(payload.get("max_search_calls", 4)),
+                lookback_days=int(payload.get("lookback_days", 14)),
+                shorts_only=_truthy(payload.get("shorts_only")),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["source-candidates", "probe"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"probe": service.probe_source_candidate(
+                candidate_url=_required(payload, "candidate_url"),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["rights"] and method == "POST":
+            payload = _json_body(body)
+            return 201, {"rights_decision": service.record_rights_decision(
+                candidate_url=_required(payload, "candidate_url"),
+                license_type=_required(payload, "license_type"),
+                decided_by=_required(payload, "decided_by"),
+                attribution=payload.get("attribution", ""),
+                transformation_note=payload.get("transformation_note", ""),
+                risk_acknowledged=_truthy(payload.get("risk_acknowledged")),
+                source_title=payload.get("source_title", ""),
+                source_channel=payload.get("source_channel", ""),
+                notes=payload.get("notes", ""),
+            )}
+
+        if rest == ["ingest"] and method == "POST":
+            payload = _json_body(body)
+            record, created = self.app.submit_job(
+                ownership, "source_ingest", params={"candidate_url": _required(payload, "candidate_url")},
+                submitted_by=_header(headers, "x-actor") or payload.get("actor") or "console",
+                run_request_id=payload.get("run_request_id"))
+            return (201 if created else 200), {"job": record, "created": created}
+
+        if rest == ["ingest", "state"] and method == "GET":
+            return 200, {"ingest_state": service.ingest_state()}
+
+        # --------------------------------------------- publication routes
+        if rest == ["metadata"] and method == "GET":
+            return 200, {"publication_metadata": service.load_artifact("publication_metadata")}
+
+        if rest == ["metadata", "generate"] and method == "POST":
+            record, created = self.app.submit_job(
+                ownership, "metadata_generation", params={},
+                submitted_by=_header(headers, "x-actor") or "console",
+                run_request_id=_json_body(body).get("run_request_id"))
+            return (201 if created else 200), {"job": record, "created": created}
+
+        if rest == ["metadata", "manual"] and method == "POST":
+            payload = _json_body(body)
+            return 201, {"publication_metadata": service.write_manual_metadata(
+                title=_required(payload, "title"),
+                description=payload.get("description", ""),
+                tags=payload.get("tags"),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["metadata", "select"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"publication_metadata": service.select_publication_metadata(
+                title_index=int(_required(payload, "title_index")),
+                description=payload.get("description"),
+                tags=payload.get("tags"),
+                category_id=payload.get("category_id"),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["metadata", "approve"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"publication_metadata": service.approve_publication_metadata(
+                reviewed_sha256=_required(payload, "reviewed_sha256"),
+                approved_by=_required(payload, "approved_by"),
+                notes=payload.get("notes", ""),
+            )}
+
+        if rest == ["publish", "state"] and method == "GET":
+            return 200, {"publish_state": service.publish_state()}
+
+        if rest == ["publish", "intent"] and method == "POST":
+            payload = _json_body(body)
+            return 201, {"publish_intent": service.create_publish_intent(
+                platform=payload.get("platform", "youtube"),
+                visibility=payload.get("visibility", "private"),
+                publish_at=payload.get("publish_at"),
+                made_for_kids=_truthy(payload.get("made_for_kids")),
+                account_ref=payload.get("account_ref", ""),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )}
+
+        if rest == ["publish", "intent", "approve"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"publish_intent": service.approve_publish_intent(
+                reviewed_sha256=_required(payload, "reviewed_sha256"),
+                approved_by=_required(payload, "approved_by"),
+                notes=payload.get("notes", ""),
+            )}
+
+        if rest == ["publish", "upload"] and method == "POST":
+            payload = _json_body(body)
+            record, created = self.app.submit_job(
+                ownership, "publish_upload", params={},
+                submitted_by=_header(headers, "x-actor") or payload.get("actor") or "console",
+                run_request_id=payload.get("run_request_id"))
+            return (201 if created else 200), {"job": record, "created": created}
+
+        if rest == ["publish", "visibility", "approve"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"publish_manifest": service.approve_publish_visibility(
+                target_visibility=_required(payload, "target_visibility"),
+                reviewed_remote_id=_required(payload, "reviewed_remote_id"),
+                approved_by=_required(payload, "approved_by"),
+                publish_at=payload.get("publish_at"),
+                notes=payload.get("notes", ""),
+            )}
+
+        if rest == ["publish", "visibility", "apply"] and method == "POST":
+            record, created = self.app.submit_job(
+                ownership, "visibility_change", params={},
+                submitted_by=_header(headers, "x-actor") or _json_body(body).get("actor") or "console",
+                run_request_id=_json_body(body).get("run_request_id"))
+            return (201 if created else 200), {"job": record, "created": created}
+
         raise ApiError("unknown_route", detail=f"{method} /{'/'.join(parts)}")
 
     # -------------------------------------------------------------- helpers

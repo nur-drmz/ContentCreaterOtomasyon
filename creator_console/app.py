@@ -332,11 +332,15 @@ class ConsoleApp:
     # ----------------------------------------------------------------- jobs
     #: job_type -> (phase gate, PipelineService method, terminal status builder)
     JOB_EXECUTORS = {
+        "source_ingest": "run_source_ingest",
         "source_assessment": "run_source_assessment",
         "video_analysis": "run_video_analysis",
         "script_generation": "run_script_generation",
         "tts": "run_tts",
         "render": "run_render",
+        "metadata_generation": "run_metadata_generation",
+        "publish_upload": "run_publish_upload",
+        "visibility_change": "run_visibility_change",
     }
 
     def submit_job(self, ownership: Ownership, job_type: str, *, params=None,
