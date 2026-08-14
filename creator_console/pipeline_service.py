@@ -27,9 +27,14 @@ from pathlib import Path
 from local_pipeline import (
     approval,
     google_ai,
+    metadata_studio,
+    publish as publish_module,
+    publish_youtube,
     render_utils,
+    scene_editor,
     script_generation,
     source_strategy,
+    trend_ingest,
     tts as tts_module,
     video_analysis,
 )
@@ -45,6 +50,13 @@ from .storage import StorageViolation, atomic_write_json
 #: host path must never reach the browser or an artifact field.
 ARTIFACTS = {
     "project": "project.json",
+    "source_candidates": "results/source_candidates.json",
+    "rights_decision": "results/rights_decision.json",
+    "ingest_manifest": "results/ingest_manifest.json",
+    "publication_metadata": "results/publication_metadata.json",
+    "publish_intent": "results/publish_intent.json",
+    "publish_manifest": "results/publish_manifest.json",
+    "edl": "results/edl/edl.json",
     "source_assessment": "results/source_assessment.json",
     "processing_plan": "results/processing_plan.json",
     "hot_moments": "results/hot_moments.json",
@@ -95,6 +107,13 @@ def is_supported_source_video_filename(filename: str) -> bool:
 
 #: Artifact kind -> the schema fields that must exist for it to be usable at all.
 REQUIRED_FIELDS = {
+    "source_candidates": ("status", "candidates", "requires_rights_decision"),
+    "rights_decision": ("artifact_kind", "status", "decision", "decision_sha256"),
+    "ingest_manifest": ("artifact_kind", "status", "candidate_url", "rights"),
+    "publication_metadata": ("artifact_kind", "status", "title_variants"),
+    "publish_intent": ("artifact_kind", "status", "decision", "decision_sha256"),
+    "publish_manifest": ("artifact_kind", "status", "platform", "upload"),
+    "edl": ("artifact_type", "status", "title", "width", "height", "clips"),
     "source_assessment": ("artifact_type", "status", "source", "mode_scores"),
     "processing_plan": ("artifact_type", "status", "decision", "phase_gates"),
     "hot_moments": ("status", "hot_moments"),
@@ -106,6 +125,13 @@ REQUIRED_FIELDS = {
 }
 
 SUPPORTED_SCHEMA_VERSIONS = {1}
+
+#: `production_ready` is normally proof that a file was hand-edited, because no
+#: phase in this project may promote itself. The publish manifest is the ONE
+#: exception: a video that a human approved for public visibility and that the
+#: platform confirmed as public genuinely IS live, and calling that
+#: `review_required` would be the dishonest option.
+PRODUCTION_READY_ALLOWED = frozenset({"publish_manifest"})
 
 # Rewinding never deletes user work.  The selected stage and everything after
 # it is moved into `.revisions/<id>/...`, while upstream inputs remain live.
@@ -154,6 +180,17 @@ REWIND_PATHS = {
     ),
 }
 
+#: A publish INTENT authorizes ONE upload of ONE exact video hash, so rewinding
+#: to any stage at or above the render invalidates it and it is archived with the
+#: rest. `publish_manifest.json` is deliberately NOT archived: it is the
+#: permanent record of what actually went live, and rewinding a local project
+#: cannot un-publish a video that already exists on a platform.
+REWIND_PATHS = {
+    stage: (paths + ("results/publish_intent.json",)
+            if "results/render" in paths else paths)
+    for stage, paths in REWIND_PATHS.items()
+}
+
 REWIND_LABELS = {
     "assessment": "Faz 0 degerlendirme",
     "plan": "isleme plani",
@@ -187,7 +224,8 @@ class PipelineService:
     def __init__(self, storage, ownership: Ownership, secret_resolver, *,
                  google_client_factory=None, openai_client_factory=None,
                  anthropic_client_factory=None, elevenlabs_client_factory=None,
-                 probe_fn=None, ffmpeg_bin=None, ffprobe_bin=None, audit: AuditLog | None = None):
+                 probe_fn=None, ffmpeg_bin=None, ffprobe_bin=None, audit: AuditLog | None = None,
+                 youtube_provider=None):
         self.storage = storage
         self.ownership = ownership
         self.secrets = secret_resolver
@@ -202,6 +240,9 @@ class PipelineService:
         self._ffmpeg_bin = ffmpeg_bin
         self._ffprobe_bin = ffprobe_bin
         self._cancel_check = None
+        # Publication provider: injectable for the same reason, and lazily built
+        # so merely constructing the service never touches the OAuth token file.
+        self._youtube_provider = youtube_provider
 
     def bind_cancel_check(self, callback) -> None:
         """Bind the current job's ownership-scoped cooperative stop signal."""
@@ -304,7 +345,7 @@ class PipelineService:
         if missing:
             info["problem"] = f"{relative} zorunlu alanlari eksik: {missing}"
             return info
-        if data.get("status") == "production_ready":
+        if data.get("status") == "production_ready" and key not in PRODUCTION_READY_ALLOWED:
             info["problem"] = (
                 f"{relative} 'production_ready' iceriyor; bu proje hicbir artefakti "
                 "otomatik olarak production_ready yapmaz, dosya elle degistirilmis olabilir"
@@ -698,6 +739,506 @@ class PipelineService:
                 f"kaynak video manifestte var ama diskte yok: {source['stored_path']}"
             )
         return path
+
+    # ------------------------------------------------- phase -1: trend ingest
+    def discover_source_candidates(self, *, terms=None, manual_urls=None,
+                                   max_search_calls: int = 4, lookback_days: int = 14,
+                                   shorts_only: bool = False, actor="console",
+                                   youtube_client=None) -> dict:
+        """Build the source-candidate shortlist.
+
+        Trend discovery runs only when a YouTube Data credential exists; a
+        missing key is NOT an error, it simply means the list is limited to the
+        URLs the user pasted in. Nothing here selects or downloads anything.
+        """
+        terms = [str(term).strip() for term in (terms or []) if str(term).strip()]
+        discovery = None
+        discovery_error = None
+        if terms:
+            credential = self.secrets.credential("youtube_data")
+            if not credential.configured:
+                discovery_error = (
+                    "YouTube Data anahtari yok; trend kesfi atlandi. Yalnizca elle "
+                    "girilen URL'ler listelendi."
+                )
+            else:
+                from local_pipeline import youtube_data  # noqa: PLC0415
+
+                cache_dir = self.storage.resolve(
+                    self.ownership, RUNTIME_DIRNAME, "youtube_cache", create_parent=True)
+                try:
+                    client = youtube_client or youtube_data.build_client(credential.value)
+                    discovery = youtube_data.discover_trending_content(
+                        client, youtube_data.Cache(cache_dir), youtube_data.QuotaTracker(),
+                        terms, lookback_days=lookback_days,
+                        max_search_calls=max_search_calls, shorts_only=shorts_only,
+                        api_key=credential.value,
+                    )
+                except Exception as exc:  # noqa: BLE001 - sanitized, never raw
+                    discovery_error = youtube_data.sanitize_error_text(exc, credential.value)
+
+        artifact = trend_ingest.build_source_candidates(discovery, manual_urls=manual_urls)
+        artifact["discovery_terms"] = terms
+        artifact["discovery_error"] = discovery_error
+        relative = self.write_artifact("source_candidates", artifact, actor=actor)
+        self.audit.record("artifact.written", actor=actor, artifact=relative,
+                          detail={"candidate_count": artifact["candidate_count"],
+                                  "terms": len(terms)})
+        return artifact
+
+    def probe_source_candidate(self, *, candidate_url: str, actor="console",
+                               ytdlp_module=None) -> dict:
+        """Read one candidate's metadata. Downloads nothing."""
+        if not trend_ingest.is_supported_source_url(candidate_url):
+            raise PipelineServiceError(f"gecersiz kaynak URL: {candidate_url!r}")
+        record = trend_ingest.probe_candidate(candidate_url, ytdlp_module=ytdlp_module)
+        self.audit.record("artifact.written", actor=actor,
+                          artifact=ARTIFACTS["source_candidates"],
+                          detail={"probe_status": record.get("status"),
+                                  "duration_sec": record.get("duration_sec")})
+        return record
+
+    def record_rights_decision(self, *, candidate_url: str, license_type: str,
+                               decided_by: str, attribution: str = "",
+                               transformation_note: str = "",
+                               risk_acknowledged: bool = False,
+                               source_title: str = "", source_channel: str = "",
+                               notes: str = "") -> dict:
+        """Persist the human's licence decision. `build_rights_decision` raises
+        on anything incomplete, so a half-filled record can never unlock a
+        download."""
+        decision = trend_ingest.build_rights_decision(
+            candidate_url, license_type, decided_by,
+            attribution=attribution, transformation_note=transformation_note,
+            risk_acknowledged=risk_acknowledged, source_title=source_title,
+            source_channel=source_channel, notes=notes,
+        )
+        relative = self.write_artifact("rights_decision", decision, actor=decided_by)
+        self.audit.record("approval.granted", actor=decided_by, artifact=relative,
+                          detail={"kind": "rights_decision",
+                                  "license_type": license_type,
+                                  "decision_sha256": decision["decision_sha256"]})
+        return decision
+
+    def run_source_ingest(self, *, candidate_url: str, job_id=None, actor="console",
+                          max_duration_sec=trend_ingest.DEFAULT_MAX_DURATION_SEC,
+                          max_filesize_bytes=trend_ingest.DEFAULT_MAX_FILESIZE_BYTES,
+                          ytdlp_module=None) -> dict:
+        tracker = self.tracker("source_ingest", job_id=job_id)
+        tracker.start("Kaynak indirme basladi")
+        try:
+            return self._run_source_ingest(
+                tracker, candidate_url=candidate_url, job_id=job_id, actor=actor,
+                max_duration_sec=max_duration_sec, max_filesize_bytes=max_filesize_bytes,
+                ytdlp_module=ytdlp_module)
+        except Exception as exc:  # noqa: BLE001
+            tracker.fail(f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _run_source_ingest(self, tracker, *, candidate_url, job_id, actor,
+                           max_duration_sec, max_filesize_bytes, ytdlp_module) -> dict:
+        tracker.stage("rights", "Haklar karari dogrulaniyor")
+        rights = self.load_artifact("rights_decision", required=True)
+        if rights["problem"]:
+            raise ArtifactProblem(rights["problem"])
+        errors = trend_ingest.validate_rights_decision(rights["data"], candidate_url)
+        if errors:
+            # Refused before any byte is fetched. Reported as a service error so
+            # the console shows the exact missing condition.
+            raise PipelineServiceError("INDIRME REDDEDILDI: " + "; ".join(errors))
+
+        tracker.stage("probe", "Kaynak meta verisi okunuyor")
+        probe = trend_ingest.probe_candidate(candidate_url, ytdlp_module=ytdlp_module)
+        if probe.get("status") == "failed":
+            raise PipelineServiceError(
+                f"kaynak okunamadi: {probe.get('status_reason')}")
+        if probe.get("ingest_blockers"):
+            raise PipelineServiceError(
+                "kaynak indirmeye uygun degil: " + "; ".join(probe["ingest_blockers"]))
+
+        tracker.stage("download", "Kaynak indiriliyor")
+        target_dir = self.storage.resolve(self.ownership, SOURCE_DIRNAME, "ingest",
+                                          create_parent=True)
+        manifest = trend_ingest.download_source(
+            candidate_url, target_dir, rights["data"], downloaded_by=actor,
+            ytdlp_module=ytdlp_module, probe_record=probe,
+            max_duration_sec=max_duration_sec, max_filesize_bytes=max_filesize_bytes,
+        )
+        if manifest.get("status") != "review_required":
+            self.write_artifact("ingest_manifest", manifest, job_id=job_id, actor=actor)
+            tracker.fail(manifest.get("error") or manifest.get("status_reason")
+                         or "indirme basarisiz")
+            return manifest
+
+        tracker.stage("register", "Kaynak projeye baglaniyor")
+        stored = Path(manifest["source_path"])
+        manifest["source_path"] = self.relative(stored)
+        self.write_artifact("ingest_manifest", manifest, job_id=job_id, actor=actor)
+        self._register_ingested_source(stored, manifest, registered_by=actor)
+        self.audit.record("source.registered", actor=actor, job_id=job_id,
+                          detail={"origin": "trend_ingest",
+                                  "license_type": manifest["rights"]["license_type"],
+                                  "size_bytes": manifest["filesize_bytes"]})
+        tracker.finish(message=f"{manifest['filesize_bytes']} bayt kaynak hazir")
+        return manifest
+
+    def _register_ingested_source(self, stored: Path, manifest: dict, *,
+                                  registered_by: str) -> dict:
+        """Point the project at a downloaded file.
+
+        Deliberately does NOT read the file into memory (an ingest can be
+        gigabytes); the fingerprint uses the same sampled digest Phase 0 relies
+        on, and `content_sha256` is left None rather than faked.
+        """
+        project = self.load_artifact("project")
+        record = project["data"] or self.create_project(
+            title=manifest.get("title") or "Indirilen kaynak", created_by=registered_by)
+        record["source"] = {
+            "display_name": safe_filename(stored.name, default="source.mp4"),
+            "stored_path": self.relative(stored),
+            "size_bytes": manifest.get("filesize_bytes"),
+            "content_sha256": None,
+            "fingerprint_sha256": source_strategy.source_fingerprint_sha256(stored),
+            "registered_at": _now_iso(),
+            "registered_by": str(registered_by)[:120],
+            "origin": "trend_ingest",
+            "candidate_url": manifest.get("candidate_url"),
+            "license_type": (manifest.get("rights") or {}).get("license_type"),
+        }
+        record["status_reason"] = (
+            "kaynak indirildi ve projeye baglandi; Faz 0 degerlendirmesi bekleniyor")
+        self.write_artifact("project", record, actor=registered_by)
+        return record
+
+    def ingest_state(self) -> dict:
+        """View model for the Trend Radar / rights screens."""
+        candidates = self.load_artifact("source_candidates")
+        rights = self.load_artifact("rights_decision")
+        ingest = self.load_artifact("ingest_manifest")
+        rights_errors = (trend_ingest.validate_rights_decision(rights["data"])
+                         if rights["data"] else ["haklar karari verilmedi"])
+        return {
+            "candidates": candidates["data"],
+            "candidates_problem": candidates["problem"],
+            "rights": rights["data"],
+            "rights_problem": rights["problem"],
+            "rights_valid": not rights_errors,
+            "rights_errors": rights_errors,
+            "ingest": ingest["data"],
+            "ingest_problem": ingest["problem"],
+            "license_types": list(trend_ingest.LICENSE_TYPES),
+            "third_party_license_types": list(trend_ingest.THIRD_PARTY_LICENSE_TYPES),
+            "rights_notice": trend_ingest.CONTENT_ID_RISK_NOTICE,
+        }
+
+    # ------------------------------------------------- publication metadata
+    def run_metadata_generation(self, *, job_id=None, actor="console") -> dict:
+        tracker = self.tracker("metadata_generation", job_id=job_id)
+        tracker.start("Metadata uretimi basladi")
+        try:
+            return self._run_metadata_generation(tracker, job_id=job_id, actor=actor)
+        except Exception as exc:  # noqa: BLE001
+            tracker.fail(f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _run_metadata_generation(self, tracker, *, job_id, actor) -> dict:
+        tracker.stage("preparation", "Kaynak metin toplaniyor")
+        script = self.load_artifact("selected_script")["data"] or {}
+        hot = self.load_artifact("hot_moments")["data"] or {}
+        plan_decision = ((self.load_artifact("processing_plan")["data"] or {})
+                         .get("decision") or {})
+        ingest = self.load_artifact("ingest_manifest")["data"]
+
+        script_text = script.get("script_text") or ""
+        transcript_excerpt = ""
+        if not script_text:
+            # `direct_clip_series` produces no script, so the transcript of the
+            # analyzed clip is the only honest input.
+            segments = (hot.get("transcript") or {}).get("segments") or []
+            transcript_excerpt = " ".join(
+                str(segment.get("text") or "") for segment in segments[:80]).strip()
+        if not script_text and not transcript_excerpt:
+            raise PipelineServiceError(
+                "metadata uretimi icin script veya transcript gerekli; once analiz "
+                "veya script fazini calistir. Alternatif olarak metadatayi elle yazabilirsin.")
+
+        client = self._build_google_client()
+        if client is None:
+            raise PipelineServiceError(
+                "Gemini kimlik bilgisi yok; metadata uretilemez. Metadatayi elle "
+                "yazabilirsin. " + google_ai.credential_help_text("google_api"))
+
+        tracker.stage("request", "Gemini yaniti bekleniyor")
+        artifact = metadata_studio.generate_metadata(
+            script_text=script_text, transcript_excerpt=transcript_excerpt,
+            source_title=(ingest or {}).get("title") or "",
+            target_language=plan_decision.get("content_language") or "tr-TR",
+            is_short=True, theory_angle=plan_decision.get("theory_angle") or "",
+            client=client,
+        )
+        tracker.stage("attribution", "Kaynak atfi uygulaniyor")
+        artifact = metadata_studio.apply_attribution(artifact, ingest)
+        self.write_artifact("publication_metadata", artifact, job_id=job_id, actor=actor)
+        self.audit.record("provider.call", actor=actor, job_id=job_id,
+                          detail={"phase": "metadata_generation",
+                                  "provider": artifact.get("provider"),
+                                  "model": artifact.get("model")})
+        if artifact.get("status") in ("failed", "insufficient_data"):
+            tracker.fail(artifact.get("status_reason") or "metadata uretilemedi")
+        else:
+            tracker.finish(message=f"{len(artifact['title_variants'])} baslik varyanti")
+        return artifact
+
+    def write_manual_metadata(self, *, title: str, description: str = "", tags=None,
+                              actor="console") -> dict:
+        plan_decision = ((self.load_artifact("processing_plan")["data"] or {})
+                         .get("decision") or {})
+        artifact = metadata_studio.build_manual_metadata(
+            title=title, description=description, tags=tags or [],
+            language=plan_decision.get("content_language") or "tr-TR",
+        )
+        artifact = metadata_studio.apply_attribution(
+            artifact, self.load_artifact("ingest_manifest")["data"])
+        self.write_artifact("publication_metadata", artifact, actor=actor)
+        return artifact
+
+    def select_publication_metadata(self, *, title_index: int, description=None,
+                                    tags=None, category_id=None, actor="console") -> dict:
+        loaded = self.load_artifact("publication_metadata", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        artifact = metadata_studio.select_metadata(
+            loaded["data"], title_index, description_override=description,
+            tags_override=tags, category_id=category_id)
+        self.write_artifact("publication_metadata", artifact, actor=actor)
+        return artifact
+
+    def approve_publication_metadata(self, *, reviewed_sha256: str, approved_by: str,
+                                     notes: str = "") -> dict:
+        loaded = self.load_artifact("publication_metadata", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        try:
+            approved = metadata_studio.approve_metadata(
+                loaded["data"], reviewed_sha256, approved_by, notes)
+        except ValueError as exc:
+            self.audit.record("approval.rejected", actor=approved_by,
+                              artifact=ARTIFACTS["publication_metadata"],
+                              detail={"kind": "publication_metadata", "reason": str(exc)})
+            raise PipelineServiceError(str(exc)) from None
+        relative = self.write_artifact("publication_metadata", approved, actor=approved_by)
+        self.audit.record("approval.granted", actor=approved_by, artifact=relative,
+                          detail={"kind": "publication_metadata",
+                                  "approved_content_sha256":
+                                      approved["metadata_approval"]["approved_selection_sha256"]})
+        return approved
+
+    # ------------------------------------------------------------- publish
+    def youtube_provider(self):
+        """Build the YouTube provider. Constructing it reads no secret value and
+        performs no network call."""
+        if self._youtube_provider is None:
+            token_path = self.storage.resolve(
+                self.ownership, RUNTIME_DIRNAME, "youtube_oauth_token.json",
+                create_parent=True)
+            self._youtube_provider = publish_youtube.YouTubeProvider(
+                token_store=publish_youtube.OAuthTokenStore(path=token_path))
+        return self._youtube_provider
+
+    def publish_credential_state(self) -> dict:
+        try:
+            return self.youtube_provider().describe_credential_state()
+        except Exception as exc:  # noqa: BLE001 - a settings panel must not crash
+            return {"platform": publish_module.PLATFORM_YOUTUBE, "configured": False,
+                    "authorized": False, "client_secrets_error": str(exc)}
+
+    def youtube_authorization_url(self, *, redirect_uri: str, state: str = "") -> str:
+        return self.youtube_provider().authorization_url(redirect_uri, state=state)
+
+    def complete_youtube_authorization(self, *, code: str, redirect_uri: str,
+                                      actor="console") -> dict:
+        state = self.youtube_provider().complete_authorization(code, redirect_uri)
+        # `state` carries only channel identity and scopes -- never a token.
+        self.audit.record("artifact.written", actor=actor,
+                          detail={"youtube_authorized": bool(state.get("authorized")),
+                                  "channel_id": state.get("channel_id")})
+        return state
+
+    def create_publish_intent(self, *, platform=publish_module.PLATFORM_YOUTUBE,
+                              visibility=publish_module.VISIBILITY_PRIVATE,
+                              publish_at=None, made_for_kids=False,
+                              account_ref="", actor="console") -> dict:
+        render = self.load_artifact("render_manifest", required=True)
+        metadata = self.load_artifact("publication_metadata", required=True)
+        for loaded in (render, metadata):
+            if loaded["problem"]:
+                raise ArtifactProblem(loaded["problem"])
+
+        # The render's own hash check is not enough: an upstream approval may have
+        # been revoked since. `approval_chain` is the console's authority on that.
+        chain = self.approval_chain()
+        render_state = chain.get("render") or {}
+        if not render_state.get("effective_valid"):
+            raise PipelineServiceError(
+                "YAYIN ENGELLI: render onayi gecerli degil -- "
+                + (render_state.get("reason") or "once Render Studio'da final onayi ver"))
+
+        target = publish_module.PublishTarget(
+            platform=platform, account_ref=account_ref, visibility=visibility,
+            publish_at=publish_at, made_for_kids=made_for_kids)
+        intent = publish_module.build_publish_intent(
+            render["data"], metadata["data"], target,
+            ingest_manifest=self.load_artifact("ingest_manifest")["data"])
+        relative = self.write_artifact("publish_intent", intent, actor=actor)
+        self.audit.record("artifact.written", actor=actor, artifact=relative,
+                          detail={"platform": platform,
+                                  "requested_visibility": visibility,
+                                  "initial_visibility": publish_module.INITIAL_PRIVACY})
+        return intent
+
+    def approve_publish_intent(self, *, reviewed_sha256: str, approved_by: str,
+                               notes: str = "") -> dict:
+        loaded = self.load_artifact("publish_intent", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        try:
+            approved = publish_module.approve_publish_intent(
+                loaded["data"], reviewed_sha256, approved_by, notes)
+        except ValueError as exc:
+            self.audit.record("approval.rejected", actor=approved_by,
+                              artifact=ARTIFACTS["publish_intent"],
+                              detail={"kind": "publish_intent", "reason": str(exc)})
+            raise PipelineServiceError(str(exc)) from None
+        relative = self.write_artifact("publish_intent", approved, actor=approved_by)
+        self.audit.record("approval.granted", actor=approved_by, artifact=relative,
+                          detail={"kind": "publish_intent",
+                                  "authorizes": "single private upload"})
+        return approved
+
+    def run_publish_upload(self, *, job_id=None, actor="console") -> dict:
+        tracker = self.tracker("publish_upload", job_id=job_id)
+        tracker.start("Private yukleme basladi")
+        try:
+            return self._run_publish_upload(tracker, job_id=job_id, actor=actor)
+        except Exception as exc:  # noqa: BLE001
+            tracker.fail(f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _run_publish_upload(self, tracker, *, job_id, actor) -> dict:
+        tracker.stage("preparation", "Yayin onayi dogrulaniyor")
+        loaded = self.load_artifact("publish_intent", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        intent = loaded["data"]
+
+        existing = self.load_artifact("publish_manifest")["data"]
+        if existing and (existing.get("upload") or {}).get("remote_id"):
+            raise PipelineServiceError(
+                "Bu proje icin zaten bir yukleme yapilmis "
+                f"(id={existing['upload']['remote_id']}). Yeniden yayin icin yeni bir "
+                "yayin niyeti olusturup onaylaman gerekir.")
+
+        # The intent stores a namespace-relative path for display; the uploader
+        # needs the real file, resolved through the storage guard.
+        intent_for_upload = dict(intent)
+        intent_for_upload["source_video_path"] = str(
+            self.storage.resolve(self.ownership, ARTIFACTS["render_manifest"]).parent
+            / Path(intent["source_video_path"]).name
+        ) if not Path(intent["source_video_path"]).is_absolute() else intent["source_video_path"]
+
+        def progress(sent, total):
+            tracker.stage("upload", f"{sent}/{total} bayt gonderildi")
+
+        tracker.stage("upload", "YouTube resumable oturumu aciliyor")
+        manifest = publish_module.execute_private_upload(
+            intent_for_upload, provider=self.youtube_provider(),
+            ingest_manifest=self.load_artifact("ingest_manifest")["data"],
+            uploaded_by=actor, progress_callback=progress,
+        )
+        tracker.stage("write", "Yayin manifesti yaziliyor")
+        self.write_artifact("publish_manifest", manifest, job_id=job_id, actor=actor)
+
+        # One intent authorizes exactly one upload; mark it spent either way.
+        intent["upload_performed"] = True
+        intent["upload_attempted_at"] = _now_iso()
+        self.write_artifact("publish_intent", intent, job_id=job_id, actor=actor)
+
+        self.audit.record("provider.call", actor=actor, job_id=job_id,
+                          detail={"phase": "publish_upload",
+                                  "platform": manifest.get("platform"),
+                                  "status": manifest["upload"].get("status"),
+                                  "quota_units_estimated":
+                                      manifest["upload"].get("quota_units_estimated")})
+        if manifest["upload"].get("status") == "failed":
+            tracker.fail(manifest["upload"].get("error")
+                         or manifest["upload"].get("status_reason") or "yukleme basarisiz")
+        else:
+            tracker.finish(message="Video PRIVATE olarak yuklendi; gorunurluk onayi bekliyor")
+        return manifest
+
+    def approve_publish_visibility(self, *, target_visibility: str, reviewed_remote_id: str,
+                                   approved_by: str, publish_at=None, notes: str = "") -> dict:
+        loaded = self.load_artifact("publish_manifest", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        try:
+            approved = publish_module.approve_visibility(
+                loaded["data"], target_visibility, reviewed_remote_id, approved_by,
+                publish_at=publish_at, notes=notes)
+        except ValueError as exc:
+            self.audit.record("approval.rejected", actor=approved_by,
+                              artifact=ARTIFACTS["publish_manifest"],
+                              detail={"kind": "visibility", "reason": str(exc)})
+            raise PipelineServiceError(str(exc)) from None
+        relative = self.write_artifact("publish_manifest", approved, actor=approved_by)
+        self.audit.record("approval.granted", actor=approved_by, artifact=relative,
+                          detail={"kind": "visibility",
+                                  "target_visibility": target_visibility,
+                                  "publish_at": publish_at})
+        return approved
+
+    def run_visibility_change(self, *, actor="console") -> dict:
+        loaded = self.load_artifact("publish_manifest", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        updated = publish_module.execute_visibility_change(
+            loaded["data"], provider=self.youtube_provider())
+        relative = self.write_artifact("publish_manifest", updated, actor=actor)
+        self.audit.record("provider.call", actor=actor, artifact=relative,
+                          detail={"phase": "visibility_change",
+                                  "visibility": updated.get("current_visibility")})
+        return updated
+
+    def publish_state(self) -> dict:
+        """View model for the publish screen: what is ready, what is blocking."""
+        render = self.load_artifact("render_manifest")
+        metadata = self.load_artifact("publication_metadata")
+        intent = self.load_artifact("publish_intent")
+        manifest = self.load_artifact("publish_manifest")
+        ingest = self.load_artifact("ingest_manifest")
+
+        preconditions = publish_module.validate_publish_preconditions(
+            render["data"] or {}, metadata["data"], ingest["data"])
+        intent_state = (publish_module.check_publish_intent_approval(intent["data"])
+                        if intent["data"] else
+                        {"approved": False, "valid": False,
+                         "reason": "yayin niyeti olusturulmadi"})
+        return {
+            "credential": self.publish_credential_state(),
+            "preconditions": preconditions,
+            "publishable": not preconditions,
+            "metadata": metadata["data"],
+            "metadata_problem": metadata["problem"],
+            "intent": intent["data"],
+            "intent_problem": intent["problem"],
+            "intent_approval": intent_state,
+            "manifest": manifest["data"],
+            "manifest_problem": manifest["problem"],
+            "initial_visibility": publish_module.INITIAL_PRIVACY,
+            "visibility_values": list(publish_module.VISIBILITY_VALUES),
+            "planned_platforms": list(publish_module.PLANNED_PLATFORMS),
+            "registered_platforms": [publish_module.PLATFORM_YOUTUBE],
+        }
 
     # ------------------------------------------------------------- phase 0
     def run_source_assessment(self, *, job_id=None, actor="console") -> dict:
@@ -1943,6 +2484,95 @@ class PipelineService:
             "rendered_count": sum(1 for s in slots
                                   if s.get("video") and s["video"].get("usable")),
         }
+
+    # ------------------------------------------------------------- faz 2 scene editor
+    def build_edl(self, *, source_path: str | None = None,
+                  source_duration: float, title: str = "", actor="console") -> dict:
+        if source_path is None:
+            source_path = str(self.source_path())
+        edl = scene_editor.build_edl(
+            source_path, source_duration, title=title,
+            width=1080, height=1920,
+        )
+        artifact = scene_editor.edl_to_artifact(edl)
+        relative = self.write_artifact("edl", artifact, actor=actor)
+        self.audit.record("edl.created", actor=actor, artifact=relative,
+                          detail={"title": title, "duration": source_duration})
+        return artifact
+
+    def load_edl(self) -> scene_editor.EDL:
+        record = self.load_artifact("edl", required=True)
+        if record["problem"]:
+            raise ArtifactProblem(record["problem"])
+        return scene_editor.edl_from_artifact(record["data"])
+
+    def update_edl_clip(self, clip_index: int, *, start=None, end=None,
+                        crop=None, zoom=None, caption_style=None,
+                        add_b_roll=None, actor="console") -> dict:
+        edl = self.load_edl()
+        if clip_index < 0 or clip_index >= len(edl.clips):
+            raise PipelineServiceError(f"gecersiz klip indeksi: {clip_index}")
+        clip = edl.clips[clip_index]
+        if start is not None and end is not None:
+            clip = scene_editor.trim_clip(clip, start, end)
+        if crop is not None:
+            clip = scene_editor.crop_clip(clip, **crop)
+        if zoom is not None:
+            clip = scene_editor.zoom_clip(clip, **zoom)
+        if caption_style is not None:
+            clip = scene_editor.set_caption_style(clip, scene_editor.CaptionStyle(**caption_style))
+        if add_b_roll is not None:
+            clip = scene_editor.add_b_roll(clip, scene_editor.BRoll(**add_b_roll))
+        edl.clips[clip_index] = clip
+        artifact = scene_editor.edl_to_artifact(edl)
+        relative = self.write_artifact("edl", artifact, actor=actor)
+        self.audit.record("edl.updated", actor=actor, artifact=relative,
+                          detail={"clip_index": clip_index})
+        return artifact
+
+    def set_edl_music(self, music_path: str, actor="console") -> dict:
+        edl = self.load_edl()
+        edl = scene_editor.set_music_track(edl, music_path)
+        artifact = scene_editor.edl_to_artifact(edl)
+        relative = self.write_artifact("edl", artifact, actor=actor)
+        self.audit.record("edl.music_set", actor=actor, artifact=relative,
+                          detail={"music_path": music_path})
+        return artifact
+
+    def build_edl_preview(self, output_name: str = "preview.mp4") -> list[str]:
+        edl = self.load_edl()
+        if not edl.is_valid():
+            raise PipelineServiceError("EDL gecerli degil")
+        render_dir = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
+                                          create_parent=True)
+        output = render_dir / output_name
+        return scene_editor.build_preview_command(edl, output)
+
+    def add_edl_clip(self, *, source_path: str, source_start_sec: float = 0.0,
+                     source_end_sec: float, actor="console") -> dict:
+        edl = self.load_edl()
+        new_clip = scene_editor.EDLClip(
+            clip_id=f"clip_{len(edl.clips)+1:03d}",
+            source_path=source_path,
+            source_start_sec=source_start_sec,
+            source_end_sec=source_end_sec,
+        )
+        edl = scene_editor.add_clip_to_edl(edl, new_clip)
+        artifact = scene_editor.edl_to_artifact(edl)
+        relative = self.write_artifact("edl", artifact, actor=actor)
+        self.audit.record("edl.clip_added", actor=actor, artifact=relative,
+                          detail={"clip_id": new_clip.clip_id})
+        return artifact
+
+    def render_edl_preview(self, output_name: str = "preview.mp4") -> dict:
+        edl = self.load_edl()
+        if not edl.is_valid():
+            raise PipelineServiceError("EDL gecerli degil")
+        render_dir = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
+                                          create_parent=True)
+        output = render_dir / output_name
+        ffmpeg_bin, _ = self.binaries()
+        return scene_editor.render_preview(edl, output, ffmpeg_bin=ffmpeg_bin)
 
     def _describe_media(self, path) -> dict:
         info = {"relative_path": None, "size_bytes": 0, "usable": False, "problem": None}

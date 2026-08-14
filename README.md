@@ -1,12 +1,13 @@
 # YoutubeOtomationv0
 
 Experimental provider-comparison notebooks for a YouTube Shorts content pipeline.
-The main production path is strictly **source video → analysis → script →
-voiceover → render**. Trend/channel discovery and viral-potential estimation are
-independent research sidecars; they never select or replace the source video,
-hot moment, script, voiceover, or render input. Nothing in this repo publishes or uploads to
-YouTube — every artifact carries an explicit `status` and stops at
-`review_required` until a human approves it.
+The main production path is now **source video / trend ingest → analysis →
+script → voiceover → render → private YouTube upload → visibility approval**.
+Trend/channel discovery is an independent research sidecar; it never selects or
+downloads a source without an explicit human licence decision. YouTube publishing
+is gated by three human approvals (metadata, private upload, visibility) and
+always starts as `private`; nothing is made public without a separate explicit
+approval.
 
 The original product/release direction is tracked in [`ROADMAP.md`](ROADMAP.md).
 Detailed status, acceptance criteria, open risks, evidence, and session-by-session
