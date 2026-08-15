@@ -784,3 +784,23 @@ video { max-width: 100%; }
 @media (max-width: 900px) {
   .correction-row { flex-direction: column; align-items: stretch; }
 }
+
+
+/* Transcript editor. Monospace keeps the caption's real length legible -- a
+   proportional font hides that a line is about to overflow the frame. */
+.transcript-seg-input,
+.transcript-full-input {
+  width: 100%;
+  font-family: var(--font-mono, ui-monospace, Consolas, monospace);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--c-border);
+  background: var(--c-surface-2, var(--c-surface));
+  color: var(--c-text);
+  resize: vertical;
+}
+.transcript-seg-input:focus,
+.transcript-full-input:focus { outline: 2px solid var(--c-accent); }
+.field--invalid { border-color: var(--c-danger); }

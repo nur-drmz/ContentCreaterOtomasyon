@@ -27,6 +27,7 @@ from .progress import load_progress
 from .ids import InvalidIdentifier
 from .jobs import JobConflict, JobError, JobNotFound
 from .pipeline_service import (
+    REWIND_LABELS,
     ArtifactProblem,
     PipelineServiceError,
     is_supported_source_video_filename,
@@ -174,6 +175,39 @@ class ConsoleApi:
                     actor=actor)
             raise ApiError("validation_failed", detail=f"yasam dongusu eylemi: {action!r}")
 
+        # Guided revision. GET only DESCRIBES what a revision would archive, so
+        # the confirmation can name the files instead of asking a blind
+        # "are you sure".
+        if rest == ["revision"] and method == "GET":
+            target = _first(query.get("target"))
+            suggestion = service.suggested_revision_stage(_slot(query))
+            return 200, {"revision": {
+                "suggested": suggestion,
+                "plan": service.revision_plan(
+                    target=target or suggestion["stage"], slot=_slot(query)),
+                "stages": [{"key": key, "label": label}
+                           for key, label in REWIND_LABELS.items()],
+                "archive": service.archive_view(),
+            }}
+
+        if rest == ["revision"] and method == "POST":
+            payload = _json_body(body)
+            actor = (_header(headers, "x-actor") or payload.get("actor")
+                     or service.project_actor())
+            return 200, {"revision": service.start_revision(
+                target=_required(payload, "target"),
+                notes=payload.get("notes") or "",
+                actor=actor, slot=_slot(payload)),
+                "archive": service.archive_view()}
+
+        if rest == ["revision", "purge"] and method == "POST":
+            payload = _json_body(body)
+            actor = (_header(headers, "x-actor") or payload.get("actor")
+                     or service.project_actor())
+            return 200, {"archive": service.purge_revision(
+                revision_id=_required(payload, "revision_id"),
+                confirmation=_required(payload, "confirmation"), actor=actor)}
+
         if rest == ["script"] and method == "PATCH":
             payload = _json_body(body)
             artifact = self.app.update_script_text(
@@ -284,6 +318,41 @@ class ConsoleApi:
                 slot=slot)
             return 200, {"transcript": service.transcript_view(slot),
                          "corrections": artifact.get("corrections") or []}
+
+        # Segment-wise and whole-transcript edits are one server operation with
+        # two entry shapes, so the textarea cannot bypass a validation the row
+        # editor enforces.
+        if rest == ["transcript", "segments"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.save_transcript_edits(
+                segments=payload.get("segments") or [],
+                edited_by=payload.get("edited_by") or service.project_actor(),
+                slot=_slot(payload))}
+
+        if rest == ["transcript", "full-text"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.save_transcript_edits(
+                full_text=_required(payload, "full_text"),
+                edited_by=payload.get("edited_by") or service.project_actor(),
+                slot=_slot(payload))}
+
+        if rest == ["transcript", "restore-asr"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.restore_transcript_from_asr(
+                actor=payload.get("actor") or service.project_actor(),
+                slot=_slot(payload))}
+
+        if rest == ["glossary"] and method == "GET":
+            return 200, {"glossary": service.glossary_view()}
+
+        if rest == ["glossary"] and method == "POST":
+            payload = _json_body(body)
+            actor = payload.get("actor") or service.project_actor()
+            if payload.get("accept_term"):
+                return 200, {"glossary": service.accept_glossary_suggestion(
+                    str(payload["accept_term"]), actor=actor)}
+            return 200, {"glossary": service.set_glossary_terms(
+                payload.get("terms") or [], actor=actor)}
 
         if rest == ["outputs"] and method == "GET":
             return 200, {"outputs": service.outputs(), "batch": service.batch_state()}
@@ -611,7 +680,9 @@ class ConsoleApi:
         if target.stat().st_size <= 0:
             raise ApiError("media_empty")
         content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        return 200, {"__raw__": target.read_bytes(), "__content_type__": content_type}
+        # Transport adapters stream this validated path. Returning bytes here
+        # would load every preview into RAM and prevents HTTP Range handling.
+        return 200, {"__file__": target, "__content_type__": content_type}
 
     def _static(self, relative):
         safe = Path(relative.replace("\\", "/"))

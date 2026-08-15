@@ -11,27 +11,54 @@
 
 const api = {
   async request(method, path, { body, headers } = {}) {
-    const options = { method, headers: { ...(headers || {}) } };
+    const requestId = `web-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    const controller = new AbortController();
+    const timeoutMs = 30000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const options = {
+      method,
+      headers: { 'X-Request-ID': requestId, ...(headers || {}) },
+      signal: controller.signal,
+    };
     if (body !== undefined && !(body instanceof ArrayBuffer) && !(body instanceof Blob)) {
       options.headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(body);
     } else if (body !== undefined) {
       options.body = body;
     }
-    const response = await fetch(path, options);
-    const contentType = response.headers.get('content-type') || '';
-    const payload = contentType.includes('application/json') ? await response.json() : null;
-    if (!response.ok) {
-      const error = (payload && payload.error) || {};
-      const failure = new Error(error.message || `HTTP ${response.status}`);
-      failure.hint = error.hint || '';
-      failure.code = error.code || `http_${response.status}`;
-      failure.status = response.status;
-      // Which form fields the server rejected, so the UI can mark them.
-      failure.fields = error.fields || [];
-      throw failure;
+    const started = performance.now();
+    console.info(`[ui] ${requestId} START ${method} ${path}`);
+    try {
+      const response = await fetch(path, options);
+      const contentType = response.headers.get('content-type') || '';
+      const payload = contentType.includes('application/json') ? await response.json() : null;
+      if (!response.ok) {
+        const error = (payload && payload.error) || {};
+        const failure = new Error(error.message || `HTTP ${response.status}`);
+        failure.hint = error.hint || '';
+        failure.code = error.code || `http_${response.status}`;
+        failure.status = response.status;
+        failure.debugId = error.debug_id || requestId;
+        // Which form fields the server rejected, so the UI can mark them.
+        failure.fields = error.fields || [];
+        throw failure;
+      }
+      console.info(`[ui] ${requestId} END ${response.status} ${Math.round(performance.now() - started)}ms`);
+      return payload;
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        const failure = new Error(`Sunucu ${timeoutMs / 1000} saniye icinde yanit vermedi.`);
+        failure.code = 'request_timeout';
+        failure.debugId = requestId;
+        failure.hint = `Sayfayi yenileyip tekrar dene. Debug istegi: ${requestId}`;
+        console.error(`[ui] ${requestId} TIMEOUT ${method} ${path}`);
+        throw failure;
+      }
+      console.error(`[ui] ${requestId} ERROR ${method} ${path}`, error);
+      throw error;
+    } finally {
+      clearTimeout(timeout);
     }
-    return payload;
   },
   get(path) { return this.request('GET', path); },
   post(path, body, headers) { return this.request('POST', path, { body, headers }); },
@@ -134,6 +161,15 @@ const state = {
   // the browser). Null until the Settings screen asks for it.
   diagnostics: null,
   diagnosticsBusy: false,
+  // Transcript editing drafts. UI-local and kept in state on purpose: the
+  // job poll re-renders every 1.5s and anything typed into a bare DOM node
+  // would be wiped mid-sentence.
+  transcriptDraft: null,
+  revision: null,
+  revisionStage: null,
+  revisionNotes: '',
+  transcriptFullDraft: null,
+  glossaryDraft: null,
   uploadRequest: null,
   uploadProgress: null,
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
@@ -449,13 +485,18 @@ async function automationAction(action) {
   if (!state.projectId || state.autoBusy) return null;
   state.autoBusy = true;
   render();
-  const result = await guard(
-    () => api.post(`/api/projects/${state.projectId}/automation`, {
-      action, actor: projectActor(),
-    }));
-  state.autoBusy = false;
-  await refresh();
-  return result;
+  try {
+    return await guard(
+      () => api.post(`/api/projects/${state.projectId}/automation`, {
+        action, actor: projectActor(),
+      }));
+  } finally {
+    // A network timeout or an unexpected refresh failure must never leave the
+    // whole automation toolbar permanently disabled.
+    state.autoBusy = false;
+    render();
+    await refresh();
+  }
 }
 
 
@@ -1450,13 +1491,18 @@ function screenMoments() {
       class: 'btn btn--primary', 'data-testid': 'save-moment-selection',
       disabled: selectedRank === null || !gate.allowed,
       onclick: async (event) => {
-        event.currentTarget.disabled = true;
-        await guard(() => api.post(`/api/projects/${state.projectId}/moment-selection`, {
-          selected_rank: selectedRank,
-          reviewed_by: projectActor(),
-          require_preview: false,
-        }), 'Moment secimi kaydedildi');
-        await refresh();
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          await guard(() => api.post(`/api/projects/${state.projectId}/moment-selection`, {
+            selected_rank: selectedRank,
+            reviewed_by: projectActor(),
+            require_preview: false,
+          }), 'Moment secimi kaydedildi');
+        } finally {
+          button.disabled = false;
+          await refresh();
+        }
       },
     }, 'Bu adayi kaydet'),
     selection && !staleSelection
@@ -1851,9 +1897,57 @@ function phaseRunCard(jobType, title, description, params, extraFields) {
  * Corrections are word-level on purpose -- they keep the alignment timings that
  * drive the yellow active-word highlight, which free-text editing would destroy.
  */
+/* Segment timestamps read as a clock, not a float: "0:07 - 0:11" is a place in
+ * the clip, "7.24" is a number. */
+function formatClock(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return '-';
+  const total = Math.max(0, Math.round(value));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/* Altyazi inceleme ve duzeltme.
+ *
+ * The screen used to show counts and nothing else, so a misheard proper noun
+ * could not be seen -- let alone fixed -- before it was burned into the video.
+ * Now the whole transcript is here, one editable row per caption line, with the
+ * words the recogniser was unsure about marked so the eye lands on them.
+ *
+ * Two rules this file has to respect:
+ *   1. Drafts live in `state`, not in the DOM. The job poll re-renders every
+ *      1.5s and anything typed straight into an input would vanish.
+ *   2. "Save" and "Approve" stay separate buttons. Saving changes the content
+ *      and therefore DROPS the approval; merging them would approve text the
+ *      reviewer had not read in its saved form. */
+function transcriptDraft(t) {
+  if (!state.transcriptDraft) state.transcriptDraft = {};
+  return state.transcriptDraft;
+}
+
+function transcriptDirty(t) {
+  const draft = transcriptDraft(t);
+  return (t.segments || []).some(seg => draft[seg.id] !== undefined
+                                        && draft[seg.id] !== seg.text);
+}
+
+/* Buttons must come back even when the request fails or times out: the API
+ * client aborts at 30s, and a permanently disabled Save is indistinguishable
+ * from a frozen app. */
+async function withButton(event, action) {
+  const button = event.currentTarget;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Kaydediliyor...';
+  try {
+    return await action();
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
 function screenTranscript() {
   const t = state.project.transcript || {};
-  const corrections = (t.corrections || []).slice();
   return el('div', {},
     el('div', { class: 'page-head' }, el('div', {},
       el('h1', { text: 'Altyazi (orijinal ses)' }),
@@ -1876,83 +1970,280 @@ function screenTranscript() {
                  'Altyazi uretilemez. Altyazili bir Short istiyorsan Moment '
                  + 'Explorer\'da konusma iceren bir aday sec.')
       : null,
-    t.available && t.has_speech
-      ? el('div', { class: 'card' },
-          el('div', { class: 'card__head' },
-            el('h2', { text: 'Altyazi metni' }),
-            badge(t.status === 'approved' ? 'approved' : 'review_required', t.status)),
-          el('div', { class: 'dim' },
-            `${t.word_count} kelime - ${t.cue_count} satir - dil ${t.language || '?'} - `
-            + `${t.whisper_model_size} - ortalama guven `
-            + `${t.average_word_probability != null ? t.average_word_probability : '?'}`),
-          t.low_confidence_count
-            ? el('div', { class: 'dim', 'data-testid': 'low-confidence-note',
-                text: `${t.low_confidence_count} kelime dusuk guvenli (asagida isaretli). `
-                      + 'Ozel isimler genelde burada yanlis cikar.' })
-            : null,
-          // The caption as it will read, with unsure words marked so the eye
-          // lands on exactly the words that need checking.
-          el('div', { class: 'transcript-text', 'data-testid': 'transcript-text' },
-            (t.words || []).map(w => el('span', {
-              class: 'transcript-word'
-                     + (w.low_confidence ? ' transcript-word--unsure' : '')
-                     + (w.corrected ? ' transcript-word--fixed' : ''),
-              title: `${w.start_sec}s - guven ${w.probability}`,
-            }, `${w.text} `))),
-          el('div', { class: 'dim mono', 'data-testid': 'transcript-plain',
-                      text: t.text || '' }))
-      : null,
-    t.available && t.has_speech ? transcriptCorrectionsPanel(corrections) : null,
+    glossaryPanel(t.glossary || {}, t.suggestions || []),
+    t.available && t.has_speech ? transcriptSummaryCard(t) : null,
+    t.available && t.has_speech ? transcriptSegmentsPanel(t) : null,
+    t.available && t.has_speech ? transcriptFullTextPanel(t) : null,
+    t.available && t.has_speech ? transcriptHistoryPanel(t) : null,
     t.available && t.has_speech
       ? el('div', { class: 'card' }, el('h2', { text: 'Altyazi onayi' }),
           el('p', { class: 'dim',
-                    text: 'Onaylanmadan render acilmaz. Duzeltme eklersen onay duser.' }),
+                    text: 'Onaylanmadan render acilmaz. Metni degistirirsen onay '
+                          + 'duser ve yeniden onaylaman gerekir.' }),
+          transcriptDirty(t)
+            ? alertBox('warn', 'Kaydedilmemis degisiklik var',
+                       'Once "Degisiklikleri kaydet" de. Onay kaydedilmis metne '
+                       + 'baglanir, ekranda yazdigina degil.')
+            : null,
           approvalPanel('transcript', 'Altyaziyi onayla'))
       : null);
 }
 
-function transcriptCorrectionsPanel(corrections) {
-  const rows = corrections.length ? corrections : [{ from: '', to: '', count: null }];
-  return el('div', { class: 'card', 'data-testid': 'transcript-corrections' },
-    el('h2', { text: 'Kelime duzeltmeleri' }),
+function transcriptSummaryCard(t) {
+  const ctx = t.glossary_context || {};
+  return el('div', { class: 'card' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Ozet' }),
+      badge(t.status === 'approved' ? 'approved' : 'review_required', t.status)),
+    el('div', { class: 'dim' },
+      `${t.word_count} kelime - ${t.cue_count} satir - dil ${t.language || '?'} - `
+      + `${t.whisper_model_size} - ortalama guven `
+      + `${t.average_word_probability != null ? t.average_word_probability : '?'}`),
+    t.low_confidence_count
+      ? el('div', { class: 'dim', 'data-testid': 'low-confidence-note',
+          text: `${t.low_confidence_count} kelime dusuk guvenli (asagida isaretli). `
+                + 'Ozel isimler genelde burada yanlis cikar.' })
+      : null,
+    ctx.term_count
+      ? el('div', { class: 'dim', 'data-testid': 'glossary-context-note',
+          text: `Bu transkript ${ctx.term_count} sozluk terimi baglam olarak `
+                + 'verilerek uretildi.' })
+      : null,
+    (ctx.terms_dropped || []).length
+      ? alertBox('warn', 'Bazi terimler modele verilemedi',
+                 `Uzunluk siniri nedeniyle ${ctx.terms_dropped.length} terim `
+                 + 'disarida kaldi, yani bu transkripti etkilemediler: '
+                 + ctx.terms_dropped.join(', '))
+      : null);
+}
+
+function transcriptSegmentsPanel(t) {
+  const draft = transcriptDraft(t);
+  const segments = t.segments || [];
+  const limits = t.limits || {};
+  return el('div', { class: 'card', 'data-testid': 'transcript-segments' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Transkript' }),
+      badge(transcriptDirty(t) ? 'review_required' : 'completed',
+            transcriptDirty(t) ? 'kaydedilmedi' : `${segments.length} segment`)),
     el('p', { class: 'dim',
-      text: 'Yanlis duyulan kelimeyi dogrusuyla degistir (ornek: Renira -> Rhaenyra). '
-            + 'Zaman damgalari korunur, aktif-kelime vurgusu bozulmaz.' }),
-    el('div', { class: 'stack', id: 'corrections-rows' },
-      rows.map((row, index) => el('div', { class: 'correction-row' },
-        el('input', { type: 'text', id: `corr-from-${index}`,
-                      value: row.from || '', placeholder: 'yanlis duyulan',
-                      maxlength: 80 }),
-        el('span', { class: 'dim', text: '->' }),
-        el('input', { type: 'text', id: `corr-to-${index}`,
-                      value: row.to || '', placeholder: 'dogrusu', maxlength: 80 }),
-        row.count != null
-          ? el('span', { class: row.count ? 'dim' : 'transcript-nomatch',
-              'data-testid': `corr-count-${index}`,
-              text: row.count ? `${row.count} yerde` : 'eslesme yok' })
-          : null))),
+      text: 'Her satir ekranda bir anda gorunen altyazidir. Metni duzenleyebilirsin; '
+            + 'zaman damgalari ve kelime zamanlamalari korunur.' }),
+    el('div', { class: 'stack' }, segments.map(seg => {
+      const value = draft[seg.id] !== undefined ? draft[seg.id] : seg.text;
+      const tooLong = value.length > (limits.max_segment_chars || 220);
+      const empty = !value.trim();
+      return el('div', { class: 'moment-card', 'data-testid': `seg-${seg.id}` },
+        el('div', { class: 'spread' },
+          el('span', { class: 'dim mono', 'data-testid': `seg-time-${seg.id}`,
+                       text: `${formatClock(seg.start_sec)} - ${formatClock(seg.end_sec)}` }),
+          el('span', { class: 'dim',
+            'data-testid': `seg-conf-${seg.id}`,
+            text: `guven ${seg.average_probability != null ? seg.average_probability : '-'}`
+                  + (seg.low_confidence_count ? ` - ${seg.low_confidence_count} dusuk` : '')
+                  + (seg.retimed ? ' - yeniden zamanlandi' : '')
+                  + (seg.edited ? ' - elle duzenlendi' : '') })),
+        // The unsure words are shown as marked text ABOVE the editor rather than
+        // inside it: highlighting inside a textarea would mean a rich editor,
+        // and a rich editor is how invisible markup ends up in a caption.
+        seg.low_confidence_words && seg.low_confidence_words.length
+          ? el('div', { class: 'dim', 'data-testid': `seg-low-${seg.id}` },
+              'Dusuk guvenli: ',
+              seg.low_confidence_words.map(w => el('span', {
+                class: 'transcript-word transcript-word--unsure',
+                title: `guven ${w.probability}`,
+              }, `${w.text} `)))
+          : null,
+        el('textarea', {
+          class: 'transcript-seg-input' + (empty || tooLong ? ' field--invalid' : ''),
+          'data-testid': `seg-input-${seg.id}`, rows: 2, spellcheck: 'false',
+          oninput: (event) => {
+            state.transcriptDraft[seg.id] = event.currentTarget.value;
+            const box = event.currentTarget;
+            const note = document.getElementById(`seg-msg-${seg.id}`);
+            if (note) {
+              note.textContent = validateSegmentValue(box.value, limits);
+            }
+          },
+        }, value),
+        el('div', { class: 'field__error', id: `seg-msg-${seg.id}`,
+                    'data-testid': `seg-msg-${seg.id}`, role: 'alert',
+                    text: validateSegmentValue(value, limits) }));
+    })),
     el('div', { class: 'row' },
-      el('button', { class: 'btn btn--sm', 'data-testid': 'corr-add',
-        onclick: () => {
-          state.transcriptRows = (state.transcriptRows || rows.length) + 1;
-          render();
-        } }, 'Satir ekle'),
-      el('button', { class: 'btn btn--primary', 'data-testid': 'corr-save',
-        onclick: async (event) => {
-          event.currentTarget.disabled = true;
-          const total = state.transcriptRows || rows.length;
-          const payload = [];
-          for (let i = 0; i < total; i += 1) {
-            const from = (document.getElementById(`corr-from-${i}`) || {}).value || '';
-            const to = (document.getElementById(`corr-to-${i}`) || {}).value || '';
-            if (from.trim() && to.trim()) payload.push({ from: from.trim(), to: to.trim() });
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'transcript-save',
+        onclick: (event) => withButton(event, async () => {
+          const payload = (t.segments || [])
+            .filter(seg => draft[seg.id] !== undefined && draft[seg.id] !== seg.text)
+            .map(seg => ({ id: seg.id, text: draft[seg.id] }));
+          if (!payload.length) {
+            pushAlert('info', 'Degisiklik yok', 'Kaydedilecek bir duzenleme bulunamadi.');
+            return;
           }
-          await guard(() => api.post(
-            `/api/projects/${state.projectId}/transcript/corrections`,
-            { corrections: payload }));
-          state.transcriptRows = null;
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/transcript/segments`,
+            { segments: payload, slot: t.slot }), 'Transkript kaydedildi');
+          if (result) {
+            state.transcriptDraft = {};
+            state.project.transcript = result.transcript;
+          }
           await refresh();
-        } }, 'Duzeltmeleri uygula')));
+        }),
+      }, 'Degisiklikleri kaydet'),
+      el('button', {
+        class: 'btn btn--sm', 'data-testid': 'transcript-discard',
+        onclick: () => { state.transcriptDraft = {}; render(); },
+      }, 'Duzenlemeleri geri al'),
+      t.asr_available
+        ? el('button', {
+            class: 'btn btn--sm', 'data-testid': 'transcript-restore-asr',
+            onclick: (event) => withButton(event, async () => {
+              const result = await guard(() => api.post(
+                `/api/projects/${state.projectId}/transcript/restore-asr`,
+                { slot: t.slot }), 'Ham ASR ciktisi geri yuklendi');
+              if (result) {
+                state.transcriptDraft = {};
+                state.project.transcript = result.transcript;
+              }
+              await refresh();
+            }),
+          }, 'Ham ASR ciktisina don')
+        : null));
+}
+
+function validateSegmentValue(value, limits) {
+  const max = limits.max_segment_chars || 220;
+  if (!String(value || '').trim()) return 'Altyazi metni bos olamaz.';
+  if (String(value).length > max) {
+    return `Satir cok uzun (${String(value).length}/${max}); dikey videoda tasar.`;
+  }
+  return '';
+}
+
+function transcriptFullTextPanel(t) {
+  const current = state.transcriptFullDraft !== null
+                  && state.transcriptFullDraft !== undefined
+    ? state.transcriptFullDraft : (t.full_text || '');
+  return el('div', { class: 'card', 'data-testid': 'transcript-full' },
+    el('h2', { text: 'Tum metni birden duzenle' }),
+    el('p', { class: 'dim',
+      text: 'Her satir bir segmenttir. Satir EKLEYIP CIKARAMAZSIN: zaman damgalari '
+            + 'satirlara bagli. Satir sayisi degisirse kayit reddedilir.' }),
+    el('textarea', {
+      class: 'transcript-full-input', 'data-testid': 'transcript-full-input',
+      rows: Math.min(20, Math.max(4, (t.segments || []).length + 1)),
+      spellcheck: 'false',
+      oninput: (event) => { state.transcriptFullDraft = event.currentTarget.value; },
+    }, current),
+    el('div', { class: 'row' },
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'transcript-full-save',
+        onclick: (event) => withButton(event, async () => {
+          const node = document.getElementById('transcript-full-input')
+                       || document.querySelector('[data-testid=transcript-full-input]');
+          const text = node ? node.value : current;
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/transcript/full-text`,
+            { full_text: text, slot: t.slot }), 'Transkript kaydedildi');
+          if (result) {
+            state.transcriptFullDraft = null;
+            state.transcriptDraft = {};
+            state.project.transcript = result.transcript;
+          }
+          await refresh();
+        }),
+      }, 'Tum metni kaydet'),
+      el('button', {
+        class: 'btn btn--sm', 'data-testid': 'transcript-full-reset',
+        onclick: () => { state.transcriptFullDraft = null; render(); },
+      }, 'Sifirla')));
+}
+
+function transcriptHistoryPanel(t) {
+  const revisions = t.revisions || [];
+  return el('div', { class: 'card', 'data-testid': 'transcript-history' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Revizyon gecmisi' }),
+      badge(revisions.length ? 'completed' : 'missing', `revizyon ${t.revision || 0}`)),
+    t.asr_reconstructed
+      ? alertBox('warn', 'Ham ASR ciktisi yeniden kurgulandi',
+                 'Bu proje revizyon takibi eklenmeden once uretilmis. Saklanan '
+                 + '"ham" metin, diskte bulunan en eski hali -- modelin ne '
+                 + 'soyledigi degil.')
+      : null,
+    revisions.length === 0
+      ? el('div', { class: 'empty', 'data-testid': 'transcript-history-empty',
+                    text: 'Henuz elle duzenleme yapilmadi.' })
+      : el('div', { class: 'stack' }, revisions.slice().reverse().map(rev =>
+          el('div', { class: 'spread', 'data-testid': `rev-${rev.revision}` },
+            el('span', { text: `#${rev.revision} ${rev.kind}` }),
+            el('span', { class: 'dim',
+                         text: `${rev.actor} - ${String(rev.at).slice(0, 19)}` }),
+            el('span', { class: 'dim mono',
+                         text: (rev.changed_segment_ids || []).join(', ') || '-' }),
+            el('span', { class: 'dim mono', text: rev.content_sha256_16 || '' })))));
+}
+
+function glossaryPanel(glossary, suggestions) {
+  const terms = (glossary.terms || []).map(entry => entry.term);
+  const current = state.glossaryDraft !== null && state.glossaryDraft !== undefined
+    ? state.glossaryDraft : terms.join('\n');
+  return el('div', { class: 'card', 'data-testid': 'glossary' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Terimler / Ozel isimler' }),
+      badge(terms.length ? 'completed' : 'missing', `${terms.length} terim`)),
+    el('p', { class: 'dim', text: glossary.asr_hint || '' }),
+    el('textarea', {
+      class: 'transcript-full-input', 'data-testid': 'glossary-input', rows: 5,
+      spellcheck: 'false', placeholder: 'Her satira bir terim: Rhaena',
+      oninput: (event) => { state.glossaryDraft = event.currentTarget.value; },
+    }, current),
+    el('div', { class: 'row' },
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'glossary-save',
+        onclick: (event) => withButton(event, async () => {
+          const node = document.querySelector('[data-testid=glossary-input]');
+          const lines = String(node ? node.value : current)
+            .split('\n').map(line => line.trim()).filter(Boolean);
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/glossary`, { terms: lines }),
+            'Sozluk kaydedildi');
+          if (result) state.glossaryDraft = null;
+          await refresh();
+        }),
+      }, 'Sozlugu kaydet')),
+    (suggestions || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'glossary-suggestions' },
+          el('h3', { text: 'Transkriptte bulunan eslesmeler' }),
+          el('p', { class: 'dim',
+            text: 'Bunlar OTOMATIK uygulanmaz. "kesin" olanlar sadece buyuk/kucuk '
+                  + 'harf veya noktalama farki; "oneri" olanlar benzerlige dayanir.' }),
+          suggestions.map((s, index) => el('div', {
+            class: 'spread', 'data-testid': `glossary-suggestion-${index}` },
+            el('span', {}, el('span', { class: 'mono', text: s.from }), ' -> ',
+                            el('strong', { text: s.to })),
+            badge(s.kind === 'certain' ? 'completed' : 'review_required',
+                  `${s.kind} ${s.score}`))))
+      : null,
+    (glossary.suggestions || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'glossary-term-suggestions' },
+          el('h3', { text: 'Duzeltmelerinden ogrenilenler' }),
+          glossary.suggestions.map((item, index) => el('div', {
+            class: 'spread', 'data-testid': `glossary-learn-${index}` },
+            el('span', {}, el('strong', { text: item.term }),
+                           el('span', { class: 'dim', text: ` - ${item.reason || ''}` })),
+            el('button', {
+              class: 'btn btn--sm', 'data-testid': `glossary-accept-${index}`,
+              onclick: (event) => withButton(event, async () => {
+                await guard(() => api.post(
+                  `/api/projects/${state.projectId}/glossary`,
+                  { accept_term: item.term }), 'Terim sozluge eklendi');
+                state.glossaryDraft = null;
+                await refresh();
+              }),
+            }, 'Sozluge ekle'))))
+      : null);
 }
 
 function planSubtitleModel() {
@@ -2501,7 +2792,146 @@ function renderReviewChecklist() {
 }
 
 function renderRevisionPanel() {
-  return reviewRevisionPanel('render');
+  // The note panel records WHY; the studio below acts on it by moving the
+  // invalidated stage out of the way. Kept adjacent so the two are
+  // obviously one workflow rather than two competing buttons.
+  return el('div', {}, reviewRevisionPanel('render'), revisionStudioPanel());
+}
+
+/* Revizyon istasyonu.
+ *
+ * Requesting a revision used to be a NOTE: it changed nothing, so the rejected
+ * clip, transcript and video stayed exactly where the next run would pick them
+ * up again. Starting a revision here MOVES the invalidated stage into the
+ * archive and hands the project back for a rerun.
+ *
+ * Two rules:
+ *   1. Nothing is deleted. The old attempt goes to `revisions/<id>/` and can be
+ *      recovered; permanent deletion is a separate, explicitly confirmed action.
+ *   2. The confirmation names the files. "Emin misin?" that cannot say what it
+ *      is about to move is not consent. */
+function revisionStudioPanel() {
+  const r = state.revision;
+  if (!r) return null;
+  const suggested = r.suggested || {};
+  const chosen = state.revisionStage || suggested.stage;
+  const plan = r.plan || {};
+  const planMatches = plan.target === chosen;
+  return el('div', { class: 'card', 'data-testid': 'revision-studio' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Revizyon: yeniden uretime gec' }),
+      badge(plan.nothing_to_move ? 'missing' : 'review_required',
+            plan.nothing_to_move ? 'tasinacak cikti yok'
+                                 : `${plan.file_count || 0} dosya`)),
+    el('p', { class: 'dim',
+      text: 'Revizyon baslatildiginda gecersizlesen asama ve sonrasi arsive '
+            + 'TASINIR (silinmez), boylece sonraki koşu eski ciktiyi yeniden '
+            + 'kullanamaz.' }),
+    (suggested.reasons || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'revision-suggestion' },
+          el('div', { class: 'dim', text: 'Isaretlenmemis inceleme maddelerinden:' }),
+          suggested.reasons.map(reason => el('div', { class: 'dim mono', text: reason })),
+          el('div', { class: 'dim', text: suggested.note || '' }))
+      : el('div', { class: 'dim', 'data-testid': 'revision-suggestion',
+                    text: suggested.note || '' }),
+    field({ id: 'revision-stage', label: 'Nereden yeniden baslansin',
+      hint: 'Sistem oneriyor, kararı sen veriyorsun. Daha erken bir asama daha '
+            + 'cok ciktiyi arsive tasir.',
+      control: el('select', {
+        id: 'revision-stage', 'data-testid': 'revision-stage',
+        onchange: async (event) => {
+          state.revisionStage = event.currentTarget.value;
+          await refreshRevision();
+          render();
+        },
+      }, (r.stages || []).map(stage => el('option', {
+        value: stage.key, selected: stage.key === chosen,
+      }, stage.label))) }),
+    textareaField({ id: 'revision-why', label: 'Neden (kayda gecer)',
+      hint: 'Serbest metin yorumlanmaz; hangi asamanin yeniden calisacagini '
+            + 'yukaridaki secim belirler.',
+      attrs: { rows: 2, 'data-testid': 'revision-why',
+               oninput: (event) => { state.revisionNotes = event.currentTarget.value; } } }),
+    // The list is the consent: it says exactly what leaves.
+    planMatches && (plan.moves || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'revision-moves' },
+          el('h3', { text: 'Arsive tasinacaklar' }),
+          plan.moves.map(move => el('div', { class: 'spread',
+                                             'data-testid': `revision-move-${move.path}` },
+            el('span', { class: 'mono', text: move.path }),
+            el('span', { class: 'dim', text: move.kind === 'dir'
+              ? `${move.file_count} dosya` : 'dosya' }),
+            el('span', { class: 'dim',
+                         text: `${(move.size_bytes / 1024).toFixed(0)} KB` }))),
+          el('div', { class: 'dim', text: `Hedef: ${plan.destination} (geri alinabilir)` }))
+      : el('div', { class: 'empty', 'data-testid': 'revision-moves-empty',
+                    text: plan.nothing_to_move
+                      ? 'Bu asamada tasinacak cikti yok.'
+                      : 'Asamayi sec, tasinacak dosyalar burada listelenecek.' }),
+    el('button', {
+      class: 'btn btn--danger', 'data-testid': 'revision-start',
+      disabled: Boolean(plan.nothing_to_move) || !planMatches,
+      onclick: (event) => withButton(event, async () => {
+        const result = await guard(() => api.post(
+          `/api/projects/${state.projectId}/revision`,
+          { target: chosen, notes: state.revisionNotes || '' }),
+          'Revizyon baslatildi; eski ciktilar arsive tasindi');
+        if (result) {
+          state.revisionNotes = '';
+          state.revision = null;
+        }
+        await refresh();
+      }),
+    }, 'Revizyonu baslat'),
+    revisionArchivePanel(r.archive || {}));
+}
+
+function revisionArchivePanel(archive) {
+  const items = archive.revisions || [];
+  return el('div', { class: 'stack', 'data-testid': 'revision-archive',
+                     style: 'margin-top:14px' },
+    el('h3', { text: `Arsiv (${archive.count || 0})` }),
+    el('p', { class: 'dim', text: archive.hint || '' }),
+    items.length === 0
+      ? el('div', { class: 'empty', 'data-testid': 'revision-archive-empty',
+                    text: 'Henuz arsivlenmis bir deneme yok.' })
+      : el('div', { class: 'stack' }, items.map(item => el('div', {
+          class: 'moment-card', 'data-testid': `archive-${item.revision_id}` },
+        el('div', { class: 'spread' },
+          el('span', { class: 'mono', text: item.revision_id }),
+          el('span', { class: 'dim',
+                       text: `${item.action}${item.target ? ' / ' + item.target : ''}` }),
+          el('span', { class: 'dim',
+                       text: String(item.created_at || '').slice(0, 19) })),
+        el('div', { class: 'dim mono',
+                    text: (item.moved_paths || []).join(', ') || '-' }),
+        el('div', { class: 'row' },
+          inputField({ id: `purge-${item.revision_id}`,
+                       label: 'Kalici silmek icin kimligi yaz',
+                       attrs: { placeholder: item.revision_id,
+                                'data-testid': `purge-input-${item.revision_id}` } }),
+          el('button', {
+            class: 'btn btn--sm btn--danger',
+            'data-testid': `purge-${item.revision_id}`,
+            onclick: (event) => withButton(event, async () => {
+              const node = document.getElementById(`purge-${item.revision_id}`);
+              await guard(() => api.post(
+                `/api/projects/${state.projectId}/revision/purge`,
+                { revision_id: item.revision_id,
+                  confirmation: node ? node.value : '' }),
+                'Arsivlenmis revizyon kalici olarak silindi');
+              state.revision = null;
+              await refresh();
+            }),
+          }, 'Kalici sil'))))));
+}
+
+async function refreshRevision() {
+  if (!state.projectId) return;
+  const stage = state.revisionStage ? `?target=${encodeURIComponent(state.revisionStage)}` : '';
+  const result = await api.get(
+    `/api/projects/${state.projectId}/revision${stage}`).catch(() => null);
+  state.revision = result ? result.revision : null;
 }
 
 function screenRender() {
@@ -2830,6 +3260,11 @@ async function refresh() {
   if (state.screen === 'settings' && !state.diagnostics && !state.diagnosticsBusy) {
     const cached = await api.get('/api/diagnostics').catch(() => null);
     if (cached) state.diagnostics = cached.diagnostics;
+  }
+  // Only on the render screen: describing a revision is a read, but it
+  // still walks the project tree and no other screen shows it.
+  if (state.screen === 'render' && state.projectId && !state.revision) {
+    await refreshRevision();
   }
   if (state.projectId) {
     try {

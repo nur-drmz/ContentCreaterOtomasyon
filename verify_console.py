@@ -256,7 +256,7 @@ check(not Path(_moment_view["preview_path"]).is_absolute() and
       "flow:moment-preview-route", "Moment Explorer mutlak host yolu sizdiriyor")
 _status, _media = api_call(
     _app, "GET", f"/api/projects/{_pid}/media/{_moment_view['preview_path']}")
-check(_status == 200 and _media.get("__raw__"),
+check(_status == 200 and Path(_media.get("__file__", "")).is_file(),
       "flow:moment-preview-route", "moment preview sahiplik-korumali rotadan acilmiyor")
 ok("flow:analysis-job", f"{len(_hot['data']['hot_moments'])} aday moment (gercek ffmpeg + whisper)")
 

@@ -13,6 +13,7 @@ browser receives already-decided booleans and already-formatted reasons.
 """
 from __future__ import annotations
 
+import json
 import os
 import re as _re
 import sys
@@ -53,7 +54,7 @@ from .progress import (
 from .status import build_workflow_map, run_preflight
 from .storage import LocalFilesystemStorage, StorageViolation
 from .env_file import write_env_value
-from .redaction import register_secret
+from .redaction import register_secret, scrub
 
 #: Pre-alpha is single-user. These are REAL ownership values, not placeholders:
 #: swapping them for session-derived ones is the only change authentication needs.
@@ -174,6 +175,7 @@ class ConsoleApp:
         self.config = config
         self.storage = LocalFilesystemStorage(config.storage_root)
         self.secrets = SecretResolver(config.secret_getter)
+        self._runtime_log_lock = threading.Lock()
         runner_cls = InlineJobRunner if config.inline_jobs else ThreadJobRunner
         self.runner = runner_cls(self._execute_job)
         # A worker process must NOT run startup recovery: it would reclaim jobs
@@ -605,6 +607,29 @@ class ConsoleApp:
         return {"state": "submitted", "next_job_type": job_type,
                 "job": _job_view(record), "message": message}
 
+    def log_runtime(self, event: str, **detail) -> None:
+        """Append one scrubbed, process-safe runtime diagnostic event.
+
+        Audit events explain domain changes inside a project. This log instead
+        explains transport/runtime behaviour (request started, response sent,
+        API error) and therefore lives at the console root. Bodies, query
+        strings and headers are deliberately never accepted by this method.
+        """
+        try:
+            record = {
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "event": str(event)[:120],
+                "detail": scrub(detail, max_len=2000),
+            }
+            target = self.storage.root / "logs" / "runtime_events.jsonl"
+            with self._runtime_log_lock:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                    handle.flush()
+        except Exception:  # noqa: BLE001 - diagnostics must never break a request
+            pass
+
     def log_error(self, error) -> None:
         """Server-side ONLY. The scrubbed detail lands here; the client gets a code.
 
@@ -612,7 +637,15 @@ class ConsoleApp:
         and correlated to the response by `debug_id`.
         """
         try:
-            print(f"[console:error] {error.log_line()}", file=sys.stderr, flush=True)
+            line = error.log_line()
+            print(f"[console:error] {line}", file=sys.stderr, flush=True)
+            self.log_runtime(
+                "api.error",
+                debug_id=getattr(error, "debug_id", None),
+                code=getattr(error, "code", "internal_error"),
+                status=getattr(error, "status", 500),
+                message=line,
+            )
         except Exception:  # noqa: BLE001 - logging must never break a response
             pass
 
