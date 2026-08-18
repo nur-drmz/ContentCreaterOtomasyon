@@ -146,10 +146,15 @@ def technical_summary(manifest: dict | None) -> dict:
         "tts_used": config.get("tts_used"),
         "pipeline_mode": config.get("pipeline_mode"),
         "render_mode": config.get("render_mode"),
+        "frame_zoom": config.get("frame_zoom"),
+        "frame_focus_x": config.get("frame_focus_x"),
+        "frame_focus_y": config.get("frame_focus_y"),
         "preview_mode": config.get("preview_mode"),
         "subtitle_source": subtitles.get("source"),
         "subtitle_cues": subtitles.get("cue_count"),
         "subtitle_words": subtitles.get("word_count"),
+        "excluded_subtitle_cues": subtitles.get("excluded_cue_count"),
+        "all_subtitles_suppressed": subtitles.get("all_subtitles_suppressed"),
         # A render that produced zero subtitle words did half of what this mode
         # promises. Carried to the panel so the reviewer is told, rather than
         # discovering it by watching a silent-captioned Short.

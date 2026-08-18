@@ -128,6 +128,7 @@ try:
         SCREENS = {
             "projects": "Projeler",
             "phase0": "Faz 0",
+            "longform": "Uzun Video Planlama",
             "jobs": "Is akisi",
             "moments": "Moment Explorer",
             "script": "Script Studio",

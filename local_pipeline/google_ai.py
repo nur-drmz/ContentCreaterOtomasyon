@@ -490,7 +490,12 @@ def is_automatic_route_eligible(model_id: str) -> bool:
 
 ROUTE_A_CREATIVE = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemma-4-31b-it")
 ROUTE_B_BULK = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemma-4-26b-a4b-it")
-ROUTE_C_GROUNDED = ("gemini-2.5-flash",)
+# 2026-08-18 canli pilotu: gemini-2.5-flash `models.list()` icinde GORUNUYOR
+# ama cagri 404 donuyor -- "no longer available to new users. Please update
+# your code to use models/gemini-3.6-flash". Tek modelli bir rota, o model
+# emekliye ayrildigi anda asamayi tamamen olduruyor; gorunurluk
+# cagrilabilirlik demek degil. Bu yuzden grounded rota da yedekli.
+ROUTE_C_GROUNDED = ("gemini-3.6-flash", "gemini-3.5-flash")
 ROUTE_D_TTS = ("gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts")
 ROUTE_E_EMBED = ("gemini-embedding-2",)
 ROUTE_F_AGENT = ("antigravity-preview-05-2026",)
@@ -524,7 +529,7 @@ TASK_THINKING_LEVELS = {
     "viral_interpretation": {"gemini-3.5-flash-lite": "minimal", "gemini-3.1-flash-lite": "minimal"},
     "metadata_generation": {"gemini-3.5-flash-lite": "minimal", "gemini-3.1-flash-lite": "minimal"},
     "transcript_cleanup": {"gemini-3.5-flash-lite": "minimal", "gemini-3.1-flash-lite": "minimal"},
-    "grounded_research": {"gemini-2.5-flash": "low"},
+    "grounded_research": {"gemini-3.6-flash": "low", "gemini-3.5-flash": "low"},
 }
 
 #: Task -> the capability the chosen model must actually support.
@@ -825,6 +830,7 @@ def run_google_connection_test(client=None, *, client_factory=None, credential=N
 
 ERROR_RATE_LIMIT_RPM = "rate_limit_rpm"
 ERROR_RATE_LIMIT_RPD = "rate_limit_rpd"
+ERROR_BILLING_QUOTA = "billing_or_quota_configuration"
 ERROR_AUTH = "auth"
 ERROR_NOT_FOUND = "model_not_found"
 ERROR_SERVER = "server_error"
@@ -890,6 +896,8 @@ def classify_google_error(exc) -> str:
         return ERROR_NOT_FOUND
     if code == 429 or "resource_exhausted" in lowered or "429" in lowered \
             or "quota" in lowered or "rate limit" in lowered:
+        if _looks_like_billing_quota(lowered):
+            return ERROR_BILLING_QUOTA
         if _looks_like_daily_quota(lowered):
             return ERROR_RATE_LIMIT_RPD
         return ERROR_RATE_LIMIT_RPM
@@ -908,6 +916,21 @@ def _looks_like_daily_quota(lowered: str) -> bool:
     return any(marker in lowered for marker in (
         "per day", "perday", "requests_per_day", "generaterequestsperday",
         "daily limit", "gunluk", "rpd",
+    ))
+
+
+def _looks_like_billing_quota(lowered: str) -> bool:
+    """A quota/configuration block has no trustworthy automatic reset time.
+
+    These provider messages mean that waiting a minute (or until midnight) is
+    not a remedy. Treating them as RPM caused the live pilot to retry the same
+    model and then spend calls on every fallback model.
+    """
+    return any(marker in lowered for marker in (
+        "plan and billing", "billing details", "billing required",
+        "enable billing", "paid tier required", "quota value: 0",
+        "quota limit value: 0", '"quota_value":"0"',
+        '"quota_limit_value":"0"',
     ))
 
 
@@ -1565,6 +1588,8 @@ def execute_google_route(task: str, call_fn, *, client=None, client_factory=None
       - RPM 429  -> honor Retry-After / bounded jittered backoff, then next model.
       - RPD 429  -> no long sleep; model marked unavailable until midnight
                     Pacific, then next model.
+      - billing/quota configuration 429 -> stop immediately. It has no known
+                    reset time, so there is no retry and no model fallback.
       - 401/403  -> the credential is disabled for the whole run; stops.
       - 404      -> model marked unavailable, continue to the next allowlisted one.
       - 5xx      -> bounded retry, circuit breaker after N consecutive transients.
@@ -1691,6 +1716,29 @@ def execute_google_route(task: str, call_fn, *, client=None, client_factory=None
                         "Google kimlik dogrulama hatasi (401/403): bu calistirmada Google "
                         "saglayicisi devre disi birakildi. "
                         f"{credential_help_text('google_api')} Ayrinti: {message}"
+                    )
+                    result["provider_disabled"] = "google"
+                    result["estimated_quota_after"] = ledger.snapshot(model_id)
+                    result["latency_sec"] = round(time.time() - started, 3)
+                    return result
+
+                if kind == ERROR_BILLING_QUOTA:
+                    result["provider_attempts"].append({
+                        "provider": "google", "model": model_id, "ok": False,
+                        "error_kind": kind, "error": message,
+                        "calls_made": calls_made,
+                        "corrective_retries": corrective_retries,
+                        "transient_retries": transient_retries,
+                    })
+                    result["model"] = model_id
+                    result["status"] = "failed"
+                    result["error_kind"] = kind
+                    result["status_reason"] = (
+                        "Google AI Studio plan/billing veya kota yapilandirmasi "
+                        "istegi engelliyor. Faturalandirma ve proje kotasini "
+                        "duzeltip operator yeniden denemesini acin; otomatik "
+                        "tekrar ve model gecisi yapilmadi. "
+                        f"Ayrinti: {message}"
                     )
                     result["provider_disabled"] = "google"
                     result["estimated_quota_after"] = ledger.snapshot(model_id)
@@ -1973,7 +2021,7 @@ def run_google_viral_interpretation(prompt: str, **kwargs) -> dict:
 def run_google_grounded_research(prompt: str, *, max_candidates: int = 5, **kwargs) -> dict:
     """CANONICAL COMMAND: Google Search grounded research (Route C).
 
-    Uses Gemini 2.5 grounding quota. Intended for a SMALL number of top
+    Uses the allowlisted Gemini grounded route. Intended for a SMALL number of top
     candidates only -- it may confirm whether a topic is currently in the news,
     but it is NOT a substitute for YouTube metrics or Google Trends time series.
     Source URLs/citations are extracted and kept in the artifact.
@@ -2134,6 +2182,104 @@ def split_script_for_tts(script_text: str, max_chars: int = 4000) -> list:
         chunks.append(current.strip())
     return chunks
 
+
+
+def run_google_tts_chunk(chunk_text: str, out_path, *, voice: str = DEFAULT_TTS_VOICE,
+                         language_code: str = DEFAULT_TTS_LANGUAGE,
+                         narration_direction: str = "", **router_kwargs) -> dict:
+    """CANONICAL COMMAND: speak ONE chunk in ONE routed call.
+
+    The difference from `run_google_tts` is the whole point of this function.
+    `run_google_tts` loops over every chunk INSIDE one `execute_google_route`
+    call, so a failure on the twelfth chunk re-speaks the first eleven and the
+    quota ledger records one routed job instead of twelve real requests. For an
+    eighteen minute narration that is both expensive and untrue.
+
+    Here the route wraps a single request: retries retry only this chunk, and
+    the ledger counts one entry per provider call, which is what actually
+    happened.
+
+    `run_google_tts` is deliberately left as it is -- the Shorts pipeline calls
+    it, its behaviour is covered by existing tests, and a script that fits in
+    one request never had this problem.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    body = (chunk_text or "").strip()
+    if not body:
+        return {"task": "tts", "provider": "google", "status": "insufficient_data",
+                "status_reason": "bos parca; TTS cagrisi yapilmadi",
+                "provider_attempts": [], "route_requested": list(TASK_ROUTES["tts"]),
+                "route_planned": [], "output": None, "latency_sec": 0.0,
+                "audio_path": None, "audio_validation": None}
+
+    if voice not in GEMINI_TTS_VOICES:
+        raise ValueError(f"bilinmeyen Gemini TTS sesi: {voice!r} (bkz. GEMINI_TTS_VOICES)")
+
+    prefix = (narration_direction.strip() + "\n\n") if (narration_direction or "").strip() else ""
+    captured: list[bytes] = []
+
+    def call(client, model_id, spec):
+        captured.clear()
+        response = client.models.generate_content(
+            model=model_id, contents=prefix + body,
+            config={
+                "response_modalities": ["AUDIO"],
+                "speech_config": {
+                    "language_code": language_code,
+                    "voice_config": {"prebuilt_voice_config": {"voice_name": voice}},
+                },
+            },
+        )
+        audio_bytes, _mime = _extract_audio_bytes(response)
+        if not audio_bytes:
+            raise StructuredOutputError("TTS bos ses verisi dondurdu")
+        captured.append(audio_bytes)
+        return response
+
+    def validate(raw_response, model_id):
+        if not captured or not captured[0]:
+            raise StructuredOutputError("TTS ses verisi bos")
+        return captured[0]
+
+    router_kwargs.setdefault("estimated_input_tokens", estimate_input_tokens(body))
+    result = execute_google_route("tts", call, validate_fn=validate, **router_kwargs)
+
+    if result["status"] != "ok":
+        result["audio_path"] = None
+        result["audio_validation"] = None
+        return result
+
+    # Atomic: a half-written WAV that survives a crash has a size, a hash and a
+    # path, so every later check would treat it as a real recording.
+    wav_bytes = pcm_to_wav_bytes(result["output"])
+    temp_path = out_path.with_suffix(out_path.suffix + ".part")
+    temp_path.write_bytes(wav_bytes)
+    os.replace(temp_path, out_path)
+
+    validation = validate_audio_file(out_path)
+    result["audio_path"] = str(out_path)
+    result["audio_validation"] = validation
+    result["voice"] = voice
+    result["language_code"] = language_code
+    result["narration_direction"] = narration_direction or None
+    result["source_text_sha256"] = sha256_text(body)
+    result["output_audio_sha256"] = sha256_file(out_path)
+    # `validate_audio_file` nests measurements under "details"; reading the
+    # top level silently produced None for every chunk duration.
+    result["duration_sec"] = (validation.get("details") or {}).get("duration_sec")
+    result["preview_model"] = True
+    result["approval_policy"] = (
+        "Gemini TTS modelleri PREVIEW; parca ciktisi her zaman review_required."
+    )
+    if not validation["passed"]:
+        result["status"] = "failed"
+        result["status_reason"] = validation["reason"]
+        # A file that failed validation must not be left where a resume would
+        # mistake it for a finished chunk.
+        out_path.unlink(missing_ok=True)
+        result["audio_path"] = None
+    return result
 
 def run_google_tts(script_text: str, out_path, *, voice: str = DEFAULT_TTS_VOICE,
                    language_code: str = DEFAULT_TTS_LANGUAGE,

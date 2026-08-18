@@ -140,6 +140,9 @@ def build_segments(artifact, *, low_confidence_threshold: float) -> list:
             "low_confidence_count": len(low),
             "retimed": any(w.get("retimed") for w in members),
             "edited": identifier in edited_ids,
+            # Preserve what ASR heard while allowing a reviewer to keep sung
+            # lyrics or other non-dialogue vocals out of burned-in captions.
+            "excluded_from_subtitles": bool(cue.get("excluded_from_subtitles")),
         })
     return segments
 
@@ -299,6 +302,43 @@ def apply_segment_texts(artifact, texts) -> dict:
         text = " ".join(str(c.get("text", "")) for c in new_cues).strip()
     return {"words": new_words, "cues": new_cues, "text": text,
             "changed_segment_ids": changed}
+
+
+def apply_segment_exclusions(artifact, segment_ids, *, excluded: bool) -> dict:
+    """Toggle caption visibility without deleting recognised text or timings."""
+    record = artifact or {}
+    cues = [dict(cue) for cue in (record.get("cues") or [])]
+    words = [dict(word) for word in (record.get("words") or [])]
+    wanted = {str(value or "").strip() for value in (segment_ids or [])}
+    wanted.discard("")
+    known = {segment_id(index) for index in range(len(cues))}
+    unknown = sorted(wanted - known)
+    if unknown:
+        raise TranscriptEditError(
+            f"bilinmeyen segment: {unknown} (mevcut: {len(cues)} segment)")
+    if not wanted:
+        raise TranscriptEditError("en az bir segment secilmeli")
+
+    changed = []
+    for index, cue in enumerate(cues):
+        identifier = segment_id(index)
+        if identifier not in wanted:
+            continue
+        if bool(cue.get("excluded_from_subtitles")) == bool(excluded):
+            continue
+        cue["excluded_from_subtitles"] = bool(excluded)
+        changed.append(identifier)
+        start, end = cue.get("start"), cue.get("end")
+        for word in words:
+            try:
+                middle = (float(word.get("start")) + float(word.get("end"))) / 2.0
+                inside = ((start is None or float(start) <= middle)
+                          and (end is None or middle <= float(end)))
+            except (TypeError, ValueError):
+                inside = False
+            if inside:
+                word["excluded_from_subtitles"] = bool(excluded)
+    return {"words": words, "cues": cues, "changed_segment_ids": changed}
 
 
 def parse_full_text(artifact, full_text, *, low_confidence_threshold: float) -> list:

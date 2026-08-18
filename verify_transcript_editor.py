@@ -219,6 +219,19 @@ def main() -> int:
         check(True, "tam-metin-satir-sayisi-korunur",
               "satir eklemek zaman damgalarini uydurmak demek olurdu")
 
+    hidden = transcript_edit.apply_segment_exclusions(
+        base, ["seg_0001"], excluded=True)
+    check(hidden["cues"][0].get("excluded_from_subtitles") is True,
+          "sarki-segmenti-cue-dan-SILINMEDEN-gizleniyor")
+    check(all(word.get("excluded_from_subtitles") for word in hidden["words"]),
+          "sarki-segmenti-dinamik-kelimelerden-de-gizleniyor")
+    check(hidden["cues"][0]["text"] == "Steelers Rider!",
+          "gizlemek-ham-metni-YOK-ETMIYOR")
+    check(approval.content_hash_for("transcript", {"words": hidden["words"],
+                                                    "cues": hidden["cues"]})
+          != approval.content_hash_for("transcript", base),
+          "gizleme-karari-onay-hashine-bagli")
+
     # ================================================ 7. sozluk onerileri
     section("7. Sozluk eslesmeleri (gercek yanlis duymalar)")
     book = glossary.set_terms(glossary.new_glossary(),
@@ -380,6 +393,33 @@ def main() -> int:
     consumed = service.load_artifact("moment_transcript", slot=1)["data"]
     check(consumed["text"] == "Rainer flew north Sheepstealer's rider",
           "5-downstream-EN-SON-revizyonu-okuyor", consumed["text"])
+
+    # Song/lyrics handling is an explicit reversible review decision.  Hide
+    # every cue to prove the renderer emits a caption-free video instead of
+    # crashing on an empty SRT/ASS input.
+    status, payload = call(api, "POST", f"/api/projects/{pid}/transcript/exclusions",
+                           {"segment_ids": ["seg_0001", "seg_0002"],
+                            "excluded": True})
+    hidden_view = payload.get("transcript") or {}
+    check(status == 200 and hidden_view.get("excluded_cue_count") == 2,
+          "sarki-satirlari-api-ile-gizleniyor", f"HTTP {status}")
+    hidden_sha = service.approval_state("transcript", 1)["content_sha256"]
+    call(api, "POST", f"/api/projects/{pid}/approvals/transcript",
+         {"reviewed_sha256": hidden_sha, "approved_by": "verify"})
+    service.run_render(actor="verify", slot=1, preview_mode=True, **render_params)
+    hidden_manifest = service.load_artifact("render_manifest", slot=1)["data"] or {}
+    check((hidden_manifest.get("subtitles") or {}).get("all_subtitles_suppressed") is True,
+          "tum-sarki-satirlari-gizliyken-render-COKMUYOR")
+    check((hidden_manifest.get("subtitles") or {}).get("format_used_for_render") == "none",
+          "bos-altyazi-filtresi-yerine-guvenli-null-video-filtresi")
+    status, payload = call(api, "POST", f"/api/projects/{pid}/transcript/exclusions",
+                           {"segment_ids": ["seg_0001", "seg_0002"],
+                            "excluded": False})
+    check(status == 200 and payload["transcript"]["excluded_cue_count"] == 0,
+          "gizlenen-sarki-satirlari-geri-acilabiliyor")
+    restored_sha = service.approval_state("transcript", 1)["content_sha256"]
+    call(api, "POST", f"/api/projects/{pid}/approvals/transcript",
+         {"reviewed_sha256": restored_sha, "approved_by": "verify"})
 
     # A real render, then an edit underneath it. Editing CLEARS the transcript
     # approval rather than invalidating it, so without the recorded digest the

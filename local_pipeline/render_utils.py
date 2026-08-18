@@ -204,23 +204,34 @@ def escape_path_for_filter(path) -> str:
     return text
 
 
-def build_vertical_filtergraph(mode: str, width: int, height: int, blur_sigma: int = 20) -> str:
+def build_vertical_filtergraph(mode: str, width: int, height: int, blur_sigma: int = 20,
+                               zoom_scale: float = 1.0, focus_x: float = 0.5,
+                               focus_y: float = 0.5) -> str:
     """Returns an ffmpeg filtergraph fragment (no leading/trailing brackets on the
     overall chain) that reframes [0:v] into a vertical WxH output labeled [framed].
     mode: 'center_crop' or 'blurred_background'.
     """
+    zoom = min(2.0, max(1.0, float(zoom_scale or 1.0)))
+    anchor_x = min(1.0, max(0.0, float(focus_x)))
+    anchor_y = min(1.0, max(0.0, float(focus_y)))
+    zoom_filter = (
+        f",scale=trunc(iw*{zoom:.4f}/2)*2:trunc(ih*{zoom:.4f}/2)*2"
+        if zoom > 1.0001 else ""
+    )
+    crop = f"crop={width}:{height}:(iw-ow)*{anchor_x:.4f}:(ih-oh)*{anchor_y:.4f}"
     if mode == 'center_crop':
         return (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}[framed]"
+            f"{zoom_filter.lstrip(',') + ',' if zoom_filter else ''}{crop}[framed]"
         )
     if mode == 'blurred_background':
         return (
             f"[0:v]split=2[bg_src][fg_src];"
             f"[bg_src]scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},gblur=sigma={blur_sigma}[bg];"
-            f"[fg_src]scale={width}:-2:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[framed]"
+            f"[fg_src]scale={width}:-2:force_original_aspect_ratio=decrease"
+            f"{zoom_filter}[fg];"
+            f"[bg][fg]overlay=(W-w)*{anchor_x:.4f}:(H-h)*{anchor_y:.4f}[framed]"
         )
     raise ValueError(f"bilinmeyen render mode: {mode!r} (beklenen: center_crop, blurred_background)")
 
@@ -1116,7 +1127,9 @@ def run_original_audio_subtitle_pipeline(
         caption_base_color_ass: str | None = None,
         caption_max_words: int | None = None, caption_max_chars: int | None = None,
         caption_margin_v: int | None = None, moment_transcript: dict | None = None,
-        source_video_path_override: str = '', progress=None) -> dict:
+        source_video_path_override: str = '', frame_zoom: float = 1.0,
+        frame_focus_x: float = 0.5, frame_focus_y: float = 0.5,
+        progress=None) -> dict:
     """Render the selected source moment with its ORIGINAL audio and subtitles.
 
     This is the canonical main-pipeline path for ordinary dialogue clips. It
@@ -1221,12 +1234,24 @@ def run_original_audio_subtitle_pipeline(
     # and re-transcribing here would silently throw those corrections away --
     # and pay for a second Whisper pass to do it.
     approved_transcript = moment_transcript if _transcript_usable(moment_transcript) else None
+    excluded_cue_count = 0
+    excluded_word_count = 0
     if approved_transcript:
-        words = list(approved_transcript.get('words') or [])
-        cues = list(approved_transcript.get('cues') or [])
+        all_words = list(approved_transcript.get('words') or [])
+        all_cues = list(approved_transcript.get('cues') or [])
+        excluded_word_count = sum(
+            bool(word.get('excluded_from_subtitles')) for word in all_words)
+        excluded_cue_count = sum(
+            bool(cue.get('excluded_from_subtitles')) for cue in all_cues)
+        words = [word for word in all_words
+                 if not word.get('excluded_from_subtitles')]
+        cues = [cue for cue in all_cues
+                if not cue.get('excluded_from_subtitles')]
         subtitle_source = (f"approved-transcript:{approved_transcript.get('source') or 'unknown'}")
         report.note(f"Onayli transkript kullaniliyor ({len(words)} kelime, "
                     f"{len(approved_transcript.get('corrections') or [])} duzeltme)")
+        if excluded_cue_count:
+            report.note(f"{excluded_cue_count} satir insan karariyla altyazidan cikarildi")
     else:
         words, cues, subtitle_source = transcribe_for_dynamic_captions(
             base_clip_path, fallback_text, subtitle_max_chars_per_cue,
@@ -1234,14 +1259,15 @@ def run_original_audio_subtitle_pipeline(
             language=resolved_subtitle_language,
             initial_prompt=transcription_prompt,
         )
-    if not cues:
+    all_subtitles_suppressed = bool(excluded_cue_count and not cues)
+    if not cues and not all_subtitles_suppressed:
         raise RuntimeError('Orijinal sesten altyazi cue uretilemedi.')
     # Zero transcribed words means this moment carries no speech. The pipeline
     # still renders it -- a wordless action beat is a valid Short -- but the
     # manifest, the panel and the review checklist must all say so, because the
     # promise of this mode is "original audio PLUS timed subtitles" and only half
     # of that was delivered.
-    no_speech_detected = not words and not fallback_text
+    no_speech_detected = not words and not fallback_text and not all_subtitles_suppressed
     subtitle_warning = None
     if no_speech_detected:
         subtitle_warning = (
@@ -1257,10 +1283,16 @@ def run_original_audio_subtitle_pipeline(
                           if not no_speech_detected
                           else 'konusma yok - altyazi uretilmedi'))
 
-    vertical_graph = build_vertical_filtergraph(render_mode, render_width, render_height)
+    vertical_graph = build_vertical_filtergraph(
+        render_mode, render_width, render_height, zoom_scale=frame_zoom,
+        focus_x=frame_focus_x, focus_y=frame_focus_y)
     subtitles_ass_path = render_dir / 'subtitles_dynamic.ass'
     dynamic_caption_meta = None
-    if caption_style == 'active_word_yellow' and words:
+    if all_subtitles_suppressed:
+        subtitle_graph = "[framed]null[vout]"
+        subtitle_format = 'none'
+        dynamic_word_highlight = False
+    elif caption_style == 'active_word_yellow' and words:
         dynamic_caption_meta = write_active_word_ass(
             words, subtitles_ass_path,
             play_res_x=target_width, play_res_y=target_height,
@@ -1341,10 +1373,13 @@ def run_original_audio_subtitle_pipeline(
     return {
         'status': final_status,
         'status_reason': (
-            ('orijinal ses korundu ancak bu momentte KONUSMA YOK; Short altyazisiz '
-             'uretildi, insan incelemesi bekleniyor'
-             if no_speech_detected else
-             'orijinal ses korundu ve altyazilar videoya gomuldu; insan incelemesi bekleniyor')
+            ('orijinal ses korundu; tum altyazi satirlari insan karariyla gizlendi, '
+             'insan incelemesi bekleniyor'
+             if all_subtitles_suppressed else
+             ('orijinal ses korundu ancak bu momentte KONUSMA YOK; Short altyazisiz '
+              'uretildi, insan incelemesi bekleniyor'
+              if no_speech_detected else
+              'orijinal ses korundu ve altyazilar videoya gomuldu; insan incelemesi bekleniyor'))
             if render_validation['passed'] else
             'orijinal-ses altyazi renderi teknik dogrulamadan gecemedi'
         ),
@@ -1363,6 +1398,9 @@ def run_original_audio_subtitle_pipeline(
         'config': {
             'pipeline_mode': 'original_audio_subtitles',
             'render_mode': render_mode,
+            'frame_zoom': float(frame_zoom),
+            'frame_focus_x': float(frame_focus_x),
+            'frame_focus_y': float(frame_focus_y),
             'preview_mode': preview_mode,
             'target_width': target_width,
             'target_height': target_height,
@@ -1407,6 +1445,9 @@ def run_original_audio_subtitle_pipeline(
             'transcript_revision': (moment_transcript or {}).get('revision'),
             'cue_count': len(cues),
             'word_count': len(words),
+            'excluded_cue_count': excluded_cue_count,
+            'excluded_word_count': excluded_word_count,
+            'all_subtitles_suppressed': all_subtitles_suppressed,
             'srt_path': str(subtitles_srt_path),
             'ass_path': str(subtitles_ass_path) if subtitles_ass_path.is_file() else None,
             'format_used_for_render': subtitle_format,
@@ -1451,7 +1492,8 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
                          original_audio_base_volume: float = 0.35, narration_volume: float = 1.0,
                          duck_ratio: float = 8, subtitle_fontsize: int = 20, subtitle_margin_v: int = 90,
                          subtitle_max_chars_per_cue: int = 42, source_video_path_override: str = '',
-                         progress=None) -> dict:
+                         frame_zoom: float = 1.0, frame_focus_x: float = 0.5,
+                         frame_focus_y: float = 0.5, progress=None) -> dict:
     """High-level, single-run render entry point shared by
     06_render_pipeline.ipynb and 00_youtube_automation_master.ipynb: extracts
     the selected moment's source clip, generates subtitles from the real
@@ -1551,7 +1593,9 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
     report.count(len(cues), len(cues), unit='altyazi',
                  message=f'{len(cues)} altyazi satiri ({subtitle_source})')
 
-    vertical_graph = build_vertical_filtergraph(render_mode, render_width, render_height)
+    vertical_graph = build_vertical_filtergraph(
+        render_mode, render_width, render_height, zoom_scale=frame_zoom,
+        focus_x=frame_focus_x, focus_y=frame_focus_y)
     subs_path_escaped = escape_path_for_filter(subtitles_srt_path)
     subs_style = (
         f'FontSize={subtitle_fontsize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,'
@@ -1638,6 +1682,8 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
         },
         'config': {
             'render_mode': render_mode, 'preview_mode': preview_mode,
+            'frame_zoom': float(frame_zoom), 'frame_focus_x': float(frame_focus_x),
+            'frame_focus_y': float(frame_focus_y),
             'target_width': target_width, 'target_height': target_height,
             'render_width': render_width, 'render_height': render_height,
             'ducking_enabled': ducking_enabled,

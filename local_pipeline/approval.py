@@ -188,8 +188,10 @@ def content_hash_for(kind: str, artifact: dict) -> str:
                 "moment_transcript.json icinde kelime/cue yok; bu momentte konusma "
                 "tespit edilmemis, onaylanacak bir altyazi metni uretilmemis."
             )
-        payload = ([{"t": w.get("text"), "s": w.get("start"), "e": w.get("end")} for w in words]
-                   or [{"t": c.get("text"), "s": c.get("start"), "e": c.get("end")} for c in cues])
+        payload = ([{"t": w.get("text"), "s": w.get("start"), "e": w.get("end"),
+                     "excluded": bool(w.get("excluded_from_subtitles"))} for w in words]
+                   or [{"t": c.get("text"), "s": c.get("start"), "e": c.get("end"),
+                        "excluded": bool(c.get("excluded_from_subtitles"))} for c in cues])
         return sha256_canonical_json(payload)
 
     if kind == "voiceover":

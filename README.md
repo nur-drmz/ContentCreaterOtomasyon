@@ -80,6 +80,11 @@ and may later change **provider** — never accounts.
   (🔑 panel). No repo clone is required for notebooks 01–05 (each is
   self-contained); note that notebooks 02, 03, and 06 read files that earlier
   notebooks wrote to `results/` in the *same* Colab session/runtime.
+  To run the browser-based Creator Console itself, open
+  `experiments/colab/07_creator_console.ipynb`. It loads the verified source
+  bundle from `MyDrive/YouTubeAutomation/app`, keeps active projects under
+  `projects/`, archives under `archive/`, and exposes only a Colab-authenticated
+  iframe over the loopback server—never a public tunnel.
 - **Local Windows:** run `setup_local.ps1` once, then `python verify_local.py`
   to smoke-test the local pipeline. Notebooks auto-detect the local `.venv`
   and activate it. See `.env.example` for the environment variables the

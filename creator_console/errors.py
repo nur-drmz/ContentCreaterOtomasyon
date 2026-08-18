@@ -154,6 +154,12 @@ FIELD_LABELS = {
     "language_code": "Dil kodu",
     "confirmation": "Proje adi dogrulamasi",
     "script_text": "Script metni",
+    "topic": "Uzun video konusu",
+    "content_type": "Video turu",
+    "target_duration_min": "Hedef sure",
+    "chapter_count": "Bolum sayisi",
+    "language": "Video dili",
+    "tone": "Anlatim tonu",
     "kind": "Secret turu",
     "secret_value": "GitHub token",
 }

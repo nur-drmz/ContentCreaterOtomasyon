@@ -130,6 +130,16 @@ def main() -> int:
     status, payload = call(api, "GET", f"/api/projects/{pid}/revision?target=bogus")
     check(status >= 400, "gecersiz-asama-reddediliyor", f"HTTP {status}")
 
+    inferred = service.infer_render_adjustment(
+        "Kadraj duzeltilmeli, biraz yakinlasmasi gerekiyor goruntunun.")
+    check(inferred and inferred["frame_zoom"] == 1.12,
+          "acik-yakinlasma-komutu-yapilandiriliyor", str(inferred))
+    graph = render_utils.build_vertical_filtergraph(
+        "blurred_background", 540, 960, zoom_scale=inferred["frame_zoom"])
+    check("1.1200" in graph, "zoom-gercek-ffmpeg-filtresine-gidiyor", graph[-100:])
+    check(service.infer_render_adjustment("Kadraj kotu olmus") is None,
+          "belirsiz-not-sessizce-uydurulmuyor")
+
     section("3. Baslatma tasiyor, silmiyor")
     status, payload = call(api, "POST", f"/api/projects/{pid}/revision",
                            {"target": "moment", "notes": "Klip cumle ortasinda basliyor."})
@@ -170,6 +180,47 @@ def main() -> int:
     check(status == 200 and payload["archive"]["count"] == 0,
           "birebir-onayla-siliniyor", f"HTTP {status}")
     check(not archived.exists(), "silinen-arsiv-diskten-gitti")
+
+    section("5. Kadraj notu yeni renderi gercekten degistiriyor")
+    zoom_root = Path(tempfile.mkdtemp(prefix="revzoom_"))
+    TMP.append(zoom_root)
+    _zoom_app, zoom_api, zoom_pid, zoom_service = seeded_project(
+        zoom_root, "Kadraj revizyonu")
+    render_dir = zoom_service.slot_render_dir(1)
+    render_dir.mkdir(parents=True, exist_ok=True)
+    video_path = render_dir / "final_short.mp4"
+    video_path.write_bytes(b"fake-video-for-hash")
+    zoom_service.write_artifact("render_manifest", {
+        "status": "review_required", "not_uploaded": True,
+        "output": {"final_video_path": str(video_path)}, "approval": {},
+        "config": {"render_mode": "blurred_background"},
+    }, actor="verify")
+    note = "Kadraj duzeltilmeli, biraz yakinlasmasi gerekiyor goruntunun."
+    status, _ = call(zoom_api, "POST", f"/api/projects/{zoom_pid}/render-review", {
+        "action": "request_revision", "requested_by": "verify",
+        "notes": note, "target_tab": "render",
+    })
+    check(status == 200, "kadraj-revizyon-notu-kayitli", f"HTTP {status}")
+    status, payload = call(zoom_api, "GET",
+                           f"/api/projects/{zoom_pid}/revision?target=render")
+    suggested_adjustment = payload["revision"]["plan"].get(
+        "suggested_render_adjustment")
+    check(payload["revision"]["suggested"]["stage"] == "render",
+          "kullanicinin-sectigi-duzeltme-sekmesi-revizyon-asamasi-oluyor",
+          str(payload["revision"]["suggested"]))
+    check(status == 200 and suggested_adjustment
+          and suggested_adjustment["frame_zoom"] == 1.12,
+          "ui-revizyon-oncesi-uygulanacak-zoomu-gosteriyor",
+          str(suggested_adjustment))
+    status, payload = call(zoom_api, "POST", f"/api/projects/{zoom_pid}/revision",
+                           {"target": "render"})
+    adjustment = ((payload.get("revision") or {}).get("render_adjustment") or {})
+    check(status == 200 and adjustment.get("frame_zoom") == 1.12,
+          "revizyon-baslatma-zoomu-kaydeder", f"HTTP {status} {adjustment}")
+    check(zoom_service.render_adjustment(1)["frame_zoom"] == 1.12,
+          "zoom-render-arsivinden-sonra-da-kalici",
+          str(zoom_service.render_adjustment(1)))
+    check(not video_path.exists(), "eski-video-yeni-ayardan-once-arsivlendi")
 
     check(bool(fixtures.PROVIDER_CALLS) is False, "sifir-saglayici-cagrisi",
           str(len(fixtures.PROVIDER_CALLS)))

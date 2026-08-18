@@ -1,14 +1,14 @@
 # Ayrıntılı Milestone ve İlerleme Takibi
-# Ayrıntılı Milestone ve İlerleme Takibi
 
-**Son güncelleme:** 2026-08-06
+**Son güncelleme:** 2026-08-18
 **Ürün hedefi:** Kullanıcının verdiği uzun filmden **birden fazla** izlenebilir 9:16
 Short üretmek: kısa klip Short'ları (orijinal ses + zaman kodlu altyazı), teori
 videoları (Gemini script + TTS anlatımı) ve savaş/karakter editleri (çoklu segment
 montaj + müzik yatağı). Her çıktı ayrı insan onayından geçer.
 **Şu anki ana hedef:** `M0.10 — Tam film analizi ve batch çoklu Short üretimi`
-**Sıradaki doğrulama:** `M0.10 — Gerçek uzun filmde tam tarama, batch render ve
-her Short'un ayrı ayrı izlenip onaylanması`
+**Sıradaki doğrulama:** `Önce transcript/glossary branch stabilizasyonu ve main
+merge; ardından M0.10 için gerçek uzun filmde tam tarama, batch render ve her
+Short'un ayrı ayrı izlenip onaylanması`
 
 Bu belge günlük ilerleme ve kabul takibi içindir. Üst seviye ürün yönü ve özgün
 release fazları için [ROADMAP.md](ROADMAP.md) esas alınır.
@@ -99,17 +99,59 @@ girdisini otomatik değiştiremez. Araştırma artefaktları
 | M0.6 | Temel edit/render kalitesi | `verification_required` | P0 | Gerçek içerikte 1080×1920 final kalite kontrolü |
 | R0.1 | YouTube araştırma yan kolu | `verification_required` | P2 | Gerçek anahtar-kelime keşfi ve CSV incelemesi |
 | R0.2 | Viral potansiyel araştırması | `in_progress` | P2 | Yeterli gerçek tarihçe üzerinde holdout raporu |
-| M0.7 | Private upload ve yayın güvenliği | `not_started` | P2 | Ayrı yetkilendirilmiş private-upload PoC |
+| M0.7 | Private upload ve yayın güvenliği | `verification_required` | P2 | Gerçek OAuth ile private upload + ayrı görünürlük onayı E2E kanıtı |
 | M0.8 | Analytics ve öğrenme | `not_started` | P2 | Gerçek yayın sonrası temel metrik toplama |
 | M0.9 | Creator Console pre-alpha | `verification_required` | P1 | Mobil izleme/onay görünümü ve erişilebilirlik smoke testi |
 | M0.10 | Tam film analizi + batch çoklu Short | `verification_required` | P0 | Gerçek uzun filmde tam tarama, batch render ve her Short'un ayrı onayı |
-| M0.11 | Montaj motoru (savaş/karakter editleri) | `not_started` | P1 | Çoklu segment concat + müzik yatağı ile izlenmiş edit |
+| M0.11 | Montaj motoru (savaş/karakter editleri) | `in_progress` | P1 | Sesli çoklu segment + müzik ducking ile izlenmiş gerçek edit |
 | M0.12 | Konsol sadeleştirme | `not_started` | P1 | Batch ve montaj akışının tek ekrandan zorlanmadan yönetilmesi |
+| M0.13 | Long-form Video Studio | `verification_required` | P1 | Gerçek ~18 dk pilotun (`verify_long_form_pilot.py`) çalıştırılıp elle izlenmesi |
 | M1.0 | Çoklu kanal ve Channel Brain | `not_started` | P3 | Kanal bazlı ayar ve izolasyon testleri |
 | M1.1 | Web/mobil beta | `not_started` | P3 | Onay ve izleme iş akışlı beta |
 | M2.0 | SaaS ve ölçek | `deferred` | P4 | MVP sonrasına ertelendi |
 
-## 4. Aktif milestone — M0.5 Uçtan uca sesli Short PoC
+### 2026-08-15 aktif çalışma kuyruğu
+
+Bu liste genel backlog değildir; `main`e güvenle dönebilmek ve M0.10 insan kabul
+koşusuna başlayabilmek için sıradaki gerçek kapıları gösterir.
+
+#### P0 — Transcript/glossary branch stabilizasyonu
+
+- [x] Tam transcript segmentleri, zaman damgaları ve düşük güven işaretleri UI'da gösteriliyor.
+- [x] Segment ve tüm metin düzenleme, ham ASR kopyası ve revizyon geçmişi eklendi.
+- [x] Proje sözlüğü faster-whisper `hotwords` bağlamına bağlandı; belirsiz eşleşmeler otomatik uygulanmıyor.
+- [x] Hedef doğrulamalar geçti: `verify_transcript_editor.py` **82/82** ve
+  `verify_revision_flow.py` **39/39**.
+- [x] Şarkı/müzik segmentleri ham metin ve zamanlama silinmeden altyazı
+  renderından çıkarılabiliyor; tüm satırlar gizlense de render çökmüyor.
+- [x] Açık kadraj revizyon komutları (`biraz yakınlaş`, yön odağı) kalıcı,
+  manifestte görünen FFmpeg zoom/focus ayarına dönüşüyor.
+- [ ] Yeniden transkripsiyon mevcut manuel segment revizyonlarını sessizce silmemeli;
+  eski sürüm arşivlenmeli veya açık kullanıcı kararı istenmeli.
+- [ ] `probability=None` olan elle düzeltilmiş kelime düşük güvenli sayılmamalı ve
+  ortalama güven hesabına `0.0` olarak girmemeli.
+- [ ] Transcript/tüm metin/glossary taslakları proje ve output slot kimliğiyle izole edilmeli.
+- [ ] Eski `/transcript/corrections` yolu v2 `asr`, `revisions`,
+  `edited_segment_ids` ve `glossary_context` alanlarını korumalı veya kaldırılmalı.
+- [ ] `Steelers Rider! → Sheepstealer's rider` düzeltmesi tam ifadeyi sözlük
+  önerisi olarak üretebilmeli.
+- [ ] `verify_diagnostics.py` dahil ilgili regresyon paketi yeşil olmalı. Mevcut
+  branch sonucu: **107/114**, 7 başarısız.
+- [ ] `feature/transcript-editor-revision-flow` gözden geçirilip `main`e merge edilmeli.
+
+#### P0 — M0.10 gerçek medya kabul koşusu
+
+- [ ] Bir saatten uzun gerçek kaynakta iki geçişli tam tarama çalıştırılmalı.
+- [ ] En az üç farklı moment üç ayrı output slotuna bilinçli seçilmeli.
+- [ ] Her slotun transcript'i okunmalı/düzeltilmeli ve ayrı hash ile onaylanmalı.
+- [ ] En az üç batch preview baştan sona izlenmeli; en az bir kabul ve bir
+  ret/revizyon kararı kaydedilmeli.
+- [ ] Kabul edilen en az bir Short 1080×1920 final kalitede render edilip teknik
+  ve görsel kontrolden geçirilmeli.
+- [ ] Kadraj, kesim, altyazı senkronu, aktif kelime vurgusu ve ses sürekliliği
+  gözlem notlarıyla birlikte kanıt paketine yazılmalı.
+
+## 4. Temel kabul zinciri — M0.5 Uçtan uca sesli Short PoC
 
 **Durum:** `in_progress`  
 **Amaç:** Tek bir gerçek kaynak videodan, insan tarafından seçilmiş momenti
@@ -434,11 +476,26 @@ GEMINI_TTS_LANGUAGE_CODE = "tr-TR"
 
 ### M0.7 — Private upload ve yayın güvenliği
 
-**Durum:** `not_started`
+**Durum:** `verification_required`
 
-- Private/unlisted upload ayrı ve açık kullanıcı yetkisi gerektirir.
-- Public yayın ikinci bir açık onay olmadan yapılamaz.
-- Bu milestone mevcut notebook tarafından uygulanmaz.
+#### Mevcut yetenekler
+
+- [x] Metadata üretimi, seçim ve hash-bağlı insan onayı.
+- [x] OAuth tabanlı resumable YouTube upload istemcisi.
+- [x] Upload öncesi haklar, metadata ve private-upload onay kapıları.
+- [x] İlk yükleme görünürlüğünü `private` ile sınırlama.
+- [x] Public/unlisted görünürlük değişikliğini yüklemeden ayrı ikinci insan kararına bağlama.
+- [x] Creator Console HTTP rotaları, FastAPI adaptörü ve React yayın ekran iskeleti.
+- [x] Sahte istemcilerle provider çağrısı yapmadan birim ve sözleşme testleri.
+
+#### Kapanış kriterleri
+
+- [ ] Ayrı yetkilendirilmiş gerçek Google/YouTube OAuth hesabıyla private upload PoC.
+- [ ] Yüklenen videonun YouTube Studio'da gerçekten `private` olduğunun gözlemlenmesi.
+- [ ] Kesilen/resume edilen upload davranışının gerçek ağda doğrulanması.
+- [ ] Yanlış veya eksik onayla upload ve görünürlük değişiminin reddedilmesi.
+- [ ] Public/unlisted değişikliğinin yalnız ayrı kullanıcı onayıyla yapılabildiğinin E2E kanıtı.
+- [ ] Kota, hata ve geri dönüş kayıtlarının secret sızdırmadan saklanması.
 
 ### M0.8 — Analytics ve öğrenme
 
@@ -682,23 +739,38 @@ değil** — filmin sonundaki yüksek enerjili an açılışı geçiyor.
 
 ### M0.11 — Montaj motoru (savaş/karakter editleri)
 
-**Durum:** `not_started`
+**Durum:** `in_progress`
 
-Yeni mod `montage_edit` (pipeline_mode `music_bed_montage`). Bugün her iki render
-hattı da tek bir `base_clip_path` üzerinde çalışır ve **hiç concat yoktur**;
-savaş/karakter editi doğası gereği N ayrı aralığın montajıdır, yani motor bunu
-şu an üretemez.
+Nubik Faz 2 ile montajın mekanik iskeleti başladı. Bu, milestone'un tamamlandığı
+anlamına gelmez: bugün gerçek preview özellikle `-an` ile **sessiz** üretiliyor ve
+EDL'de saklanan `music_track` FFmpeg komutuna henüz bağlanmıyor.
 
-- Yeni `run_montage_pipeline`: N segment çıkar → aynı fps/çözünürlük/SAR'a
-  normalize et → concat → 9:16 → ses miksi → opsiyonel altyazı.
-- **Ses: müzik yatağı + orijinal ses, konuşmada müzik kısılır.** Mevcut
-  `build_audio_filtergraph` yeniden kullanılır; ikinci bir ducking uygulaması yazılmaz.
-- Müziği kullanıcı sağlar; sistem müzik **indirmez ve üretmez**, telif sorumluluğu
-  arayüzde açıkça yazılır.
-- Karakter farkındalığı v0: tam transkriptten isim-geçiş indeksi + segment etiketleri.
-  **Yüz tanıma kapsam dışıdır** ve öyle olduğu açıkça belirtilir.
-- `decision.segments`, `music_track`, `audio_mix` karar bloğunda → onay hash'inin parçası.
-- Script/TTS yapısal olarak kapalı → sıfır sağlayıcı çağrısı.
+#### Mevcut yetenekler
+
+- [x] EDL veri modeli ve artefaktı.
+- [x] Trim, zoom, crop ve caption stili kararları.
+- [x] Birden fazla kaynak klibi EDL'e ekleme.
+- [x] Çoklu video klibini FFmpeg `concat` filtergraph'ıyla birleştirme.
+- [x] B-roll picture-in-picture `overlay`, opacity ve merkez ölçekleme.
+- [x] Gerçek FFmpeg preview komutu ve render servisi/API rotası.
+- [x] Creator Console servis metotları ve React Scene Editor ekran iskeleti.
+- [x] Müzik yolu EDL'de saklanıyor.
+
+#### Kalan uygulama ve kapanış kriterleri
+
+- [ ] Kliplerin orijinal seslerini video sırasıyla normalize edip concat etme.
+- [ ] Kullanıcının sağladığı müzik dosyasını gerçek FFmpeg girdisi olarak bağlama.
+- [ ] Müzik yatağı + orijinal ses miksi ve konuşmada mevcut ortak audio-ducking
+  uygulamasını kullanma; ikinci bir ducking motoru yazmama.
+- [ ] Video/ses süre eşleşmesi, stream, çözünürlük, fps ve SAR teknik doğrulaması.
+- [ ] `music_track`, segmentler ve `audio_mix` kararlarını onay hash'ine bağlama.
+- [ ] Kullanıcı müziği/telif sorumluluğunu arayüzde açık gösterme; sistem müzik
+  indirmemeli veya üretmemeli.
+- [ ] Karakter farkındalığı v0: transcript isim-geçiş indeksi ve segment etiketleri;
+  yüz tanıma açıkça kapsam dışı.
+- [ ] Script/TTS yapısal olarak kapalı ve sıfır sağlayıcı çağrısı.
+- [ ] Gerçek kaynak + gerçek kullanıcı müziğiyle en az üç segmentli savaş/karakter
+  editi render edilip baştan sona izlenmeli.
 
 ### M0.12 — Konsol sadeleştirme
 
@@ -709,6 +781,34 @@ Beklenen kapsam: proje ana ekranı olarak batch tahtası, tek birincil akış, g
 ayarların katlanması, üst seviye sekme sayısının azalması, her ekranda tek net
 "sıradaki eylem". Sunucu-türetimli akış haritası tek gerçek kaynağı olarak kalır;
 kural JS'e kopyalanmaz.
+
+### M0.13 — Long-form Video Studio
+
+**Durum:** `verification_required` (mock üretim zinciri geçti; gerçek ~18 dk pilot ve insan dinlemesi bekliyor)
+
+**Hedef:** Bilinen konular üzerinde teori, genel anlatım veya karşılaştırma formatında
+15–20 dakikalık, 16:9 anlatıcı odaklı videolar üretmek.
+
+- [x] Proje içinde ayrı `Uzun Video` planlama sekmesi.
+- [x] Konu, içerik türü, anlatım açısı, 15–20 dk hedef süre, 5–7 bölüm, dil,
+  ton, hedef kitle, seslendirme ve altyazı tercihini kalıcı kaydetme.
+- [x] Planlama ekranının model/script/TTS/render çağrısı başlatmadığını açık gösterme.
+- [x] Tahmini 130–150 kelime/dakika aralığını plandan türetme.
+- [ ] Outline üretimi, düzenleme ve ayrı insan onayı.
+- [x] Bölüm bazlı script üretimi; ortak brief, glossary ve tekrar kontrolü.
+- [x] On iki kalıcı aşamalı iş akışı; yeniden başlatmada kaldığı yerden devam.
+- [x] Outline-öncelikli script: araştırma + outline + bölüm başına ayrı çağrı.
+- [x] Parça parça, yeniden başlatılabilir TTS; başarılı parça iki kez seslendirilmez.
+- [x] TTS RPM/RPD dolduğunda kalıcı bekleme; süre dolunca aynı modelde otomatik devam,
+  kota nedeniyle parça `failed` yapılmaz ve sessiz model/sağlayıcı geçişi olmaz.
+- [ ] Bölüm/b-roll eşleme ve 16:9 long-form timeline. (aşamalar tanımlı, çalıştırıcıları henüz yok)
+- [ ] Önizleme/final render ve arşiv aşamalarının uçtan uca çalıştırılması.
+- [x] Canlı pilot **çalıştırıldı** (2026-08-18): 7 gerçek istek, sağlayıcı kotasında (`429 RESOURCE_EXHAUSTED`) durdu; üç kusur bulunup düzeltildi.
+- [ ] **Anlatım üretilemedi.** Pilotun script/TTS/birleştirme adımlarına hiç ulaşılamadı; kota açıldığında tekrarlanmalı.
+- [ ] **Ses sürekliliği elle dinlenmedi** (dinlenecek ses yok); üretime hazır DEĞİL.
+- [ ] TTS/kendi sesi seçimi, müzik ducking ve tam video altyazısı.
+- [ ] 720p preview ve 1080p final render.
+- [ ] Gerçek bir konuda 15–20 dakikalık videonun baştan sona izlenmesi.
 
 ### M1.0 — Çoklu kanal ve Channel Brain
 
@@ -1994,6 +2094,17 @@ Sıradaki oturum bunu kapatmalı:
 
 | 2026-08-07 | **5.1 ses hatası düzeltildi.** 5.1 kaynak AAC'ye kodlanınca altı kanal kalıyor ama kanal düzeni metadata'sı kayboluyordu (`channels=6, layout=unknown`); zincirdeki bir sonraki AAC kodlaması bunu `Unsupported channel layout "6 channels"` ile reddediyordu. Sonuç: gerçek HOTD projesinde **5 adayın da önizlemesi üretilemedi**, moment seçimi "preview bulunamadı" ile geçersiz kaldı ve render bloke oldu. Beş kodlama noktasına stereo indirgeme eklendi (analiz klibi, önizleme, iki base clip, iki final render); önizleme komutuna açık `-map 0:v:0 -map 0:a:0?` eklendi — `-map` yokken FFmpeg **en çok kanallı** ses akışını (ve 38 altyazı akışı olan bir MKV'de bir subrip akışını) seçiyordu. | M0.1, M0.2, M0.6, M0.9 | Gerçek 4 GB / 63 dk MKV üzerinde birebir yeniden üretildi ve düzeltildi: klip stereo, **5/5 önizleme üretildi**, moment seçimi geçerli, render 540×960 stereo + 13 cue, teknik doğrulama geçti. Derinlik ölçümü: 1./15./30./50./61. dakikadan klip çıkarma 3.5–6.5 sn (sabit — input-side seek çalışıyor), süre sapması 0.06 sn. MKV→MP4 çevrimi ölçüldü: hız kazancı yok (5.5 sn vs 6.5 sn), gerekli değil. `verify_local`, `verify_console`, `verify_batch_outputs` (88/88), `verify_real_preview`, `verify_browser`, `verify_faults` (70/70), `verify_acceptance` (109/109) exit 0. |
 | 2026-08-07 | **Konuşmasız moment artık sessizce altyazısız Short üretmiyor.** Ses enerjisi skorun 0.30'u olduğu için yüksek sesli ama sözsüz bir pencere (müzik/savaş/ejderha) diğer adaylar gibi sıralanıyor, seçiliyor ve render 0 kelimeyle `review_required` dönüyordu — kullanıcı bunu ancak videoyu izleyince anlıyordu. Aday artık `has_speech` taşıyor ve Moment Explorer'da **"konusma yok"** rozeti + açıklama gösteriliyor; render manifesti `no_speech_detected` + `subtitle_warning` taşıyor, `status_reason` bunu söylüyor ve Render Studio teknik özetinde uyarı kutusu çıkıyor. Video yine de üretiliyor — sözsüz bir aksiyon anı geçerli bir Short'tur, ama modun vaadinin yarısı teslim edilmediği için bu **söyleniyor**. | M0.2, M0.6, M0.9 | Gerçek kaynakta iki uçlu doğrulama: rank 4 (2367–2400s, mean −19.8 dB ama 0 segment) → `no_speech_detected=True`, uyarı metni, `status_reason` söylüyor, panele taşınıyor, video yine de üretiliyor; rank 1 (2224–2258s) → 34 kelime, dinamik kelime vurgusu, uyarı yok. Regresyon: `verify_local`, `verify_console`, `verify_batch_outputs`, `verify_real_preview`, `verify_browser`, `verify_faults` (70/70), `verify_acceptance` (109/109) exit 0; gömülü payload'lar yenilendi. |
+| 2026-08-15 | Moment seçiminde arayüzün donması incelendi: tarayıcının altı bağlantısı Range desteklemeyen tam MP4 indirmeleriyle dolduğu için seçim/otomasyon POST isteği sunucuya ulaşmıyordu. Medya yolu chunked streaming + HTTP Range (`206/416`) oldu; UI isteklerine timeout/`finally`, sunucuya request-id bağlı ve secret-redacted kalıcı runtime logları eklendi. | M0.2, M0.9 | `tests/test_http_media.py` 2/2, test paketi 120 passed/1 skipped; canlı 12.2 MB preview isteği `bytes=0-1023` için 1024 byte ve `206 Partial Content`; `.console_data/logs/runtime_events.jsonl` başlangıç/bitiş, süre ve byte sayısını kaydetti. |
+| 2026-08-15 | Tam transcript editörü, ham ASR + revizyon geçmişi ve proje sözlüğü/hotwords bağlamı `feature/transcript-editor-revision-flow` branch'inde uygulandı. İnceleme beş merge blokeri buldu: rerun'da manuel revizyon kaybı, `None` güvenin düşük sayılması, taslakların proje/slot izolasyonu, eski corrections yolunda v2 alan kaybı ve tam ifade sözlük önerisi. Bu nedenle özellik tamamlanmış veya main'e merge edilmiş sayılmadı. | M0.5, M0.6, M0.9 | Commit `0b24e5f`; `verify_transcript_editor.py` 74/74, `verify_revision_flow.py` 30/30; `verify_diagnostics.py` 107/114 (7 başarısız). Aktif P0 stabilizasyon listesi genel durum panosuna eklendi. |
+| 2026-08-15 | Milestone panosu kodun gerçek durumuyla senkronlandı: Publish altyapısı nedeniyle M0.7 `verification_required`, Nubik Scene Editor/EDL çalışması nedeniyle M0.11 `in_progress` oldu. Sessiz preview ve bağlanmamış müzik nedeniyle M0.11 tamamlanmış sayılmadı; M0.10 ana hedef ve insan izlemesi blokeri olarak korundu. | M0.7, M0.10, M0.11, M0.12 | `MILESTONES.md` aktif kuyruk, kapanış kriterleri ve ilerleme günlüğü güncellendi; hiçbir kanıtsız checkbox kapatılmadı. |
+
+| 2026-08-17 | Long-form planlama v0 eklendi: proje bazlı 15–20 dk brief sekmesi, kalıcı `long_form_plan` artefaktı, süre/bölüm doğrulaması ve model çağrısı yapmayan gerçek tarayıcı akışı. | M0.13 | `creator_console/static/app.js`, `creator_console/pipeline_service.py`, `verify_long_form_planner.py` 18/18 |
+| 2026-08-18 | **Long-form Video Studio: planlamadan üretime.** Sekme yalnızca brief kaydediyordu; artık on iki **kalıcı aşamalı** bir iş akışı var (araştırma → outline → bölüm scriptleri → tutarlılık incelemesi → insan script incelemesi → TTS → ses incelemesi → B-roll eşleme → 16:9 zaman çizelgesi → önizleme render → final render → arşiv). Durum diske yazıldığı için uygulama yeniden başlatıldığında **tamamlanmamış ilk aşamadan** devam ediyor; kısmi hata bütün akışı sıfırlamıyor. Script tek dev çağrıyla değil, **outline-öncelikli** üretiliyor: araştırma, outline ve HER BÖLÜM ayrı istek, aralarında kompakt bir story bible (konu, kitle, ton, tez, onaylı olgular, sözlük, önceki bölüm özeti, sonraki bölümün amacı) dolaşıyor. Olgular ve yorumlar ayrı listelerde tutuluyor, kaynak meta verisi korunuyor. **TTS baştan yazıldı:** eski `run_google_tts` bütün parçaları TEK yönlendirilmiş çağrının içinde çalıştırıyordu — 12. parça düşünce ilk 11'i yeniden seslendiriyor ve kota defterine 12 istek yerine 1 iş yazıyordu. Yeni `run_google_tts_chunk` her parçayı kendi rota çağrısında çalıştırıyor; parça defteri (metin+ses+model+sağlayıcı+yönerge+dil hash'i) sayesinde başarılı bir parça asla iki kez seslendirilmiyor ve bölüm 3 düzenlenince yalnızca onun sesi geçersizleşiyor. `run_google_tts` **dokunulmadan** duruyor; kısa video yolu değişmedi. | M0.13, M0.9 | `verify_long_form_studio.py` (yeni, **66/66**, sahte sağlayıcı ikizleri, sıfır gerçek API çağrısı): 18 dk planı 6 bölüm × 420 kelime (130-150 wpm bandında), bölümler ayrı çağrılarla üretiliyor (en büyük istek 853 karakter — tek dev prompt yok), 12 bağımsız TTS parçası ayrı dosyalar hâlinde saklanıyor, parça 5 düşünce 1-4 korunuyor, **yeniden başlatma** tamamlananları koruyup yalnızca eksiği istiyor ve tamamlananların hash'i değişmiyor, bölüm düzenlemesi yalnızca kendi sesini geçersizleştiriyor, 429/5xx yeniden denenebilir / 400-401-403 denenmez, 401'de güvenli duruyor (0 parça üretildi), iptal parçalar arasında duruyor, birleştirme sırası deterministik, olay günlüğünde tam script ve kimlik bilgisi yok. `verify_long_form_planner.py` 18/18 (tarayıcı, JS hatası yok). Regresyon: `verify_project_lifecycle` 23/23, `verify_voice_review`, `verify_content_language`, `verify_transcript_editor`, `verify_revision_flow`, `verify_mkv_support` 19/19, `verify_large_upload` 17/17, `verify_cancel_long_video` 26/26, `verify_project_archive` 18/18 — hepsi exit 0. **Yol üstünde bulunan üç gerçek kusur:** (1) `validate_audio_file` süreyi `details` altında döndürüyor, üst seviyeden okuduğum için her parçanın süresi None kalıyordu; (2) kota özeti `requests_today` anahtarını arıyordu, defter `requests_current_day` yazıyor — sıfır istek raporluyordu; (3) rota hatası alttaki HTTP kodunu yutuyor, 401 'transient' sanılıyordu. **En önemli operasyonel bulgu:** yapılandırılmış TTS limitleri (model başına rpm=3, rpd=10; iki model) bir 18 dakikalık anlatımı **tek geçişte üretemiyor** — ölçüldü, altı istekte duruyor. Bu bir hata değil, gerçek bir sınır; artık başlamadan önce uyarı olarak gösteriliyor ve parça defterinin yeniden başlatılabilir olmasının asıl sebebi bu. |
+| 2026-08-18 | **Long-form TTS kota zamanlayıcısı.** Önceki uygulama RPM sınırında kalan parçayı hata gibi işaretliyor ve otomatik fallback rotası aynı anlatımı ikinci TTS modeline taşıyabiliyordu. TTS artık seçilen tek modeli açık modda kullanıyor; yerel veya canlı RPM/RPD sınırında `waiting_rate_limit` / `waiting_daily_quota` durumunu ve kesin `resume_at` zamanını diske yazıyor. Tamamlanmış parçalar korunuyor, bekleme uygulama yeniden başlatılınca kaybolmuyor ve Uzun Video sekmesi zamanı gelince aşamayı otomatik uyandırıyor. TTS oynatıcısının dosya-kimliği yerine yanlışlıkla ses hash’iyle URL kurması da düzeltildi; görünüm yalnızca güvenli dosya adını taşıyor. | M0.13 | `verify_long_form_studio.py` **75/75**, `verify_long_form_planner.py` 18/18; regresyon: project lifecycle 23/23, transcript editor 74/74, revision flow 30/30, voice review 86/86, content language 93/93, MKV 19/19, large upload 17/17, cancel long video 26/26, project archive 18/18 — tamamı exit 0. Gerçek API çağrısı yapılmadı. Önceki “iki model toplam kapasite” yorumu düzeltilmiştir: ses sürekliliği için kapasite seçili tek model üzerinden hesaplanır; başka modele sessiz geçiş yapılmaz. |
+| 2026-08-18 | **İlk kontrollü canlı Gemini pilotu ÇALIŞTIRILDI ve sağlayıcı kotasında durdu.** İzole proje (`.console_data_longform_pilot`, `prj_f6b230896e8882e9`, 18 dk / 6 bölüm / tr-TR), üretim deposuna dokunulmadı. **Toplam 7 gerçek Gemini isteği yapıldı, hiçbiri başarılı olmadı; hiçbir script, ses veya video üretilmedi.** Pilot üç gerçek kusur ortaya çıkardı ve üçü de düzeltildi: (1) `verify_long_form_pilot.py` `.env.local`'ı yüklemiyordu — kardeş canlı scriptlerin hepsi yüklüyor — bu yüzden anahtar diskte dururken 'kimlik yapılandırılmamış' diyordu; (2) `grounded_research` rotası tek modelliydi (`gemini-2.5-flash`) ve o model **`models.list()` içinde görünmesine rağmen** çağrıda 404 veriyor: *"no longer available to new users, use models/gemini-3.6-flash"* — görünürlük çağrılabilirlik değil; rota yedekli hale getirildi; (3) kota bekleme sınıflandırması yalnızca TTS döngüsündeydi, metin aşamalarında 429 düz `failed` oluyordu — `failed` operatörü yeniden denemeye davet edip kotayı daha da yakar, bekleme ise `resume_at` taşır. **Pilotu durduran engel:** `gemini-3.6-flash` + grounding çağrısı `429 RESOURCE_EXHAUSTED — You exceeded your current quota, please check your plan and billing details`. Bu bir faturalandırma/kota sınırı; talimat gereği bypass edilmedi, kimlik döndürülmedi, ikinci bir pilot çalıştırılmadı. | M0.13 | **Gözlenen kanıt:** yerel kota defteri 7 istek (gemini-2.5-flash 1 başarısız, gemini-3.6-flash 3 başarısız, gemini-3.5-flash 3 başarısız). Üretilen artefakt: yok (research/outline/chapters/consistency **yok**, TTS parçası 0, birleşik ses yok). İş akışı durumu `research=failed`. Sızıntı kontrolü: olay günlüğünde API anahtarı yok, `GeminiKey` adı yok, mutlak host yolu yok. Her iki kusur için **düzeltmeden ÖNCE** mock regresyon testi yazıldı ve düşürüldüğü doğrulandı (emekli model: 4 kontrol düştü; metin kotası: 3 kontrol düştü), düzeltmeden sonra geçtiler. `verify_long_form_studio.py` **83/83**, `verify_long_form_planner.py` 18/18, `verify_project_lifecycle` 23/23, `verify_voice_review`, `verify_content_language`, `verify_cancel_long_video` 26/26, `verify_project_archive` 18/18 — hepsi exit 0; `git diff --check` temiz. **Kapasite gerçeği:** sabitlenmiş tek TTS modelinde günlük kapasite 10 istek, 18 dk anlatım ~12 parça gerektiriyor — tam anlatım tek günde tamamlanamaz; bu, parça defterinin yeniden başlatılabilir olmasının sebebi. **İnsan incelemesi yapılmadı: dinlenecek ses üretilmedi.** |
+| 2026-08-18 | **Canlı pilot sonrası billing/kota koruması.** `check your plan and billing details` mesajı artık RPM/RPD gibi süreli bir kota değil, ayrı `billing_or_quota_configuration` hata türü ve kalıcı `blocked_billing` aşama durumu olarak ele alınıyor. Bu durumda rota ilk hatada duruyor: aynı modele geçici retry yapmıyor, yedek modele geçmiyor ve `resume_at`/tarayıcı zamanlayıcısı kurmuyor. Uzun Video arayüzü sebebi açıkça gösteriyor; yalnızca operatör **“Billing düzeltildi - yeniden denemeyi aç”** eylemine bastığında aşama tekrar kuyruğa alınıyor. Aynı koruma TTS parça defterine de uygulandı. Canlı pilotta 404 veren emekli `gemini-2.5-flash`, otomatik grounded rotadan tamamen çıkarıldı; rota `3.6 → 3.5`. | M0.13 | `verify_long_form_studio.py` **91/91**: canlı hata metniyle tam **1 sağlayıcı çağrısı**, 0 retry, 0 fallback; zamanlayıcısız blok, API üzerinden açık operatör yeniden denemesi ve aynı aşamadan başarıyla devam doğrulandı. `verify_long_form_planner.py` 18/18; regresyon: project lifecycle 23/23, transcript editor 74/74, revision flow 30/30, voice review 86/86, content language 93/93, MKV 19/19, large upload 17/17, cancel long video 26/26, project archive 18/18 — tamamı exit 0. `git diff --check` temiz. **Gerçek API çağrısı yapılmadı.** `verify_local.py` değişiklikle ilgisiz, önceden mevcut notebook-gömülü `local_pipeline.approval` hash senkronu nedeniyle Google yönlendirme kontrollerine ulaşmadan durdu; notebook yeniden üretimi bu düzeltmenin kapsamına alınmadı. |
+| 2026-08-18 | **Creator Console Colab/Drive dağıtımı.** Mevcut `MyDrive/YouTubeAutomation` yapısı bozulmadan `app`, `projects` ve `archive` klasörleri eklendi. `07_creator_console.ipynb`, Console'u `127.0.0.1` üzerinde çalıştırıp Colab'ın oturum-korumalı iframe proxy'sinde gösteriyor; herkese açık tünel açmıyor. Projeler ve arşiv Drive'da kalıyor, kod hızlı geçici diskte doğrulanmış ZIP'ten çalışıyor, bağımlılıklar Colab kernelini bozmamak için ayrı venv'e kuruluyor ve `GeminiKey` yalnızca Colab Secrets'tan sunucu sürecine aktarılıyor. `source_videos` sunucu tarafı kitaplık olarak bağlandı: kullanıcı Drive'daki büyük videoyu Console'dan seçiyor, dosya tarayıcı/Colab proxy üzerinden geçmeden aktif projeye kopyalanıyor. Kaynak paketi yalnızca `creator_console`, `local_pipeline` ve Colab requirements içeriyor; medya, `.env`, `.git`, `.venv`, proje verisi ve cache yapısal olarak dışarıda. | M0.9, M0.13 | Drive readback sonrası son dağıtım: `app/creator_console_colab.zip` **419151 bayt**, `app/07_creator_console.ipynb` **6306 bayt**, SHA-256 sidecar **66 bayt**; üçü de private/not-shared. Yerel paket SHA-256 `676c22dc1ddcf35fd8b1b7ba92aba6801680568ef1e6c4f138f71b4faec38654`, 51 dosya. `verify_colab_console.py` **14/14**: manifest/hash, secret/medya dışlama, Long-form modülleri, boş notebook output'ları, açık Drive mount, loopback+iframe, public-tunnel yokluğu, çıkarılmış paketten gerçek `/api/health`, path-safe kitaplık listeleme, sunucu tarafı import ve traversal reddi doğrulandı. `verify_long_form_planner.py` 18/18 ve `verify_project_archive.py` 18/18 geçti. Gerçek Gemini/YouTube çağrısı yapılmadı. Colab runtime'ında hücrelerin elle çalıştırılması hâlâ `verification_required`. |
+| 2026-08-18 | **Uygulanabilir render revizyonu ve şarkı altyazısı kontrolü.** Render revizyon notu artık yalnızca kayıt değil: açık yakınlaşma/uzaklaşma ve odak komutları slot-bazlı `render_adjustment` artefaktına çevriliyor, eski video arşivleniyor ve yeni FFmpeg renderı zoom/focus değerini manifestte taşıyor. Kullanıcının seçtiği düzeltme sekmesi yeniden üretim aşamasını belirliyor. Altyazı ekranına segment-bazlı “Şarkı / müzik: altyazıda gösterme” kararı eklendi; metin, zamanlama ve ham ASR korunuyor, karar onay hash'ine bağlanıyor ve geri alınabiliyor. Tüm satırlar gizliyken boş ASS/SRT filtresine düşmek yerine güvenli videosuz-altyazı (`null`) yolu kullanılıyor. Otomatik şarkı/konuşma ayrımı kesin kabul edilmedi; Whisper şarkıyı yüksek güvenle konuşma sayabildiği için insan kararı otorite olarak korunuyor. | M0.5, M0.6, M0.9 | `verify_transcript_editor.py` **82/82** ve `verify_revision_flow.py` **39/39**, exit 0; gerçek FFmpeg ile tüm altyazılar gizliyken render tamamlandı, 1.12x zoomun filtreye ve kalıcı artefakta ulaştığı doğrulandı. `py_compile`, frontend `node --check` ve `git diff --check` temiz. Gerçek API çağrısı/yükleme/yayın yapılmadı. Geniş `verify_console.py` mevcut zorunlu transcript kapısını atlayan eski test beklentisi nedeniyle düştü; `verify_browser.py` genel 120 sn zaman aşımına uğradı. |
 
 Yeni bir çalışma tamamlandığında bu tabloya tarih, yapılan değişiklik ve somut
 kanıt eklenmelidir. Checkbox yalnızca ilgili kanıt üretildiğinde işaretlenmelidir.

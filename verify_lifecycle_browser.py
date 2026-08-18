@@ -36,8 +36,11 @@ def check(condition, label):
 
 
 with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
+    root = Path(temp)
+    archive_root = root / "external_archive"
+    archive_root.mkdir()
     app = ConsoleApp(ConsoleConfig(
-        storage_root=Path(temp), inline_jobs=True,
+        storage_root=root / "active", archive_root=archive_root, inline_jobs=True,
         secret_getter=fixtures.fake_secret_getter(google=False),
         **fixtures.fixture_client_factories()))
     project = app.create_project(title="Browser lifecycle", created_by="test")
@@ -63,6 +66,12 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
             page = browser.new_page(viewport={"width": 1280, "height": 900})
             errors = []
             page.on("pageerror", lambda exc: errors.append(str(exc)))
+            page.goto(f"{base}/#projects", wait_until="networkidle")
+            policy = page.locator("[data-testid=storage-policy]")
+            check(policy.count() == 1, "storage-policy-visible")
+            check("AKTIF CALISMA" in policy.inner_text()
+                  and "UZUN SURELI SAKLAMA" in policy.inner_text(),
+                  "storage-policy-explains-c-to-archive")
             page.goto(f"{base}/?project={pid}#script", wait_until="networkidle")
             check(page.locator("[data-testid=project-lifecycle]").count() == 1,
                   "lifecycle-panel-visible")
@@ -81,6 +90,8 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
                   "script-edit-click-archives-downstream")
 
             page.locator("[data-testid=project-lifecycle] > summary").click()
+            check(not page.locator("[data-testid=lifecycle-archive]").is_disabled(),
+                  "archive-button-enabled")
             page.select_option("[data-testid=lifecycle-target]", "script")
             page.click("[data-testid=lifecycle-rewind]")
             page.wait_for_timeout(700)

@@ -157,6 +157,7 @@ const state = {
   alerts: [],
   polling: null,
   autoBusy: false,
+  longFormAutoBusy: false,
   // The LAST diagnostics report, fetched from the server (never recomputed in
   // the browser). Null until the Settings screen asks for it.
   diagnostics: null,
@@ -165,11 +166,14 @@ const state = {
   // job poll re-renders every 1.5s and anything typed into a bare DOM node
   // would be wiped mid-sentence.
   transcriptDraft: null,
+  longFormStudio: null,
+  longFormDraft: null,
   revision: null,
   revisionStage: null,
   revisionNotes: '',
   transcriptFullDraft: null,
   glossaryDraft: null,
+  longFormDraft: null,
   uploadRequest: null,
   uploadProgress: null,
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
@@ -192,6 +196,7 @@ const SCREENS = [
   { key: 'projects',  label: 'Projeler',        needsProject: false },
   { key: 'history',   label: 'Kayitlar',        needsProject: false },
   { key: 'phase0',    label: 'Faz 0 · Strateji', needsProject: true },
+  { key: 'longform',  label: 'Uzun Video',       needsProject: true },
   { key: 'jobs',      label: 'Is akisi',         needsProject: true },
   { key: 'moments',   label: 'Moment Explorer',  needsProject: true },
   { key: 'script',    label: 'Script Studio',    needsProject: true },
@@ -239,7 +244,7 @@ function textareaField(spec) {
   const { id, required = false } = spec;
   const attrs = { id, ...spec.attrs };
   if (required) { attrs['aria-required'] = 'true'; attrs['aria-describedby'] = `${id}-error`; }
-  return field({ ...spec, control: el('textarea', attrs) });
+  return field({ ...spec, control: el('textarea', attrs, spec.value || '') });
 }
 
 function requiredLegend() {
@@ -406,12 +411,30 @@ async function guard(action, successTitle) {
 function screenProjects() {
   const ws = state.workspace;
   const projects = (ws && ws.projects) || [];
+  const storage = (ws && ws.storage_policy) || {};
   return el('div', {},
     el('div', { class: 'page-head' },
       el('div', {},
         el('h1', { text: 'Projeler' }),
-        el('p', { class: 'subtitle', text: 'Her proje kendi izole depolama alanina sahiptir.' })),
+        el('p', { class: 'subtitle',
+          text: 'Aktif projeler hizli calisma diskinde, tamamlananlar G arsivinde tutulur.' })),
     ),
+    el('div', { class: 'card storage-policy-card', 'data-testid': 'storage-policy' },
+      el('div', { class: 'storage-policy-flow' },
+        el('div', { class: 'storage-policy-node' },
+          el('div', { class: 'dim', text: 'AKTIF CALISMA' }),
+          el('strong', { text: storage.working_location_name || 'C surucusu / aktif calisma' }),
+          el('div', { class: 'dim', text: 'Uzerinde calistigin proje burada acilir.' })),
+        el('div', { class: 'storage-policy-arrow', text: 'Arsivle  →' }),
+        el('div', { class: 'storage-policy-node' },
+          el('div', { class: 'dim', text: 'UZUN SURELI SAKLAMA' }),
+          el('strong', { text: storage.archive_location_name || 'G surucusu / Youtube kaynak videolar' }),
+          el('div', { class: 'dim',
+            text: storage.archive_available
+              ? 'Arsiv diski bagli ve kullanima hazir.'
+              : 'Arsiv diski su anda kullanilamiyor.' }))),
+      el('p', { class: 'subtitle storage-policy-note',
+        text: 'Arsivleme kopya birakmaz: proje aktif listeden cikar ve G diskine tasinir.' })),
     el('div', { class: 'card' },
       el('h2', { text: 'Yeni proje' }),
       requiredLegend(),
@@ -759,7 +782,9 @@ function projectLifecyclePanel() {
   if (!record.project_id) return null;
   const active = Number(((state.project || {}).job_summary || {}).active || 0);
   const revisions = (state.project && state.project.revisions) || [];
+  const archive = (state.project && state.project.archive) || {};
   const disabled = active > 0;
+  const archiveDisabled = disabled || !archive.configured || !archive.available;
   const runLifecycle = async (action, extra, successTitle) => {
     const result = await guard(() => api.post(
       `/api/projects/${state.projectId}/lifecycle`, {
@@ -778,8 +803,15 @@ function projectLifecyclePanel() {
     el('p', { class: 'subtitle lifecycle-lead',
               text: 'Geri donulen asama ve sonraki ciktilar kaybolmaz; proje icindeki '
                     + 'revizyon arsivine tasinir. Aktif is varken bu islemler kilitlidir.' }),
+    el('p', { class: 'subtitle lifecycle-lead',
+      text: `${((state.project || {}).storage_policy || {}).working_location_name || 'C aktif calisma'} → `
+        + `${archive.location_name || 'G uzun sureli arsiv'}` }),
     disabled ? alertBox('warn', 'Proje su anda calisiyor',
-      `${active} aktif is tamamlanmadan geri donme, sifirlama veya silme yapilamaz.`) : null,
+      `${active} aktif is tamamlanmadan geri donme, arsivleme, sifirlama veya silme yapilamaz.`) : null,
+    archive.configured && !archive.available
+      ? alertBox('warn', 'Arsiv diski kullanilamiyor',
+        'G arsiv klasorunu kullanabilmek icin diskin bagli ve yazilabilir oldugunu kontrol et.')
+      : null,
     requiredLegend(),
     el('div', { class: 'lifecycle-section' },
       el('h3', { text: 'Bir asamaya geri don' }),
@@ -804,13 +836,33 @@ function projectLifecyclePanel() {
         },
       }, 'Bu asamaya geri don')),
     el('div', { class: 'lifecycle-section lifecycle-section--danger' },
-      el('h3', { text: 'Sifirla veya sil' }),
+      el('h3', { text: 'Arsivle, sifirla veya sil' }),
       inputField({ id: 'lifecycle-confirmation', label: 'Proje adi dogrulamasi',
                    required: true,
                    hint: `Devam etmek icin proje adini birebir yaz: ${record.title}`,
                    attrs: { maxlength: 200, autocomplete: 'off',
                             placeholder: record.title || '' } }),
       el('div', { class: 'row' },
+        el('button', {
+          class: 'btn btn--primary', disabled: archiveDisabled,
+          'data-testid': 'lifecycle-archive',
+          title: archive.location_name || 'Arsiv konumu yapilandirilmamis',
+          onclick: async (event) => {
+            const values = destructiveValues();
+            if (!values) return;
+            event.currentTarget.disabled = true;
+            const archived = await guard(() => api.post(
+              `/api/projects/${state.projectId}/archive`, {
+                confirmation: values['lifecycle-confirmation'], actor: projectActor(),
+              }), 'Proje G arsivine tasindi');
+            if (archived) {
+              state.projectId = null; state.project = null; state.selectedMode = null;
+              await goto('history');
+            } else {
+              event.currentTarget.disabled = archiveDisabled;
+            }
+          },
+        }, 'Projeyi G arsivine tasi'),
         el('button', {
           class: 'btn', disabled, 'data-testid': 'lifecycle-reset-keep-source',
           onclick: async (event) => {
@@ -854,6 +906,8 @@ function projectLifecyclePanel() {
 
 function screenHistory() {
   const projects = (state.workspace && state.workspace.projects) || [];
+  const archive = (state.workspace && state.workspace.archive) || {};
+  const archivedProjects = archive.projects || [];
   const projectCards = projects.map(project => {
     const titleId = `history-title-${project.project_id}`;
     const notesId = `history-notes-${project.project_id}`;
@@ -920,8 +974,482 @@ function screenHistory() {
         el('p', { class: 'subtitle',
           text: 'Projeler, kaynaklar ve sonuclar yeniden baslatmadan sonra da burada kalir.' }))),
     projects.length === 0
-      ? el('div', { class: 'card empty', text: 'Henuz kayitli proje yok.' })
-      : el('div', { class: 'archive-list' }, projectCards));
+      ? el('div', { class: 'card empty', text: 'Henuz aktif proje yok.' })
+      : el('div', { class: 'archive-list' }, projectCards),
+    el('div', { class: 'page-head archive-heading' },
+      el('div', {},
+        el('h2', { text: 'G arsivindeki projeler' }),
+        el('p', { class: 'subtitle',
+          text: archive.configured
+            ? `${archive.location_name || 'Harici arsiv'} · aktif calisma listesinden ayridir.`
+            : 'Arsiv konumu henuz yapilandirilmamis.' }))),
+    archivedProjects.length === 0
+      ? el('div', { class: 'card empty',
+          text: archive.available ? 'Henuz arsivlenmis proje yok.' : 'Arsiv diski kullanilamiyor.' })
+      : el('div', { class: 'archive-list' }, archivedProjects.map(item =>
+          el('article', { class: 'card archive-card' },
+            el('div', { class: 'card__head' },
+              el('div', {},
+                el('h3', { text: item.title || '(okunamadi)' }),
+                el('div', { class: 'dim', text: item.source_name || 'Kaynak adi yok' })),
+              badge('completed', 'arsivlendi')),
+            el('div', { class: 'grid grid--3 archive-meta' },
+              el('div', {}, el('div', { class: 'dim', text: 'Arsivlenme' }),
+                el('div', { text: item.archived_at || '-' })),
+              el('div', {}, el('div', { class: 'dim', text: 'Boyut' }),
+                el('div', { text: formatBytes(item.total_bytes) })),
+              el('div', {}, el('div', { class: 'dim', text: 'Dosya' }),
+                el('div', { text: String(item.file_count || 0) })))))));
+}
+
+const LONG_FORM_DEFAULTS = {
+  topic: '', content_type: 'explainer', target_duration_min: 18,
+  chapter_count: 6, language: 'tr-TR', tone: 'documentary',
+  audience: 'Genel izleyici', angle: '', narration_mode: 'undecided',
+  include_subtitles: true, notes: '',
+};
+
+function longFormDraft() {
+  if (!state.longFormDraft || state.longFormDraft.projectId !== state.projectId) {
+    const saved = (((state.project || {}).long_form || {}).data) || {};
+    state.longFormDraft = { ...LONG_FORM_DEFAULTS, ...saved, projectId: state.projectId };
+  }
+  return state.longFormDraft;
+}
+
+function setLongFormDraft(key, value) {
+  const draft = longFormDraft();
+  draft[key] = value;
+  if (key === 'target_duration_min') {
+    const duration = Math.max(15, Math.min(20, Number(value) || 18));
+    const label = document.getElementById('longform-word-range');
+    if (label) label.textContent = `${duration * 130}-${duration * 150} kelime`;
+  }
+}
+
+function longFormSelect(id, label, value, options, onChange, hint = '') {
+  return field({ id, label, required: true, hint,
+    control: el('select', { id, 'aria-required': 'true',
+      onchange: event => onChange(event.currentTarget.value) },
+    options.map(([optionValue, optionLabel]) => el('option', {
+      value: optionValue, selected: value === optionValue,
+    }, optionLabel))) });
+}
+
+function screenLongForm() {
+  const section = (state.project && state.project.long_form) || {};
+  const draft = longFormDraft();
+  const duration = Math.max(15, Math.min(20, Number(draft.target_duration_min) || 18));
+  const saved = section.data;
+  const update = key => event => setLongFormDraft(key, event.currentTarget.value);
+  const rules = [
+    { id: 'longform-topic', label: 'Video konusu', required: true },
+    { id: 'longform-content-type', label: 'Video turu', required: true },
+    { id: 'longform-duration', label: 'Hedef sure', required: true,
+      number: true, min: 15, max: 20 },
+    { id: 'longform-chapters', label: 'Bolum sayisi', required: true,
+      number: true, min: 5, max: 7 },
+    { id: 'longform-language', label: 'Video dili', required: true },
+    { id: 'longform-tone', label: 'Anlatim tonu', required: true },
+    { id: 'longform-audience', label: 'Hedef kitle' },
+    { id: 'longform-angle', label: 'Anlatim acisi' },
+    { id: 'longform-narration', label: 'Seslendirme tercihi', required: true },
+    { id: 'longform-notes', label: 'Plan notlari' },
+  ];
+  return el('div', { 'data-testid': 'longform-screen' },
+    el('div', { class: 'page-head' },
+      el('div', {},
+        el('h1', { text: 'Uzun Video Planlama' }),
+        el('p', { class: 'subtitle',
+          text: '15-20 dakikalik teori, genel anlatim ve karsilastirma videolari icin brief.' })),
+      saved ? badge('review_required', 'plan kayitli') : badge('planned', 'yeni plan')),
+    alertBox('info', 'Yalnizca planlama',
+      'Bu sekme model cagrisi, script uretimi, seslendirme veya render baslatmaz. '
+      + 'Kaydedilen brief daha sonra outline ve bolum uretiminin girdisi olacak.'),
+    section.problem ? alertBox('danger', 'Plan okunamadi', section.problem) : null,
+    el('div', { class: 'card' },
+      el('h2', { text: 'Icerik briefi' }),
+      requiredLegend(),
+      inputField({ id: 'longform-topic', label: 'Video konusu', required: true,
+        hint: 'Ornek: House of the Dragon evreninde ejderha biniciligi nasil calisir?',
+        attrs: { value: draft.topic, maxlength: 300, 'data-testid': 'longform-topic',
+          oninput: update('topic') } }),
+      el('div', { class: 'grid grid--2' },
+        longFormSelect('longform-content-type', 'Video turu', draft.content_type, [
+          ['explainer', 'Genel anlatim'], ['theory', 'Teori / yorum'],
+          ['comparison', 'Karsilastirma / analiz'],
+        ], value => setLongFormDraft('content_type', value)),
+        longFormSelect('longform-language', 'Video dili', draft.language, [
+          ['tr-TR', 'Turkce'], ['en-US', 'English'],
+        ], value => setLongFormDraft('language', value))),
+      textareaField({ id: 'longform-angle', label: 'Anlatim acisi',
+        hint: 'Videonun ana iddiasi, sorusu veya izleyiciye verecegi bakis acisi.',
+        value: draft.angle,
+        attrs: { maxlength: 1000, 'data-testid': 'longform-angle',
+          oninput: update('angle') } }),
+      el('div', { class: 'grid grid--3' },
+        inputField({ id: 'longform-duration', label: 'Hedef sure (dakika)', required: true,
+          type: 'number', attrs: { value: duration, min: 15, max: 20,
+            'data-testid': 'longform-duration', oninput: update('target_duration_min') } }),
+        inputField({ id: 'longform-chapters', label: 'Bolum sayisi', required: true,
+          type: 'number', attrs: { value: draft.chapter_count, min: 5, max: 7,
+            'data-testid': 'longform-chapters', oninput: update('chapter_count') } }),
+        longFormSelect('longform-tone', 'Anlatim tonu', draft.tone, [
+          ['documentary', 'Belgesel'], ['cinematic', 'Sinematik'],
+          ['conversational', 'Sohbet'], ['analytical', 'Analitik'],
+        ], value => setLongFormDraft('tone', value))),
+      inputField({ id: 'longform-audience', label: 'Hedef kitle',
+        attrs: { value: draft.audience, maxlength: 300,
+          'data-testid': 'longform-audience', oninput: update('audience') } }),
+      longFormSelect('longform-narration', 'Seslendirme tercihi', draft.narration_mode, [
+        ['undecided', 'Daha sonra karar ver'], ['tts', 'TTS anlatim'],
+        ['own_voice', 'Kendi sesim'],
+      ], value => setLongFormDraft('narration_mode', value)),
+      el('label', { class: 'check-row' },
+        el('input', { id: 'longform-subtitles', type: 'checkbox',
+          checked: draft.include_subtitles !== false,
+          onchange: event => setLongFormDraft('include_subtitles', event.currentTarget.checked) }),
+        el('span', { text: 'Tam video altyazisi planla' })),
+      textareaField({ id: 'longform-notes', label: 'Plan notlari',
+        value: draft.notes,
+        attrs: { maxlength: 3000, 'data-testid': 'longform-notes',
+          oninput: update('notes') } }),
+      el('div', { class: 'longform-estimate' },
+        el('div', {}, el('span', { class: 'dim', text: 'Tahmini script: ' }),
+          el('strong', { id: 'longform-word-range', text: `${duration * 130}-${duration * 150} kelime` })),
+        el('div', { class: 'dim',
+          text: 'Hook + giris + 5-7 ana bolum + sonuc/CTA yapisi hedeflenir.' })),
+      el('button', { class: 'btn btn--primary', 'data-testid': 'longform-save',
+        onclick: async event => {
+          const values = validateFields(rules);
+          if (!values) return;
+          const button = event.currentTarget;
+          button.disabled = true;
+          const result = await guard(() => api.request(
+            'PATCH', `/api/projects/${state.projectId}/long-form-plan`, { body: {
+              topic: values['longform-topic'],
+              content_type: values['longform-content-type'],
+              target_duration_min: values['longform-duration'],
+              chapter_count: values['longform-chapters'],
+              language: values['longform-language'], tone: values['longform-tone'],
+              audience: values['longform-audience'] || 'Genel izleyici',
+              angle: values['longform-angle'] || '',
+              narration_mode: values['longform-narration'],
+              include_subtitles: document.getElementById('longform-subtitles').checked,
+              notes: values['longform-notes'] || '', updated_by: projectActor(),
+            } }), 'Uzun video plani kaydedildi');
+          if (result) {
+            state.longFormDraft = { ...result.long_form, projectId: state.projectId };
+            await refresh();
+          } else {
+            button.disabled = false;
+          }
+        } }, saved ? 'Plani guncelle' : 'Plani kaydet')),
+    saved ? el('div', { class: 'card' },
+      el('h2', { text: 'Kayit durumu' }),
+      el('div', { class: 'grid grid--3' },
+        el('div', { class: 'tech-cell' }, el('div', { class: 'tech-cell__label', text: 'Durum' }),
+          el('div', { class: 'tech-cell__value', text: 'Taslak' })),
+        el('div', { class: 'tech-cell' }, el('div', { class: 'tech-cell__label', text: 'Son guncelleme' }),
+          el('div', { class: 'tech-cell__value', text: saved.updated_at || '-' })),
+        el('div', { class: 'tech-cell' }, el('div', { class: 'tech-cell__label', text: 'Uretim' }),
+          el('div', { class: 'tech-cell__value', text: 'Baslatilmadi' })))) : null,
+    longFormStudioPanel());
+}
+
+/* Uzun Video Studio: uretim paneli.
+ *
+ * The planning brief above stays exactly as it was. Everything here is the
+ * PRODUCTION half: what a run would cost, which stage is next, and the two
+ * things a long run actually needs from a UI -- visible progress and an
+ * actionable reason when it stops.
+ *
+ * Rules this panel follows:
+ *   1. Opening the tab spends nothing. Estimates and stage state are reads.
+ *   2. Every long action shows the stage, the unit in flight and the elapsed
+ *      time, so the screen is never a frozen button.
+ *   3. A failure shows a sanitized reason plus the one control that fixes it
+ *      (retry this chunk, regenerate this chunk, approve this gate). */
+function longFormStudioPanel() {
+  const studio = state.longFormStudio;
+  if (!studio || !studio.available) return null;
+  const progress = studio.progress || {};
+  const estimates = studio.estimates || {};
+  const readiness = studio.readiness || {};
+  return el('div', {},
+    longFormEstimatePanel(estimates, readiness),
+    longFormControlPanel(progress),
+    longFormStagePanel(progress),
+    longFormScriptPanel(studio),
+    longFormChunkPanel(studio.tts || {}),
+    longFormEventPanel(studio.events || [], studio.quota || {}));
+}
+
+function longFormEstimatePanel(estimates, readiness) {
+  const calls = estimates.api_calls || {};
+  const capacity = readiness.tts_capacity || {};
+  return el('div', { class: 'card', 'data-testid': 'lf-estimates' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Uretim tahmini' }),
+      badge(readiness.ready ? 'completed' : 'missing',
+            readiness.ready ? 'saglayici hazir' : 'saglayici eksik')),
+    el('div', { class: 'grid grid--2' },
+      techCell('Kelime hedefi', `${(estimates.word_range || {}).minimum}-${(estimates.word_range || {}).maximum}`),
+      techCell('TTS parcasi (tahmini)', String(estimates.tts_chunk_estimate || '-')),
+      techCell('API istegi (tahmini)', String(calls.total || '-')),
+      techCell('En-boy orani', estimates.aspect_ratio || '16:9')),
+    calls.total ? el('div', { class: 'dim', 'data-testid': 'lf-call-breakdown',
+      text: `Arastirma ${calls.research} + outline ${calls.outline} + bolum `
+            + `${calls.chapters} + tutarlilik ${calls.consistency} + TTS `
+            + `${calls.tts_chunks}. ${calls.note || ''}` }) : null,
+    (readiness.blockers || []).map(text => alertBox('danger', 'Baslatilamaz', text)),
+    (readiness.warnings || []).map(text => alertBox('warn', 'Kota uyarisi', text)),
+    capacity.needed ? el('div', { class: 'dim', 'data-testid': 'lf-capacity',
+      text: `Gunluk TTS kapasitesi ${capacity.daily_request_capacity} istek, `
+            + `dakikalik ${capacity.per_minute_request_capacity} istek `
+            + `(sinirlayan: ${capacity.binding_limit}).` }) : null);
+}
+
+function longFormControlPanel(progress) {
+  const busy = progress.status === 'running';
+  const next = progress.next || {};
+  const send = async (body, successTitle) => {
+    const result = await guard(() => api.post(
+      `/api/projects/${state.projectId}/long-form/control`, body), successTitle);
+    if (result) state.longFormStudio = result.long_form_studio;
+    await refresh();
+  };
+  return el('div', { class: 'card', 'data-testid': 'lf-controls' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Uretim kontrolu' }),
+      badge(progress.cancelled ? 'failed' : (progress.paused ? 'queued' : progress.status),
+            progress.cancelled ? 'iptal' : (progress.paused ? 'duraklatildi' : progress.status))),
+    el('div', { class: 'dim', 'data-testid': 'lf-next',
+      text: next.reason || '' }),
+    next.billing_blocked
+      ? alertBox('danger', 'Billing/kota ayari gerekiyor',
+          'Google AI Studio planini, faturalandirmayi ve proje kotasini kontrol et. '
+          + 'Bu engel zamanlayiciyla tekrar denenmez.')
+      : null,
+    el('div', { class: 'row' },
+      el('button', { class: 'btn btn--primary', 'data-testid': 'lf-start',
+        onclick: (e) => withButton(e, () => send({ action: 'start' }, 'Uretim baslatildi')) },
+        'Uretimi baslat'),
+      el('button', { class: 'btn btn--sm', 'data-testid': 'lf-run-stage',
+        disabled: Boolean(next.blocked),
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/stage`, {}),
+            'Asama calisti');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, 'Sonraki asamayi calistir'),
+      next.billing_blocked
+        ? el('button', { class: 'btn btn--primary', 'data-testid': 'lf-retry-billing',
+            onclick: (e) => withButton(e, () => send(
+              { action: 'retry_billing' },
+              'Billing engeli kaldirildi; asama yeniden denenebilir')) },
+            'Billing duzeltildi - yeniden denemeyi ac')
+        : null,
+      progress.paused
+        ? el('button', { class: 'btn btn--sm', 'data-testid': 'lf-resume',
+            onclick: (e) => withButton(e, () => send({ action: 'resume' }, 'Devam')) },
+            'Devam et')
+        : el('button', { class: 'btn btn--sm', 'data-testid': 'lf-pause',
+            onclick: (e) => withButton(e, () => send({ action: 'pause' }, 'Duraklatildi')) },
+            'Duraklat'),
+      el('button', { class: 'btn btn--sm btn--danger', 'data-testid': 'lf-cancel',
+        onclick: (e) => withButton(e, () => send({ action: 'cancel' }, 'Iptal edildi')) },
+        'Iptal et')));
+}
+
+function longFormStagePanel(progress) {
+  const stages = progress.stages || [];
+  return el('div', { class: 'card', 'data-testid': 'lf-stages' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Asamalar' }),
+      badge('planned', `${progress.completed_count || 0}/${progress.total_count || 12}`)),
+    el('div', { class: 'stack' }, stages.map(stage => el('div', {
+      class: 'spread', 'data-testid': `lf-stage-${stage.key}` },
+      el('span', {}, badge(_lfStageBadge(stage.state), stage.state), ' ', stage.label),
+      el('span', { class: 'dim',
+        text: (stage.attempts ? `deneme ${stage.attempts}` : '')
+              + (stage.detail ? ` - ${stage.detail}` : '') }),
+      stage.error
+        ? el('span', { class: 'transcript-nomatch', 'data-testid': `lf-error-${stage.key}`,
+                       text: stage.error })
+        : null,
+      (!stage.automatic && stage.state !== 'completed')
+        ? el('button', { class: 'btn btn--sm', 'data-testid': `lf-approve-${stage.key}`,
+            onclick: (e) => withButton(e, async () => {
+              const result = await guard(() => api.post(
+                `/api/projects/${state.projectId}/long-form/control`,
+                { action: 'approve_stage', stage: stage.key }), 'Asama onaylandi');
+              if (result) state.longFormStudio = result.long_form_studio;
+              await refresh();
+            }) }, 'Onayla')
+        : null))));
+}
+
+function _lfStageBadge(stateName) {
+  return { completed: 'completed', failed: 'failed', running: 'running',
+           review_required: 'review_required', queued: 'queued',
+           waiting_rate_limit: 'queued', waiting_daily_quota: 'queued',
+           blocked_billing: 'failed',
+           cancelled: 'failed' }[stateName] || 'missing';
+}
+
+async function longFormResumeTick() {
+  if (state.longFormAutoBusy || state.screen !== 'longform' || !state.projectId) return;
+  state.longFormAutoBusy = true;
+  try {
+    const result = await api.post(
+      `/api/projects/${state.projectId}/long-form/stage`, {});
+    if (result) state.longFormStudio = result.long_form_studio;
+  } catch (error) {
+    pushAlert('danger', 'Uzun video devam edemedi', error.message, error.hint);
+  } finally {
+    state.longFormAutoBusy = false;
+  }
+  await refresh();
+}
+
+function longFormScriptPanel(studio) {
+  const chapters = studio.chapters || [];
+  const summary = studio.chapters_summary || {};
+  const research = studio.research;
+  const consistency = studio.consistency;
+  if (!chapters.length && !research) return null;
+  if (!state.longFormDraft) state.longFormDraft = {};
+  const draft = state.longFormDraft;
+  return el('div', { class: 'card', 'data-testid': 'lf-script' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Script' }),
+      badge(chapters.length ? 'review_required' : 'missing',
+            `${summary.total_word_count || 0} kelime`)),
+    research ? el('div', { class: 'dim', 'data-testid': 'lf-research',
+      text: `Arastirma: ${(research.facts || []).length} kaynakli olgu, `
+            + `${(research.interpretations || []).length} yorum. Tez: `
+            + `${research.thesis || '-'}` }) : null,
+    consistency ? el('div', { class: 'dim', 'data-testid': 'lf-consistency',
+      text: `Tutarlilik: ${consistency.issue_count} bulgu `
+            + `(${consistency.high_severity_count} yuksek). ${consistency.overall || ''}` })
+      : null,
+    el('div', { class: 'stack' }, chapters.map(chapter => el('div', {
+      class: 'moment-card', 'data-testid': `lf-chapter-${chapter.index}` },
+      el('div', { class: 'spread' },
+        el('strong', { text: `${chapter.index}. ${chapter.title || ''}` }),
+        el('span', { class: 'dim',
+          text: `${chapter.word_count}/${chapter.target_words} kelime - `
+                + `~${Math.round((chapter.duration_estimate || {}).expected_sec || 0)} sn`
+                + (chapter.within_target ? '' : ' - hedef disi')
+                + (chapter.edited_by_human ? ' - elle duzenlendi' : '') })),
+      el('textarea', {
+        class: 'transcript-full-input', rows: 4, spellcheck: 'false',
+        'data-testid': `lf-chapter-input-${chapter.index}`,
+        oninput: (e) => { draft[chapter.index] = e.currentTarget.value; },
+      }, draft[chapter.index] !== undefined ? draft[chapter.index] : (chapter.text || '')),
+      el('button', { class: 'btn btn--sm', 'data-testid': `lf-chapter-save-${chapter.index}`,
+        onclick: (e) => withButton(e, async () => {
+          const node = document.querySelector(`[data-testid=lf-chapter-input-${chapter.index}]`);
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/chapter`,
+            { index: chapter.index, text: node ? node.value : '' }),
+            'Bolum kaydedildi');
+          if (result) { state.longFormStudio = result.long_form_studio; delete draft[chapter.index]; }
+          await refresh();
+        }) }, 'Bolumu kaydet')))),
+    studio.full_script
+      ? el('details', {}, el('summary', { text: 'Tum script' }),
+          el('pre', { class: 'pre', 'data-testid': 'lf-full-script',
+                      text: studio.full_script }))
+      : null);
+}
+
+function longFormChunkPanel(tts) {
+  const chunks = tts.chunks || [];
+  const readiness = tts.readiness || {};
+  const combined = tts.combined;
+  if (!chunks.length) return null;
+  return el('div', { class: 'card', 'data-testid': 'lf-chunks' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'TTS parcalari' }),
+      badge(readiness.ready ? 'completed' : 'review_required',
+            `${readiness.completed_count || 0}/${readiness.chunk_count || 0}`)),
+    el('p', { class: 'dim', text: tts.approval_policy || '' }),
+    el('div', { class: 'stack' }, chunks.map(chunk => el('div', {
+      class: 'spread', 'data-testid': `lf-chunk-${chunk.id}` },
+      el('span', {}, badge(_lfStageBadge(chunk.status === 'pending' ? 'queued' : chunk.status),
+                           chunk.status), ` ${chunk.sequence}. ${chunk.chapter_id}`),
+      el('span', { class: 'dim',
+        text: `${chunk.word_count} kelime`
+              + (chunk.duration_sec ? ` - ${chunk.duration_sec}s` : '')
+              + (chunk.attempts ? ` - deneme ${chunk.attempts}` : '') }),
+      chunk.error
+        ? el('span', { class: 'transcript-nomatch', 'data-testid': `lf-chunk-error-${chunk.id}`,
+                       text: `${chunk.error_kind || ''}: ${chunk.error}` })
+        : null,
+      chunk.wait_reason
+        ? el('span', { class: 'dim', 'data-testid': `lf-chunk-wait-${chunk.id}`,
+            text: `${chunk.wait_reason} - devam: `
+                  + `${chunk.resume_at ? new Date(chunk.resume_at).toLocaleString() : '-'}` })
+        : null,
+      chunk.status === 'completed'
+        ? el('audio', { controls: true, preload: 'none',
+            'data-testid': `lf-chunk-audio-${chunk.id}`,
+            src: `/api/projects/${state.projectId}/media/results/long_form/tts/`
+                 + encodeURIComponent(chunk.media_name || '') })
+        : null,
+      el('button', { class: 'btn btn--sm', 'data-testid': `lf-chunk-retry-${chunk.id}`,
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/tts`,
+            { action: 'retry', chunk_id: chunk.id }), 'Parca yeniden denendi');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, chunk.status === 'completed' ? 'Yeniden uret' : 'Tekrar dene')))),
+    el('div', { class: 'row' },
+      el('button', { class: 'btn btn--primary', 'data-testid': 'lf-tts-run',
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/tts`, { action: 'run' }),
+            'Eksik parcalar uretildi');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, 'Eksik parcalari uret'),
+      el('button', { class: 'btn btn--sm', 'data-testid': 'lf-tts-concat',
+        disabled: !readiness.ready,
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/tts`, { action: 'concat' }),
+            'Ses birlestirildi');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, 'Parcalari birlestir')),
+    combined ? el('div', { class: 'stack', 'data-testid': 'lf-combined' },
+      el('div', { class: 'dim',
+        text: `Birlesik anlatim: ${combined.duration_sec}s `
+              + `(${(combined.duration_check || {}).measured_min} dk), `
+              + `${combined.chunk_count} parca` }),
+      (combined.duration_check && !combined.duration_check.within_target)
+        ? alertBox('warn', 'Sure hedef disinda', combined.duration_check.reason)
+        : null) : null);
+}
+
+function longFormEventPanel(events, quota) {
+  if (!events.length) return null;
+  return el('div', { class: 'card', 'data-testid': 'lf-events' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Olaylar' }),
+      badge('planned', `${quota.request_total || 0} istek (tahmini)`)),
+    el('div', { class: 'stack' }, events.slice(-12).reverse().map(event => el('div', {
+      class: 'spread', 'data-testid': `lf-event-${event.event}` },
+      el('span', { class: 'mono', text: event.event }),
+      el('span', { class: 'dim', text: String(event.at || '').slice(11, 19) }),
+      el('span', { class: 'dim',
+        text: [event.chunk_id, event.chapter_index != null ? `bolum ${event.chapter_index}` : '',
+               event.latency_sec != null ? `${event.latency_sec}s` : '',
+               event.error_kind || ''].filter(Boolean).join(' - ') })))));
 }
 
 function parseMomentRanks(value) {
@@ -1124,6 +1652,8 @@ function screenPhase0() {
     ? `${supportedExtensions.join(',')},video/*`
     : 'video/*';
   const uploading = state.uploadProgress;
+  const sourceLibrary = view.source_library || {};
+  const libraryVideos = sourceLibrary.videos || [];
 
   const uploadCard = el('div', { class: 'card' },
     el('h2', { text: '1 · Kaynak video' }),
@@ -1134,6 +1664,32 @@ function screenPhase0() {
           el('div', { class: 'dim', text: `${(source.size_bytes / 1048576).toFixed(1)} MB · parmak izi ${String(source.fingerprint_sha256).slice(0, 16)}…` }))
       : el('div', { class: 'stack' },
           el('p', { class: 'muted', text: 'Bu projede henuz kaynak video yok.' }),
+          sourceLibrary.configured
+            ? (sourceLibrary.available && libraryVideos.length
+              ? el('div', { class: 'stack', 'data-testid': 'source-library-panel' },
+                  el('strong', { text: 'Drive / kaynak kutuphanesinden al' }),
+                  el('select', { id: 'source-library-file',
+                    'data-testid': 'source-library-file' },
+                    libraryVideos.map(video => el('option', { value: video.name },
+                      `${video.name} (${formatBytes(video.size_bytes)})`))),
+                  el('button', { class: 'btn btn--primary',
+                    'data-testid': 'source-library-import',
+                    onclick: (event) => withButton(event, async () => {
+                      const input = document.getElementById('source-library-file');
+                      const result = await guard(() => api.post(
+                        `/api/projects/${state.projectId}/source-library`,
+                        { filename: input ? input.value : '', actor: projectActor() }),
+                        'Kaynak video kutuphaneden projeye alindi');
+                      if (result) await refresh();
+                    }) }, 'Secili videoyu projeye al'),
+                  el('div', { class: 'dim',
+                    text: 'Aktarim sunucu tarafinda yapilir; video tarayici veya Colab proxy uzerinden gecmez.' }))
+              : alertBox('warn', 'Kaynak kutuphanesi bos veya erisilemiyor',
+                  'Videoyu Drive/YouTubeAutomation/source_videos klasorune ekleyip Yenileye basin.'))
+            : null,
+          sourceLibrary.configured && libraryVideos.length
+            ? el('div', { class: 'dim', text: 'Veya bu cihazdan yeni bir video yukle:' })
+            : null,
           uploading ? null : el('input', {
             type: 'file', id: 'source-file', accept: sourceAccept,
             'data-testid': 'source-file',
@@ -2004,6 +2560,11 @@ function transcriptSummaryCard(t) {
           text: `${t.low_confidence_count} kelime dusuk guvenli (asagida isaretli). `
                 + 'Ozel isimler genelde burada yanlis cikar.' })
       : null,
+    t.excluded_cue_count
+      ? el('div', { class: 'dim', 'data-testid': 'excluded-caption-note',
+          text: `${t.excluded_cue_count} satir transkriptte korunuyor ancak videoda `
+                + 'altyazi olarak gosterilmeyecek.' })
+      : null,
     ctx.term_count
       ? el('div', { class: 'dim', 'data-testid': 'glossary-context-note',
           text: `Bu transkript ${ctx.term_count} sozluk terimi baglam olarak `
@@ -2043,6 +2604,10 @@ function transcriptSegmentsPanel(t) {
                   + (seg.low_confidence_count ? ` - ${seg.low_confidence_count} dusuk` : '')
                   + (seg.retimed ? ' - yeniden zamanlandi' : '')
                   + (seg.edited ? ' - elle duzenlendi' : '') })),
+        seg.excluded_from_subtitles
+          ? alertBox('info', 'Videoda gosterilmeyecek',
+                     'Metin ve zamanlama kayitli; bu satir altyazi renderindan dislandi.')
+          : null,
         // The unsure words are shown as marked text ABOVE the editor rather than
         // inside it: highlighting inside a textarea would mean a rich editor,
         // and a rich editor is how invisible markup ends up in a caption.
@@ -2068,7 +2633,26 @@ function transcriptSegmentsPanel(t) {
         }, value),
         el('div', { class: 'field__error', id: `seg-msg-${seg.id}`,
                     'data-testid': `seg-msg-${seg.id}`, role: 'alert',
-                    text: validateSegmentValue(value, limits) }));
+                    text: validateSegmentValue(value, limits) }),
+        el('button', {
+          class: 'btn btn--sm', 'data-testid': `seg-exclude-${seg.id}`,
+          onclick: (event) => withButton(event, async () => {
+            const result = await guard(() => api.post(
+              `/api/projects/${state.projectId}/transcript/exclusions`, {
+                segment_ids: [seg.id], excluded: !seg.excluded_from_subtitles,
+                slot: t.slot,
+              }), seg.excluded_from_subtitles
+                ? 'Satir yeniden altyaziya alindi'
+                : 'Satir altyazidan cikarildi');
+            if (result) {
+              state.transcriptDraft = {};
+              state.project.transcript = result.transcript;
+            }
+            await refresh();
+          }),
+        }, seg.excluded_from_subtitles
+          ? 'Altyazida yeniden goster'
+          : 'Sarki / muzik: altyazida gosterme'));
     })),
     el('div', { class: 'row' },
       el('button', {
@@ -2765,6 +3349,11 @@ function renderTechnicalSummary(tech) {
                  tech.subtitle_warning
                  || 'Secilen momentte konusma tespit edilmedi.')
       : null,
+    tech.excluded_subtitle_cues
+      ? alertBox('info', 'Sarki / muzik altyazisi gizlendi',
+                 `${tech.excluded_subtitle_cues} satir insan karariyla renderdan cikarildi.`,
+                 'Metin transkript gecmisinde korunuyor ve Altyazi sekmesinden geri acilabilir.')
+      : null,
     el('div', { class: 'tech-grid', 'data-testid': 'render-technical' },
       techCell('Sure', tech.duration_sec ? `${Number(tech.duration_sec).toFixed(2)} sn` : null),
       techCell('Cozunurluk', tech.resolution + (tech.vertical ? ' (9:16)' : ' (DIKEY DEGIL)')),
@@ -2778,6 +3367,9 @@ function renderTechnicalSummary(tech) {
       techCell('Aktif kelime', tech.dynamic_word_highlight ? 'dinamik vurgu acik' : 'duz altyazi'),
       techCell('Caption tema/font', `${tech.caption_theme || '-'} / ${tech.caption_font || '-'}`),
       techCell('Render modu', tech.render_mode),
+      techCell('Kadraj zoom', tech.frame_zoom ? `${Number(tech.frame_zoom).toFixed(2)}x` : '1.00x'),
+      techCell('Kadraj odagi', tech.frame_focus_x != null && tech.frame_focus_y != null
+        ? `${Number(tech.frame_focus_x).toFixed(2)}, ${Number(tech.frame_focus_y).toFixed(2)}` : '-'),
       techCell('Kalite', tech.preview_mode ? 'preview' : 'uretim'),
       techCell('artifact_status', tech.status)),
     el('div', { class: 'dim', style: 'margin-top:12px',
@@ -2852,6 +3444,18 @@ function revisionStudioPanel() {
             + 'yukaridaki secim belirler.',
       attrs: { rows: 2, 'data-testid': 'revision-why',
                oninput: (event) => { state.revisionNotes = event.currentTarget.value; } } }),
+    plan.suggested_render_adjustment
+      ? alertBox('info', 'Kadraj komutu algilandi',
+          `${Number(plan.suggested_render_adjustment.frame_zoom).toFixed(2)}x zoom; `
+          + `odak ${Number(plan.suggested_render_adjustment.frame_focus_x).toFixed(2)}, `
+          + `${Number(plan.suggested_render_adjustment.frame_focus_y).toFixed(2)}.`,
+          'Revizyonu baslatinca bu ayar yeni rendera uygulanacak ve manifestte kaydedilecek.')
+      : (chosen === 'render'
+          ? alertBox('warn', 'Notta uygulanabilir kadraj komutu yok',
+              'Otomatik yorumlanan komutlar: biraz yakinlas, yakinlastir, uzaklastir, '
+              + 'sola/saga/yukari/asagi odakla.',
+              'Belirsiz bir not videoyu sessizce degistirmez.')
+          : null),
     // The list is the consent: it says exactly what leaves.
     planMatches && (plan.moves || []).length
       ? el('div', { class: 'stack', 'data-testid': 'revision-moves' },
@@ -3178,6 +3782,7 @@ function screenSettings() {
 
 const RENDERERS = {
   projects: screenProjects, history: screenHistory, phase0: screenPhase0,
+  longform: screenLongForm,
   jobs: screenJobs, moments: screenMoments,
   script: screenScript, voice: screenVoice, render: screenRender, outputs: screenOutputs,
   settings: screenSettings,
@@ -3266,6 +3871,12 @@ async function refresh() {
   if (state.screen === 'render' && state.projectId && !state.revision) {
     await refreshRevision();
   }
+  // Describing the workflow is a read; it never spends a request.
+  if (state.screen === 'longform' && state.projectId) {
+    const lf = await api.get(
+      `/api/projects/${state.projectId}/long-form`).catch(() => null);
+    state.longFormStudio = lf ? lf.long_form_studio : null;
+  }
   if (state.projectId) {
     try {
       state.project = await api.get(`/api/projects/${state.projectId}`);
@@ -3285,6 +3896,15 @@ async function refresh() {
     // The SERVER says the flow is running, so keep ticking it. Browser memory
     // is not the source of truth any more: a refresh resumes this loop.
     state.polling = setTimeout(() => automationAction('tick'), 1500);
+  } else {
+    const lfNext = (((state.longFormStudio || {}).progress || {}).next || {});
+    if (state.screen === 'longform' && lfNext.waiting && lfNext.resume_at) {
+      // The server owns the persisted wait. The browser only wakes it at the
+      // advertised time; reopening the tab reconstructs this timer from disk.
+      const dueMs = Date.parse(lfNext.resume_at) - Date.now();
+      const delayMs = Math.max(500, Math.min(2147000000, dueMs + 250));
+      state.polling = setTimeout(longFormResumeTick, delayMs);
+    }
   }
   render();
 }
@@ -3302,7 +3922,10 @@ async function goto(screen) {
 }
 
 async function openProject(projectId, screen = 'phase0') {
-  if (state.projectId !== projectId) state.selectedMode = null;
+  if (state.projectId !== projectId) {
+    state.selectedMode = null;
+    state.longFormDraft = null;
+  }
   state.projectId = projectId;
   await goto(screen);
 }

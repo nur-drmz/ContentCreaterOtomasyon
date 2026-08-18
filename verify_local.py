@@ -3612,8 +3612,8 @@ _GROUNDED = type("R", (), {
 _gc, _gcalls = _ga_client(lambda m, i: _GROUNDED)
 _gres = _ga.run_google_grounded_research("Konu gundemde mi?", client=_gc, manifest=_GA_MANIFEST,
                                           ledger=_ga.QuotaLedger(), persist_ledger=False)
-if _gres["status"] != "ok" or _gcalls != ["gemini-2.5-flash"]:
-    raise AssertionError(f"[ga] grounded rota Gemini 2.5 olmali: {_gcalls}")
+if _gres["status"] != "ok" or _gcalls != ["gemini-3.6-flash"]:
+    raise AssertionError(f"[ga] grounded rota Gemini 3.6 ile baslamali: {_gcalls}")
 if [s["uri"] for s in _gres["grounding_sources"]] != ["https://haber.example/a",
                                                        "https://haber.example/b"]:
     raise AssertionError(f"[ga] kaynak baglantilari korunmadi: {_gres['grounding_sources']}")
@@ -3630,13 +3630,15 @@ if "haber.example/a" not in json.dumps(_gart):
     raise AssertionError("[ga] artefakt kaynak baglantilarini icermiyor")
 if "yerine GECMEZ" not in _gart["research_caveat"]:
     raise AssertionError("[ga] grounded arastirmanin sinirlari artefaktta belirtilmemis")
-# 2.5-flash-lite is NOT a documented grounding model -> must not be in the route.
+# Retired 2.5-flash and unverified 2.5-flash-lite must not be in the live route.
+if "gemini-2.5-flash" in _ga.TASK_ROUTES["grounded_research"]:
+    raise AssertionError("[ga] emekli gemini-2.5-flash grounded rotasinda kalmis")
 if "gemini-2.5-flash-lite" in _ga.TASK_ROUTES["grounded_research"]:
     raise AssertionError("[ga] dogrulanmamis grounding modeli rotaya alinmis")
 if _ga.ACTION_GROUNDED in _ga.MODEL_REGISTRY["gemini-2.5-flash-lite"]["actions"]:
     raise AssertionError("[ga] gemini-2.5-flash-lite yanlislikla grounding-yetenekli isaretlenmis")
 print(f"  [ga:grounded-keeps-sources] {len(_gres['grounding_sources'])} kaynak + 1 sorgu "
-      f"artefaktta; 2.5-flash-lite rotada degil (resmi listede yok)")
+      f"artefaktta; emekli/dogrulanmamis 2.5 modelleri rotada degil")
 
 # --- 30. Antigravity: off by default, hard token budget --------------------
 _off = _ga.run_antigravity_research_experimental("arastir")

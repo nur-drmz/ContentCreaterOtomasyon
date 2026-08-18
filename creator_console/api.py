@@ -159,6 +159,32 @@ class ConsoleApi:
                 actor=_header(headers, "x-actor") or payload.get("actor") or "console",
             )
 
+        if rest == ["archive"] and method == "POST":
+            payload = _json_body(body)
+            return 200, self.app.archive_project(
+                ownership,
+                confirmation=_required(payload, "confirmation"),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )
+
+        if rest == ["long-form-plan"] and method == "PATCH":
+            payload = _json_body(body)
+            return 200, {"long_form": service.save_long_form_plan(
+                topic=_required(payload, "topic"),
+                content_type=_required(payload, "content_type"),
+                target_duration_min=_required(payload, "target_duration_min"),
+                chapter_count=_required(payload, "chapter_count"),
+                language=_required(payload, "language"),
+                tone=_required(payload, "tone"),
+                audience=payload.get("audience") or "Genel izleyici",
+                angle=payload.get("angle") or "",
+                narration_mode=payload.get("narration_mode") or "undecided",
+                include_subtitles=_truthy(payload.get("include_subtitles", True)),
+                notes=payload.get("notes") or "",
+                updated_by=_header(headers, "x-actor") or payload.get("updated_by")
+                or service.project_actor(),
+            )}
+
         if rest == ["lifecycle"] and method == "POST":
             payload = _json_body(body)
             action = payload.get("action")
@@ -218,6 +244,14 @@ class ConsoleApi:
             )
             return 200, {"script": artifact,
                          "approval": service.approval_state("script")}
+
+        if rest == ["source-library"] and method == "POST":
+            payload = _json_body(body)
+            record = self.app.import_source_from_library(
+                ownership, filename=_required(payload, "filename"),
+                actor=_header(headers, "x-actor") or payload.get("actor")
+                or service.project_actor())
+            return 201, {"project": record}
 
         if rest == ["source"] and method == "POST":
             filename = _header(headers, "x-filename") or _first(query.get("filename")) or "source.mp4"
@@ -336,6 +370,14 @@ class ConsoleApi:
                 edited_by=payload.get("edited_by") or service.project_actor(),
                 slot=_slot(payload))}
 
+        if rest == ["transcript", "exclusions"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.set_transcript_exclusions(
+                segment_ids=payload.get("segment_ids") or [],
+                excluded=_truthy(payload.get("excluded", True)),
+                actor=payload.get("actor") or service.project_actor(),
+                slot=_slot(payload))}
+
         if rest == ["transcript", "restore-asr"] and method == "POST":
             payload = _json_body(body)
             return 200, {"transcript": service.restore_transcript_from_asr(
@@ -353,6 +395,66 @@ class ConsoleApi:
                     str(payload["accept_term"]), actor=actor)}
             return 200, {"glossary": service.set_glossary_terms(
                 payload.get("terms") or [], actor=actor)}
+
+        # ---------------------------------------------- Long-form Video Studio
+        # GET only DESCRIBES the workflow; it never starts a stage. Opening the
+        # screen must not spend a provider request.
+        if rest == ["long-form"] and method == "GET":
+            return 200, {"long_form_studio": service.long_form_studio().view()}
+
+        if rest == ["long-form", "control"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "")
+            if action == "start":
+                studio.start(actor=actor)
+            elif action == "pause":
+                studio.pause(actor=actor)
+            elif action == "resume":
+                studio.resume(actor=actor)
+            elif action == "cancel":
+                studio.cancel(actor=actor)
+            elif action == "approve_stage":
+                studio.approve_stage(_required(payload, "stage"), actor=actor)
+            elif action == "retry_billing":
+                studio.retry_billing(actor=actor)
+            else:
+                raise ApiError("validation_failed",
+                               detail=f"uzun video eylemi: {action!r}")
+            return 200, {"long_form_studio": studio.view()}
+
+        if rest == ["long-form", "stage"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            outcome = studio.run_next_stage(actor=actor)
+            return 200, {"ran": outcome, "long_form_studio": studio.view()}
+
+        if rest == ["long-form", "chapter"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            studio.save_chapter_text(
+                int(_required(payload, "index")), _required(payload, "text"),
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"long_form_studio": studio.view()}
+
+        if rest == ["long-form", "tts"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "run")
+            if action == "plan":
+                studio.plan_tts(actor=actor)
+            elif action in ("retry", "regenerate"):
+                studio.run_tts(actor=actor,
+                               only_chunk=_required(payload, "chunk_id"))
+            elif action == "concat":
+                studio.concat_audio(actor=actor)
+            else:
+                studio.run_tts(actor=actor,
+                               max_chunks=int(payload.get("max_chunks") or 0))
+            return 200, {"long_form_studio": studio.view()}
 
         if rest == ["outputs"] and method == "GET":
             return 200, {"outputs": service.outputs(), "batch": service.batch_state()}

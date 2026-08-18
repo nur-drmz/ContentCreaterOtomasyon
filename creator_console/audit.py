@@ -29,6 +29,7 @@ EVENT_TYPES = {
     "project.updated",
     "project.rewound",
     "project.reset",
+    "project.archived",
     "project.deleted",
     "script.updated",
     "source.registered",

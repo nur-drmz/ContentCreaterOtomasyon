@@ -68,6 +68,7 @@ ARTIFACTS = {
     "selected_voiceover": "results/selected_voiceover.json",
     "moment_transcript": "results/moment_transcript.json",
     "glossary": "results/glossary.json",
+    "long_form_plan": "results/long_form_plan.json",
     "render_manifest": "results/render/render_manifest.json",
 }
 
@@ -126,6 +127,8 @@ REQUIRED_FIELDS = {
     "selected_voiceover": ("status",),
     "moment_transcript": ("artifact_type", "status", "words", "cues"),
     "glossary": ("artifact_type", "status", "terms"),
+    "long_form_plan": ("artifact_type", "status", "topic", "content_type",
+                       "target_duration_min", "chapter_count"),
     "render_manifest": ("status", "output", "approval"),
 }
 
@@ -205,6 +208,16 @@ REWIND_PATHS = {
 REWIND_PATHS = {
     stage: (paths + ("results/moment_transcript.json",)
             if stage in ("assessment", "plan", "analysis", "moment", "script")
+            else paths)
+    for stage, paths in REWIND_PATHS.items()
+}
+
+# Framing adjustments belong to the selected moment. Re-encoding the same
+# moment preserves them; selecting a different moment archives them so an old
+# face focus cannot silently carry onto a new shot.
+REWIND_PATHS = {
+    stage: (paths + ("results/render_adjustments",)
+            if stage in ("assessment", "plan", "analysis", "moment")
             else paths)
     for stage, paths in REWIND_PATHS.items()
 }
@@ -498,6 +511,93 @@ class PipelineService:
         )
         return record
 
+    def save_long_form_plan(self, *, topic: str, content_type: str,
+                            target_duration_min: int, chapter_count: int,
+                            language: str, tone: str, audience: str,
+                            angle: str = "", narration_mode: str = "undecided",
+                            include_subtitles: bool = True, notes: str = "",
+                            updated_by: str = "console") -> dict:
+        """Persist a planning-only long-form brief; never starts generation."""
+        topic = str(topic or "").strip()
+        angle = str(angle or "").strip()
+        audience = str(audience or "").strip()
+        notes = str(notes or "").strip()
+        content_type = str(content_type or "").strip()
+        language = str(language or "").strip()
+        tone = str(tone or "").strip()
+        narration_mode = str(narration_mode or "").strip()
+        if not topic:
+            raise PipelineServiceError("uzun video konusu bos olamaz")
+        if len(topic) > 300:
+            raise PipelineServiceError("uzun video konusu en fazla 300 karakter olabilir")
+        if len(angle) > 1000:
+            raise PipelineServiceError("anlatim acisi en fazla 1000 karakter olabilir")
+        if len(audience) > 300:
+            raise PipelineServiceError("hedef kitle en fazla 300 karakter olabilir")
+        if len(notes) > 3000:
+            raise PipelineServiceError("uzun video notlari en fazla 3000 karakter olabilir")
+        if content_type not in {"theory", "explainer", "comparison"}:
+            raise PipelineServiceError("uzun video turu gecersiz")
+        if language not in {"tr-TR", "en-US"}:
+            raise PipelineServiceError("uzun video dili gecersiz")
+        if tone not in {"cinematic", "documentary", "conversational", "analytical"}:
+            raise PipelineServiceError("uzun video tonu gecersiz")
+        if narration_mode not in {"undecided", "tts", "own_voice"}:
+            raise PipelineServiceError("uzun video ses tercihi gecersiz")
+        try:
+            duration_value = float(target_duration_min)
+            chapters_value = float(chapter_count)
+        except (TypeError, ValueError) as exc:
+            raise PipelineServiceError("uzun video suresi ve bolum sayisi sayi olmali") from exc
+        if not duration_value.is_integer() or not chapters_value.is_integer():
+            raise PipelineServiceError("uzun video suresi ve bolum sayisi tam sayi olmali")
+        duration = int(duration_value)
+        chapters = int(chapters_value)
+        if duration < 15 or duration > 20:
+            raise PipelineServiceError("uzun video hedef suresi 15-20 dakika olmali")
+        if chapters < 5 or chapters > 7:
+            raise PipelineServiceError("uzun video bolum sayisi 5-7 olmali")
+
+        current = self.load_artifact("long_form_plan").get("data") or {}
+        now = _now_iso()
+        record = {
+            "schema_version": 1,
+            "artifact_type": "long_form_plan",
+            "status": "draft",
+            "status_reason": "plan kaydedildi; outline ve uretim henuz baslatilmadi",
+            "topic": topic,
+            "content_type": content_type,
+            "target_duration_min": duration,
+            "estimated_word_range": {
+                "minimum": duration * 130,
+                "maximum": duration * 150,
+            },
+            "chapter_count": chapters,
+            "language": language,
+            "tone": tone,
+            "audience": audience,
+            "angle": angle,
+            "narration_mode": narration_mode,
+            "include_subtitles": bool(include_subtitles),
+            "notes": notes,
+            "planning_only": True,
+            "generation_started": False,
+            "created_at": current.get("created_at") or now,
+            "updated_at": now,
+            "updated_by": str(updated_by or "console")[:120],
+        }
+        self.write_artifact("long_form_plan", record, actor=updated_by)
+        return record
+
+    def long_form_studio(self):
+        """The long-form workflow for this project.
+
+        Built on demand rather than in __init__ so a Shorts-only project never
+        pays for it and the Shorts pipeline keeps no reference to it.
+        """
+        from .long_form_studio import LongFormStudio
+        return LongFormStudio(self)
+
     # ------------------------------------------------------- project lifecycle
     def _archive_revision(self, paths, *, action: str, actor: str,
                           target: str | None = None) -> dict:
@@ -594,6 +694,85 @@ class PipelineService:
         "audio_continuity": "moment",
     }
 
+    def render_adjustment_relative(self, slot: int = 1) -> str:
+        index = self.require_slot(slot)
+        return f"results/render_adjustments/output_{index:02d}.json"
+
+    def render_adjustment(self, slot: int = 1) -> dict:
+        loaded = self.load_artifact_path(self.render_adjustment_relative(slot))
+        if not isinstance(loaded, dict):
+            return {"frame_zoom": 1.0, "frame_focus_x": 0.5,
+                    "frame_focus_y": 0.5, "source": "default"}
+        return {
+            "frame_zoom": min(2.0, max(1.0, float(loaded.get("frame_zoom", 1.0)))),
+            "frame_focus_x": min(1.0, max(0.0, float(loaded.get("frame_focus_x", 0.5)))),
+            "frame_focus_y": min(1.0, max(0.0, float(loaded.get("frame_focus_y", 0.5)))),
+            "source": loaded.get("source") or "saved_revision",
+            "reason": loaded.get("reason") or "",
+            "updated_at": loaded.get("updated_at"),
+        }
+
+    @staticmethod
+    def infer_render_adjustment(notes: str, current=None) -> dict | None:
+        """Parse a deliberately small, auditable framing vocabulary.
+
+        This is not an LLM pretending to understand arbitrary edit direction.
+        It only acts when the note contains an unambiguous zoom/focus command.
+        """
+        text = str(notes or "").casefold().translate(str.maketrans({
+            "ı": "i", "ş": "s", "ğ": "g", "ü": "u", "ö": "o", "ç": "c",
+        }))
+        base = current or {}
+        zoom = float(base.get("frame_zoom", 1.0) or 1.0)
+        focus_x = float(base.get("frame_focus_x", 0.5) or 0.5)
+        focus_y = float(base.get("frame_focus_y", 0.5) or 0.5)
+        matched = []
+        if any(token in text for token in
+               ("yakinlas", "yakinlastir", "zoom in", "zoomla", "daha yakin")):
+            zoom = 1.12 if "biraz" in text else 1.20
+            matched.append("zoom_in")
+        elif any(token in text for token in ("uzaklas", "zoom out", "uzaklastir")):
+            zoom = 1.0
+            matched.append("zoom_out")
+        if any(token in text for token in ("sola odak", "sol tarafa", "sola kaydir")):
+            focus_x = 0.30
+            matched.append("focus_left")
+        elif any(token in text for token in ("saga odak", "sag tarafa", "saga kaydir")):
+            focus_x = 0.70
+            matched.append("focus_right")
+        if any(token in text for token in
+               ("yukariya odak", "yukari odak", "yukari kaydir")):
+            focus_y = 0.30
+            matched.append("focus_up")
+        elif any(token in text for token in
+                 ("asagiya odak", "asagi odak", "asagi kaydir")):
+            focus_y = 0.70
+            matched.append("focus_down")
+        if not matched:
+            return None
+        return {"frame_zoom": zoom, "frame_focus_x": focus_x,
+                "frame_focus_y": focus_y, "matched_commands": matched}
+
+    def save_render_adjustment(self, adjustment: dict, *, notes: str, actor: str,
+                               slot: int = 1) -> dict:
+        record = {
+            "artifact_type": "render_adjustment", "schema_version": 1,
+            "status": "active", "not_uploaded": True,
+            "frame_zoom": min(2.0, max(1.0, float(adjustment["frame_zoom"]))),
+            "frame_focus_x": min(1.0, max(0.0, float(adjustment["frame_focus_x"]))),
+            "frame_focus_y": min(1.0, max(0.0, float(adjustment["frame_focus_y"]))),
+            "matched_commands": list(adjustment.get("matched_commands") or []),
+            "source": "revision_note", "reason": str(notes or "")[:2000],
+            "updated_at": _now_iso(), "updated_by": str(actor or "console")[:120],
+        }
+        relative = self.render_adjustment_relative(slot)
+        atomic_write_json(self.storage.resolve(self.ownership, relative, create_parent=True),
+                          record)
+        self.audit.record("artifact.written", actor=actor, artifact=relative,
+                          detail={"slot": int(slot), "frame_zoom": record["frame_zoom"],
+                                  "matched_commands": record["matched_commands"]})
+        return record
+
     def revision_plan(self, *, target: str, slot: int = 1) -> dict:
         """What starting this revision WOULD archive. Pure read, changes nothing.
 
@@ -620,6 +799,10 @@ class PipelineService:
             else:
                 entries.append({"path": relative, "kind": "file", "file_count": 1,
                                 "size_bytes": path.stat().st_size})
+        current_review = self.render_review_state(slot)
+        open_note = ((current_review.get("open_revision") or {}).get("notes") or "")
+        inferred = (self.infer_render_adjustment(
+            open_note, self.render_adjustment(slot)) if target == "render" else None)
         return {
             "target": target,
             "label": REWIND_LABELS.get(target, target),
@@ -635,6 +818,7 @@ class PipelineService:
             "destination": "revisions/<revizyon-id>/",
             "reversible": True,
             "not_uploaded": True,
+            "suggested_render_adjustment": inferred,
         }
 
     def suggested_revision_stage(self, slot: int = 1) -> dict:
@@ -645,6 +829,19 @@ class PipelineService:
         to destroy, and this mode is contractually provider-free anyway.
         """
         state = self.render_review_state(slot)
+        open_revision = state.get("open_revision") or {}
+        target_map = {
+            "moments": "moment", "phase0": "plan", "script": "script",
+            "voice": "voice", "render": "render",
+        }
+        explicit_stage = target_map.get(open_revision.get("target_tab"))
+        if explicit_stage:
+            return {
+                "stage": explicit_stage,
+                "reasons": [f"Kayitli duzeltme hedefi -> "
+                            f"{REWIND_LABELS.get(explicit_stage, explicit_stage)}"],
+                "note": "Revizyon kaydinda kullanicinin sectigi hedef esas alindi.",
+            }
         order = ["assessment", "plan", "analysis", "moment", "script", "voice", "render"]
         unchecked = [item for item in (state.get("items") or [])
                      if not item.get("checked")]
@@ -685,7 +882,9 @@ class PipelineService:
             raise PipelineServiceError(
                 f"{plan['label']} asamasinda tasinacak bir cikti yok; "
                 "bu asama zaten bos.")
-        note = str(notes or "").strip()[:2000]
+        open_note = ((self.render_review_state(slot).get("open_revision") or {})
+                     .get("notes") or "")
+        note = str(notes or open_note or "").strip()[:2000]
         # Record the reason BEFORE moving anything: if the move fails halfway the
         # project still says why someone tried.
         if note:
@@ -696,6 +895,12 @@ class PipelineService:
                 # No render to attach the note to (rewinding from an earlier
                 # stage). The audit entry below still carries it.
                 pass
+        adjustment = None
+        if target == "render":
+            inferred = self.infer_render_adjustment(note, self.render_adjustment(slot))
+            if inferred:
+                adjustment = self.save_render_adjustment(
+                    inferred, notes=note, actor=actor, slot=slot)
         result = self.rewind_project(target=target, actor=actor)
         self.audit.record("project.rewound", actor=actor, detail={
             "revision_started": True, "target": target, "slot": slot,
@@ -705,7 +910,8 @@ class PipelineService:
         })
         return {"revision": result["revision"], "project": result["project"],
                 "plan": plan, "next_stage": target,
-                "label": REWIND_LABELS.get(target, target)}
+                "label": REWIND_LABELS.get(target, target),
+                "render_adjustment": adjustment}
 
     def archive_view(self, *, limit: int = 20) -> dict:
         """The archive, so a moved-away attempt is visible instead of merely gone."""
@@ -2486,6 +2692,43 @@ class PipelineService:
             artifact, rebuilt, applied["changed_segment_ids"], actor=edited_by)
         return self.transcript_view(slot)
 
+    def set_transcript_exclusions(self, *, segment_ids, excluded: bool,
+                                  actor: str, slot: int = 1) -> dict:
+        """Keep selected vocals reviewable while excluding them from captions."""
+        slot = self.require_slot(slot)
+        artifact, _loaded = self._transcript_artifact(slot)
+        previous_sha = transcript_edit.content_sha256(artifact)
+        try:
+            applied = transcript_edit.apply_segment_exclusions(
+                artifact, segment_ids, excluded=excluded)
+        except transcript_edit.TranscriptEditError as exc:
+            raise PipelineServiceError(str(exc)) from exc
+        if not applied["changed_segment_ids"]:
+            return self.transcript_view(slot)
+        rebuilt = render_utils.build_moment_transcript_artifact(
+            applied["words"], applied["cues"],
+            source=artifact.get("source"), language=artifact.get("language"),
+            moment_rank=artifact.get("moment_rank"),
+            moment_selection_sha256=artifact.get("moment_selection_sha256"),
+            whisper_model_size=artifact.get("whisper_model_size"),
+            initial_prompt_used=artifact.get("initial_prompt_used"),
+            corrections=artifact.get("corrections"), asr=artifact.get("asr"),
+            revisions=artifact.get("revisions"),
+            edited_segment_ids=artifact.get("edited_segment_ids"),
+            glossary_context=artifact.get("glossary_context"))
+        rebuilt = transcript_edit.append_revision(
+            rebuilt, actor=actor,
+            kind=("subtitle_exclusion" if excluded else "subtitle_inclusion"),
+            previous_sha256=previous_sha,
+            changed_segment_ids=applied["changed_segment_ids"])
+        relative = self.write_artifact("moment_transcript", rebuilt,
+                                       actor=actor, slot=slot)
+        self.audit.record(
+            "artifact.written", actor=actor, artifact=relative,
+            detail={"slot": slot, "caption_excluded": bool(excluded),
+                    "changed_segments": applied["changed_segment_ids"]})
+        return self.transcript_view(slot)
+
     def _record_glossary_suggestions_from_edit(self, before, after, changed_ids,
                                                *, actor: str) -> None:
         threshold = render_utils.LOW_CONFIDENCE_WORD_THRESHOLD
@@ -2583,6 +2826,9 @@ class PipelineService:
             "text": data.get("text"),
             "word_count": data.get("word_count"),
             "cue_count": data.get("cue_count"),
+            "excluded_cue_count": sum(
+                bool(cue.get("excluded_from_subtitles"))
+                for cue in (data.get("cues") or [])),
             "has_speech": data.get("has_speech"),
             "average_word_probability": data.get("average_word_probability"),
             "low_confidence_words": data.get("low_confidence_words") or [],
@@ -2747,6 +2993,7 @@ class PipelineService:
         if hot["problem"]:
             raise ArtifactProblem(hot["problem"])
         render_dir = self.slot_render_dir(slot)
+        frame = self.render_adjustment(slot)
         pipeline_mode = plan["data"]["pipeline_mode"]
 
         if pipeline_mode == "original_audio_subtitles":
@@ -2773,6 +3020,9 @@ class PipelineService:
                 subtitle_whisper_model_size=subtitle_whisper_model_size,
                 subtitle_language=subtitle_language,
                 caption_style=caption_style, caption_theme=caption_theme,
+                frame_zoom=frame["frame_zoom"],
+                frame_focus_x=frame["frame_focus_x"],
+                frame_focus_y=frame["frame_focus_y"],
                 source_video_path_override=str(self.source_path()),
                 progress=tracker,
             )
@@ -2788,6 +3038,9 @@ class PipelineService:
                 self.relative(self.path("selected_script")),
                 self.relative(self.path("selected_voiceover")),
                 render_dir=render_dir, render_mode=render_mode, preview_mode=preview_mode,
+                frame_zoom=frame["frame_zoom"],
+                frame_focus_x=frame["frame_focus_x"],
+                frame_focus_y=frame["frame_focus_y"],
                 source_video_path_override=str(self.source_path()),
                 progress=tracker,
             )

@@ -70,6 +70,8 @@ Faydalı bayraklar:
 | Bayrak | Ne yapar |
 |---|---|
 | `--port 8765` | HTTP portu |
+| `--archive-root "G:\\Youtube kaynak videolar"` | `Arsivle` ile tamamlanan projelerin tasinacagi harici disk koku |
+| `--source-library-root "G:\\Youtube kaynak videolar"` | Faz 0'da tarayici upload'i olmadan secilebilen kaynak video kutuphanesi |
 | `--storage-root ./.console_data` | Tüm proje/artefakt/iş verisinin kökü |
 | `--inline-jobs` | İşleri arka plan thread'i yerine senkron çalıştır (hata ayıklama) |
 | `--demo-fixtures` | Sentetik kaynak videolu örnek proje oluştur |
@@ -81,6 +83,41 @@ Faydalı bayraklar:
 **bilerek engellenmiştir**: pre-alpha'da kimlik doğrulama yoktur, ağa açmak
 konsolu herkese açmak demektir.
 
+## Google Colab'da Creator Console
+
+Drive'a dağıtılacak küçük kaynak paketini yerelde üretmek ve doğrulamak için:
+
+```bash
+python tools/build_colab_console_bundle.py
+python tools/build_colab_console_bundle.py --verify
+python verify_colab_console.py
+```
+
+Colab'da `07_creator_console.ipynb` açılır ve hücreler sırayla çalıştırılır.
+Notebook aşağıdaki Drive sözleşmesini kullanır:
+
+```text
+MyDrive/YouTubeAutomation/
+  app/creator_console_colab.zip
+  app/creator_console_colab.zip.sha256
+  app/07_creator_console.ipynb
+  source_videos/                 # büyük kaynakların kalıcı kütüphanesi
+  projects/                      # aktif Console projeleri ve ara ürünler
+  archive/                       # tamamlanan projeler
+  results/                       # eski/self-contained notebook sonuçları
+  cache/                         # eski/self-contained notebook önbelleği
+```
+
+Console Colab'da da `127.0.0.1` üzerinde kalır; herkese açık ngrok/cloudflared
+tüneli kurulmaz. Arayüz yalnızca Colab'ın mevcut kullanıcı oturumuyla korunan
+`serve_kernel_port_as_iframe` görünümünden açılır. Drive bağlama izni her yeni
+runtime'da kullanıcı tarafından verilir. `GeminiKey` değeri Colab Secrets'tan
+yalnızca sunucu sürecine aktarılır; notebook çıktısına yazılmaz.
+
+Büyük videolar Colab proxy'sinden tarayıcı upload ile gönderilmemelidir. Önce
+`source_videos/` klasörüne konmaları gerekir. Colab runtime diski geçicidir;
+kalıcı proje/artefakt kaynağı `projects/` ve `archive/` dizinleridir.
+
 ## Kurulum
 
 Ek bağımlılık **yoktur**. Konsol yalnızca Python standart kütüphanesini kullanır;
@@ -90,6 +127,7 @@ custom property'leridir.
 
 ```bash
 python verify_console.py   # konsol test suiti (15 bolum)
+python verify_project_archive.py  # harici disk arsiv akisi (dosya tasima + manifest)
 python verify_faults.py    # fault-injection + cok surecli worker (10 aile, 70 senaryo)
 python verify_browser.py   # gercek Chromium (Playwright) UI testleri (42 kontrol)
 python verify_local.py     # mevcut pipeline suiti
