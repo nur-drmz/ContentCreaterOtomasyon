@@ -2110,3 +2110,8 @@ Sıradaki oturum bunu kapatmalı:
 
 Yeni bir çalışma tamamlandığında bu tabloya tarih, yapılan değişiklik ve somut
 kanıt eklenmelidir. Checkbox yalnızca ilgili kanıt üretildiğinde işaretlenmelidir.
+
+## MILESTONES bölüm 8'den taşınanlar (2026-08-23)
+
+- 2026-08-18 — Long-form canlı pilot billing/kotada güvenli durdu; çıktı üretilmedi.
+- 2026-08-18 — Creator Console Colab/Drive paketi doğrulandı; Colab runtime kabulü bekliyor.

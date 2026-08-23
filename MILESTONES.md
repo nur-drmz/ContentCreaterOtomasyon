@@ -321,8 +321,6 @@ Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive
   **REAL_PREVIEW_OK**; tam süpürme (canlı paketler hariç 28 paket) **28/28 yeşil**.
 - 2026-08-22 — Stok medya adaptörü: mock sağlayıcı ve güvenlik testleri geçti; canlı kabul bekliyor.
 - 2026-08-22 — Turbo Studio: aşama grafiği ve gerçek FFmpeg mekaniği geçti; insan izlemesi yok.
-- 2026-08-18 — Long-form canlı pilot billing/kotada güvenli durdu; çıktı üretilmedi.
-- 2026-08-18 — Creator Console Colab/Drive paketi doğrulandı; Colab runtime kabulü bekliyor.
 - 2026-08-23 — P0 transcript/glossary stabilizasyon testleri yeniden ölçüldü:
   `verify_transcript_editor` 113/113, `verify_revision_flow` 39/39,
   `verify_diagnostics` 110/110; ilgili 10 regresyon paketi tamamen yeşil.
