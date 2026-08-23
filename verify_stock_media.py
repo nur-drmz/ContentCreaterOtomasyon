@@ -95,6 +95,26 @@ def pixabay_payload():
     }]}
 
 
+def coverr_payload():
+    """Two hits: one usable, one whose CDN host is not on the allowlist.
+
+    The second is the important one. A provider that changed its download host
+    -- or a payload someone tampered with -- must be dropped here, not
+    downloaded and discovered afterwards.
+    """
+    return {"hits": [
+        {"id": "cv-303", "url": "https://coverr.co/videos/storm?ref=NOPE",
+         "duration": 11, "creator": {"name": "Mira"},
+         "max_width": 1920, "max_height": 1080, "file_size": 5200,
+         "poster": "https://storage.coverr.co/posters/303.jpg",
+         "urls": {"mp4_download": "https://storage.coverr.co/videos/303.mp4",
+                  "mp4": "https://storage.coverr.co/videos/303_preview.mp4"}},
+        {"id": "cv-404", "duration": 8,
+         "max_width": 1920, "max_height": 1080, "file_size": 4000,
+         "urls": {"mp4_download": "https://evil.example.com/404.mp4"}},
+    ]}
+
+
 def main():
     print("\n--- provider normalization ---")
     pexels = stock_media.parse_pexels(pexels_payload(), query="dragon flight")
@@ -109,6 +129,30 @@ def main():
     check(len(pixabay) == 1 and pixabay[0]["provider"] == "pixabay",
           "pixabay-normalized")
     check("key=" not in json.dumps(pixabay), "pixabay-key-not-persisted")
+
+    coverr = stock_media.parse_coverr(coverr_payload(), query="storm")
+    check(len(coverr) == 1 and coverr[0]["provider"] == "coverr",
+          "coverr-normalized", str([c.get("asset_id") for c in coverr]))
+    ids = [c["asset_id"] for c in coverr]
+    check("cv-404" not in ids and "cv-303" in ids,
+          "coverr-ALLOWLIST-DISI-host-DUSURULDU",
+          f"izin verilmeyen CDN adayi kabul edildi: {ids}")
+    check(all("evil.example.com" not in c["download_url"] for c in coverr),
+          "izin-verilmeyen-host-indirme-URLine-GIRMIYOR", str(ids))
+    check((coverr[0]["width"], coverr[0]["height"]) == (1920, 1080),
+          "coverr-boyut-normalize", str(coverr[0]["width"]))
+    check(coverr[0]["source_page"] == "https://coverr.co/videos/storm",
+          "coverr-sayfa-sorgusu-temizlendi", coverr[0]["source_page"])
+    check(coverr[0]["creator"]["name"] == "Mira"
+          and "Coverr" in coverr[0]["attribution"],
+          "coverr-atif-tasiniyor", coverr[0]["attribution"])
+    check(coverr[0]["duration_sec"] == 11, "coverr-sure-tasiniyor",
+          str(coverr[0]["duration_sec"]))
+    # Portrait was not requested, so a landscape-only payload must yield nothing
+    # rather than a clip that would be cropped to pieces.
+    check(stock_media.parse_coverr(coverr_payload(), query="storm",
+                                   orientation="portrait") == [],
+          "coverr-yonelim-filtresi-calisiyor")
 
     print("\n--- explicit searches and secret handling ---")
     p_session = Session(Response(pexels_payload(), headers={
@@ -133,6 +177,20 @@ def main():
         safe_error = str(exc)
     check("SECRET" not in safe_error and "reddedildi" in safe_error,
           "provider-error-sanitized", safe_error)
+
+    c_session = Session(Response(coverr_payload()))
+    c_result = stock_media.search_videos(
+        "coverr", "storm", "SECRET_COVERR", session=c_session)
+    check(c_result["count"] == 1, "coverr-search-result", str(c_result["count"]))
+    check(c_session.calls[0][1]["headers"]["Authorization"]
+          == "Bearer SECRET_COVERR", "coverr-bearer-header",
+          str(c_session.calls[0][1]["headers"]))
+    # Unlike Pixabay the key never goes in the URL; prove it stays out of both
+    # the request line and everything the call returns.
+    check("SECRET_COVERR" not in c_session.calls[0][0],
+          "coverr-anahtari-URL-e-YAZILMIYOR", c_session.calls[0][0])
+    check("SECRET_COVERR" not in json.dumps(c_result),
+          "coverr-secret-not-returned")
 
     print("\n--- plan, selection, atomic download ---")
     chapters = {"chapters": [

@@ -43,7 +43,7 @@ def clip_dirname(kind: str = "long_form") -> str:
         raise StockMediaError(f"bilinmeyen stok materyal alani: {kind!r}")
     return f"{root}/{'broll' if kind == 'long_form' else 'clips'}"
 SCHEMA_VERSION = 1
-PROVIDERS = ("pexels", "pixabay")
+PROVIDERS = ("pexels", "pixabay", "coverr")
 DEFAULT_CLIP_DURATION_SEC = 5
 MIN_CLIP_DURATION_SEC = 2
 MAX_CLIP_DURATION_SEC = 12
@@ -53,6 +53,7 @@ MAX_DOWNLOAD_BYTES = 750 * 1024 * 1024
 _DOWNLOAD_HOSTS = {
     "pexels": frozenset({"videos.pexels.com"}),
     "pixabay": frozenset({"cdn.pixabay.com"}),
+    "coverr": frozenset({"storage.coverr.co", "cdn.coverr.co"}),
 }
 
 
@@ -238,6 +239,59 @@ def parse_pixabay(payload: dict, *, query: str,
     return candidates
 
 
+def parse_coverr(payload: dict, *, query: str,
+                 orientation: str = "landscape") -> list[dict]:
+    """Normalise a Coverr search response into the shared candidate shape.
+
+    Coverr returns ONE downloadable rendition per video rather than a ladder,
+    so the rendition list handed to `_best_rendition` has a single entry. That
+    is deliberate: the size/orientation gates still apply, so an unusable clip
+    is dropped here instead of failing at download time.
+
+    NOTE: written against Coverr's published response shape and exercised with
+    recorded fixtures -- no live call has confirmed it. Field lookups are
+    therefore forgiving, and a video missing any required field is skipped
+    rather than half-built.
+    """
+    candidates = []
+    for item in (payload or {}).get("hits") or []:
+        urls = item.get("urls") or {}
+        asset_id = item.get("id")
+        download = urls.get("mp4_download") or urls.get("mp4")
+        if not download or asset_id in (None, ""):
+            continue
+        rendition = _best_rendition([{
+            "url": download,
+            "width": item.get("max_width") or item.get("width"),
+            "height": item.get("max_height") or item.get("height"),
+            "size": item.get("file_size"),
+            "quality": "mp4",
+            "file_type": "video/mp4",
+            "thumbnail": item.get("poster") or item.get("thumbnail"),
+        }], "coverr", orientation)
+        if not rendition:
+            continue
+        creator = _text((item.get("creator") or {}).get("name")
+                        if isinstance(item.get("creator"), dict)
+                        else item.get("creator"), 160)
+        candidates.append({
+            "id": _candidate_id("coverr", asset_id),
+            "provider": "coverr", "asset_id": str(asset_id),
+            "query": query,
+            "source_page": public_url(
+                item.get("url") or f"https://coverr.co/videos/{asset_id}"),
+            "creator": {"name": creator, "profile_page": None},
+            "duration_sec": max(0, _number(item.get("duration"))),
+            "width": rendition["width"], "height": rendition["height"],
+            "bytes": rendition["bytes"], "quality": rendition["quality"],
+            "preview_url": rendition.get("thumbnail_url"),
+            "download_url": rendition["download_url"],
+            "attribution": (f"Video by {creator} on Coverr" if creator
+                            else "Video provided by Coverr"),
+        })
+    return candidates
+
+
 def search_videos(provider: str, query: str, api_key: str, *, per_page: int = 6,
                   session=None, timeout: float = 20.0,
                   orientation: str = "landscape") -> dict:
@@ -269,6 +323,14 @@ def search_videos(provider: str, query: str, api_key: str, *, per_page: int = 6,
                 "query": query, "orientation": orientation, "per_page": count})
             response = client.get(url, headers={"Authorization": key},
                                   timeout=timeout)
+        elif provider == "coverr":
+            # Coverr takes the key in a Bearer header, so unlike Pixabay the
+            # request URL carries no secret. `urls=true` is what makes the
+            # response include the downloadable rendition at all.
+            url = "https://api.coverr.co/videos?" + urlencode({
+                "query": query, "page_size": count, "urls": "true"})
+            response = client.get(url, headers={"Authorization": f"Bearer {key}"},
+                                  timeout=timeout)
         else:
             # Pixabay requires the key in the query. This URL is deliberately
             # never returned, persisted or included in an exception message.
@@ -289,10 +351,9 @@ def search_videos(provider: str, query: str, api_key: str, *, per_page: int = 6,
     except (requests.RequestException, ValueError) as exc:
         raise StockMediaError(
             f"{provider} aramasina ulasilamadi ({type(exc).__name__})") from None
-    candidates = (parse_pexels(payload, query=query, orientation=orientation)
-                  if provider == "pexels"
-                  else parse_pixabay(payload, query=query,
-                                     orientation=orientation))
+    parser = {"pexels": parse_pexels, "pixabay": parse_pixabay,
+              "coverr": parse_coverr}[provider]
+    candidates = parser(payload, query=query, orientation=orientation)
     return {
         "provider": provider, "query": query,
         "candidates": candidates[:count], "count": min(len(candidates), count),

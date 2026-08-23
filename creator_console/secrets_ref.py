@@ -34,6 +34,7 @@ CONSOLE_SECRET_KINDS = {
     "tmdb": "Opsiyonel film/dizi trend metadata zenginlestirmesi",
     "pexels": "Long-form icin insan onayli Pexels stok video aramasi",
     "pixabay": "Long-form icin insan onayli Pixabay stok video aramasi",
+    "coverr": "Long-form icin insan onayli Coverr stok video aramasi",
     "huggingface": "Opsiyonel Hugging Face model indirme kimlik dogrulamasi",
     "github": "GitHub private repo/LFS senkron kimligi (otomatik veri senkronu henuz kapali)",
 }
@@ -46,6 +47,7 @@ CONSOLE_SECRET_ALIASES = {
     "tmdb": ("TMDB_API_KEY",),
     "pexels": ("PEXELS_API_KEY",),
     "pixabay": ("PIXABAY_API_KEY",),
+    "coverr": ("COVERR_API_KEY",),
     "huggingface": ("HF_TOKEN",),
     "github": ("GITHUB_TOKEN",),
 }
