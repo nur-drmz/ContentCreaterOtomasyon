@@ -118,10 +118,11 @@ tekrarlanmaz.
   adımı yoktu, (2) `diagnostics` `__raw__` yerine `__file__` okumuyordu,
   (3) testler transcript kapısı eklenmeden önceki dünyayı iddia ediyordu.
   Temizlik sonrası tam süpürme (canlı paketler hariç 28 paket): **28/28 yeşil**.
-- [ ] `feature/transcript-editor-revision-flow` gözden geçirilip `main`e merge edilmeli.
-  2026-08-23 gözden geçirme: branch `main`den 2 commit ileride, `git merge-tree`
-  conflict çıkarmadı; 10/10 ilgili regresyon paketi yeşil; working tree'de
-  commitlenmemiş değişiklikler var — merge öncesi kullanıcı onayı/kararı bekliyor.
+- [x] `feature/transcript-editor-revision-flow` gözden geçirilip `main`e merge edilmeli.
+  2026-08-23: çalışma ağacı üç commite bölündü, branch `main`e `--no-ff` ile
+  conflict'siz merge edildi (`082cbbc`, 73 dosya). Merge sonrası `main` üzerinde
+  `verify_transcript_editor` 113/113, `verify_revision_flow` 39/39,
+  `verify_diagnostics` 110/110, `verify_console` OK. Push yapılmadı.
 
 ### P0 — M0.10 gerçek medya kabul koşusu
 
@@ -281,8 +282,7 @@ Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları ar�
 
 ## 7. Bir sonraki çalışma oturumu
 
-1. Branchi gözden geçirip `main`e merge et. (Yedi P0 maddesinden altısı kapandı;
-   yalnızca merge kaldı. 2026-08-23 regresyonu yeşil.)
+1. `main`i uzak depoya push et (merge yerelde tamam; push kullanıcı onayı bekliyor).
 2. Creator Console'da >1 saat gerçek kaynakla final kalite planı oluştur.
 3. Tam kaynak taraması çalıştır; üç ayrı momenti üç slota seç.
 4. Her slot transcript'ini ayrı incele/onayla ve batch renderı çalıştır.
@@ -310,6 +310,5 @@ Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive
 - 2026-08-23 — P0 transcript/glossary stabilizasyon testleri yeniden ölçüldü:
   `verify_transcript_editor` 113/113, `verify_revision_flow` 39/39,
   `verify_diagnostics` 110/110; ilgili 10 regresyon paketi tamamen yeşil.
-- 2026-08-23 — `feature/transcript-editor-revision-flow` main'den 2 commit ileride,
-  conflict yok; merge için working tree'deki commitlenmemiş değişikliklerin
-  commitlenmesi ve kullanıcı onayı bekliyor.
+- 2026-08-23 — `feature/transcript-editor-revision-flow` üç commite bölünüp `main`e
+  conflict'siz merge edildi (`082cbbc`, 73 dosya); merge sonrası `main` yeşil. Push yok.
