@@ -103,9 +103,92 @@ def order_clip_ids(clip_ids, *, mode: str, seed: int | None) -> list:
 
 
 # -------------------------------------------------------------------- packing
+#: Suffixes treated as a still image rather than footage. A still has no
+#: duration of its own, so it is looped for the length of its slot and given
+#: motion by `zoompan` -- a static frame held for five seconds reads as a
+#: broken video, not as a deliberate choice.
+IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
+KEN_BURNS_DIRECTIONS = ("in", "out", "left", "right")
+DEFAULT_KEN_BURNS = {"direction": "in", "amount": 0.12}
+MAX_KEN_BURNS_AMOUNT = 0.5
+
+
+def clip_kind(source: dict) -> str:
+    """`image` or `video`, decided by the source record, then by the suffix.
+
+    An explicit `kind` from the provider wins; the suffix is the fallback for
+    records written before images existed.
+    """
+    declared = str((source or {}).get("kind") or "").strip().lower()
+    if declared in ("image", "video"):
+        return declared
+    suffix = Path(str((source or {}).get("relative_path") or "")).suffix.lower()
+    return "image" if suffix in IMAGE_SUFFIXES else "video"
+
+
+def normalize_ken_burns(values) -> dict:
+    """Validated Ken Burns settings. Refuses rather than silently clamping to a
+    default, because a typo in the direction would otherwise ship as `in`."""
+    data = dict(values or {})
+    direction = str(data.get("direction")
+                    or DEFAULT_KEN_BURNS["direction"]).strip().lower()
+    if direction not in KEN_BURNS_DIRECTIONS:
+        raise TimelineError(
+            "ken burns yonu su seceneklerden biri olmali: "
+            + ", ".join(KEN_BURNS_DIRECTIONS))
+    try:
+        amount = round(float(data.get("amount", DEFAULT_KEN_BURNS["amount"])), 4)
+    except (TypeError, ValueError) as exc:
+        raise TimelineError("ken burns miktari bir sayi olmali") from exc
+    if not (0.0 <= amount <= MAX_KEN_BURNS_AMOUNT):
+        raise TimelineError(
+            f"ken burns miktari 0 ile {MAX_KEN_BURNS_AMOUNT} arasinda olmali "
+            f"(girilen: {amount})")
+    return {"direction": direction, "amount": amount}
+
+
+def _zoompan_statement(position: int, clip: dict, *, fps: int) -> str:
+    """The Ken Burns move for one still image.
+
+    `on` is the OUTPUT frame index, so the ramp is driven by frames actually
+    emitted rather than by zoompan's `d` interacting with `-loop 1`. zoompan
+    also carries its own fps (default 25); leaving it unset would resample the
+    clip and break `concat`, which compares frame rates exactly.
+    """
+    span = _round(float(clip["timeline_end_sec"])
+                  - float(clip["timeline_start_sec"]))
+    total = max(1, int(round(span * fps)))
+    settings = normalize_ken_burns(clip.get("ken_burns"))
+    amount, direction = settings["amount"], settings["direction"]
+    probed = clip.get("probed") or {}
+    out_w = max(2, int(probed.get("width") or 1920))
+    out_h = max(2, int(probed.get("height") or 1080))
+
+    centre_y = "ih/2-(ih/zoom/2)"
+    if direction == "in":
+        zoom = f"1+{amount}*on/{total}"
+        x, y = "iw/2-(iw/zoom/2)", centre_y
+    elif direction == "out":
+        zoom = f"1+{amount}-{amount}*on/{total}"
+        x, y = "iw/2-(iw/zoom/2)", centre_y
+    elif direction == "left":
+        zoom = f"1+{amount}"
+        x, y = f"(iw-iw/zoom)*(1-on/{total})", centre_y
+    else:  # right
+        zoom = f"1+{amount}"
+        x, y = f"(iw-iw/zoom)*on/{total}", centre_y
+
+    return (f"[{position}:v]fps={fps},setsar=1,"
+            f"zoompan=z='{zoom}':x='{x}':y='{y}':d=1:fps={fps}:"
+            f"s={out_w}x{out_h},"
+            f"trim=duration={span},setpts=PTS-STARTPTS[pre_{position}]")
+
+
 def pack_clips(sources, *, total_duration_sec: float, clip_duration_sec: float,
                fps: int, order: list, frame_defaults: dict,
-               transition: str = "none", transition_sec: float = 0.0) -> list:
+               transition: str = "none", transition_sec: float = 0.0,
+               ken_burns_defaults: dict | None = None) -> list:
     """Lay the ordered sources end to end so they exactly fill the narration.
 
     `sources` maps clip_id -> {relative_path, sha256, provider, ..., probed}.
@@ -142,7 +225,11 @@ def pack_clips(sources, *, total_duration_sec: float, clip_duration_sec: float,
             break
 
         probed = source.get("probed") or {}
-        source_len = float(probed.get("duration_sec") or 0.0)
+        kind = clip_kind(source)
+        # A still has no timeline of its own to seek into, so the reuse/offset
+        # arithmetic below would be meaningless for it.
+        source_len = (0.0 if kind == "image"
+                      else float(probed.get("duration_sec") or 0.0))
         reuse_index = used.get(clip_id, 0)
         used[clip_id] = reuse_index + 1
 
@@ -168,7 +255,12 @@ def pack_clips(sources, *, total_duration_sec: float, clip_duration_sec: float,
             "timeline_end_sec": _round(cursor + span),
             "source_in_sec": source_in,
             "source_out_sec": _round(source_in + span),
-            "stream_loop": max(0, loops - 1),
+            "stream_loop": 0 if kind == "image" else max(0, loops - 1),
+            "kind": kind,
+            # Only meaningful for images; kept off video clips so the render
+            # fingerprint does not change for footage that never pans.
+            "ken_burns": (normalize_ken_burns(ken_burns_defaults)
+                          if kind == "image" else None),
             "reuse_index": reuse_index,
             "frame": dict(frame_defaults),
             "fade_in": bool(transition == "fade" and position > 0),
@@ -252,7 +344,8 @@ def render_fingerprint(manifest: dict) -> str:
             {key: clip.get(key) for key in (
                 "clip_id", "source_in_sec", "source_out_sec",
                 "timeline_start_sec", "timeline_end_sec", "stream_loop",
-                "frame", "fade_in", "fade_out", "fade_sec")}
+                "frame", "fade_in", "fade_out", "fade_sec",
+                "kind", "ken_burns")}
             | {"sha256": (clip.get("source") or {}).get("sha256")}
             for clip in manifest.get("clips") or []],
         "subtitles": {key: (manifest.get("subtitles") or {}).get(key)
@@ -292,9 +385,12 @@ def build_filter_complex(manifest: dict, *, subtitle_path=None) -> str:
         # ratio (common in stock footage derived from DV) makes `concat` abort
         # with "Input link parameters do not match". One `fps=` per clip for the
         # same reason -- concat requires identical frame rates.
-        statements.append(
-            f"[{position}:v]trim=duration={span},setpts=PTS-STARTPTS,"
-            f"fps={fps},setsar=1[pre_{position}]")
+        if clip.get("kind") == "image":
+            statements.append(_zoompan_statement(position, clip, fps=fps))
+        else:
+            statements.append(
+                f"[{position}:v]trim=duration={span},setpts=PTS-STARTPTS,"
+                f"fps={fps},setsar=1[pre_{position}]")
         statements.append(render_utils.build_vertical_filtergraph(
             mode, width, height,
             blur_sigma=int(frame.get("blur_sigma") or 20),
@@ -394,6 +490,11 @@ def build_ffmpeg_args(manifest: dict, *, resolve, narration_path,
     for clip in clips:
         span = _round(float(clip["timeline_end_sec"])
                       - float(clip["timeline_start_sec"]))
+        if clip.get("kind") == "image":
+            # A still is decoded once and looped for the slot. `-ss` would seek
+            # inside a file that has nothing to seek into.
+            args += ["-loop", "1", "-t", str(span), "-i", str(resolve(clip))]
+            continue
         if int(clip.get("stream_loop") or 0) > 0:
             args += ["-stream_loop", str(int(clip["stream_loop"]))]
         args += ["-ss", str(clip["source_in_sec"]), "-t", str(span),

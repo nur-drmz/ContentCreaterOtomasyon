@@ -1257,6 +1257,152 @@ def test_real_render():
 
 
 # ===================================================================== N
+def test_image_clips_and_ken_burns():
+    section("K. Gorsel klipler ve Ken Burns hareketi")
+    from local_pipeline import timeline as tl, render_utils as ru
+
+    # --- classification and validation, before any rendering ---------------
+    check(tl.clip_kind({"relative_path": "clips/a.mp4"}) == "video",
+          "video-uzantisi-video-sayiliyor")
+    check(tl.clip_kind({"relative_path": "clips/a.JPG"}) == "image",
+          "gorsel-uzantisi-BUYUK-harfle-de-taniniyor")
+    check(tl.clip_kind({"kind": "image", "relative_path": "x.mp4"}) == "image",
+          "saglayicinin-bildirdigi-tur-uzantiyi-EZER")
+    for bad in ({"direction": "diagonal"}, {"amount": 9}, {"amount": -1}):
+        try:
+            tl.normalize_ken_burns(bad)
+            check(False, f"gecersiz-ken-burns-reddedilir:{bad}")
+        except tl.TimelineError:
+            check(True, f"gecersiz-ken-burns-reddedilir:{sorted(bad)[0]}")
+
+    ffmpeg_bin, ffprobe_bin = ru.resolve_ffmpeg_binaries()
+    if not ffmpeg_bin:
+        check(False, "ffmpeg-bulunamadi", "gorsel klip render testi atlandi")
+        return
+
+    root = Path(tempfile.mkdtemp(prefix="turbo_kenburns_"))
+    try:
+        # One real video and one real STILL, so the graph has to handle both in
+        # a single concat -- which is the whole point: a mixed timeline is the
+        # normal case, not an edge case.
+        subprocess.run([ffmpeg_bin, "-y", "-f", "lavfi",
+                        "-i", "testsrc=size=1920x1080:duration=6:rate=30",
+                        "-pix_fmt", "yuv420p", str(root / "a.mp4")],
+                       check=True, capture_output=True)
+        subprocess.run([ffmpeg_bin, "-y", "-f", "lavfi",
+                        "-i", "smptebars=size=1920x1080:duration=1:rate=1",
+                        "-frames:v", "1", str(root / "b.jpg")],
+                       check=True, capture_output=True)
+        subprocess.run([ffmpeg_bin, "-y", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=10",
+                        "-ar", "24000", "-ac", "1", str(root / "nar.wav")],
+                       check=True, capture_output=True)
+
+        sources = {
+            "a": {"relative_path": "a.mp4", "sha256": "a" * 64,
+                  "provider": "pexels", "asset_id": "1", "source_page": None,
+                  "creator": {}, "attribution": "", "license_note": "",
+                  "probed": {"duration_sec": 6.0, "width": 1920, "height": 1080}},
+            "b": {"relative_path": "b.jpg", "sha256": "b" * 64,
+                  "provider": "pexels", "asset_id": "2", "source_page": None,
+                  "creator": {}, "attribution": "", "license_note": "",
+                  "probed": {"duration_sec": 0.0, "width": 1920, "height": 1080}},
+        }
+        clips = tl.pack_clips(sources, total_duration_sec=10.0,
+                              clip_duration_sec=5.0, fps=30, order=["a", "b"],
+                              frame_defaults={"mode": "fit", "zoom": 1.0,
+                                              "focus_x": 0.5, "focus_y": 0.5},
+                              ken_burns_defaults={"direction": "right",
+                                                  "amount": 0.2})
+        by_kind = {c["source_id"]: c for c in clips}
+        check(by_kind["a"]["kind"] == "video" and by_kind["b"]["kind"] == "image",
+              "klip-turleri-manifeste-yazildi",
+              str([(c["source_id"], c["kind"]) for c in clips]))
+        check(by_kind["b"]["ken_burns"] == {"direction": "right", "amount": 0.2},
+              "gorsele-ken-burns-verildi", str(by_kind["b"]["ken_burns"]))
+        check(by_kind["a"]["ken_burns"] is None,
+              "VIDEOYA-ken-burns-VERILMEDI",
+              "pan etmeyen goruntu icin parmak izi degismemeli")
+        check(by_kind["b"]["stream_loop"] == 0,
+              "gorsel-stream_loop-KULLANMIYOR", str(by_kind["b"]["stream_loop"]))
+        # The duration accounting must survive the new clip type.
+        tl.assert_gapless(clips, 10.0)
+        check(True, "gorselli-zaman-cizelgesi-BOSLUKSUZ")
+
+        manifest = _manifest(clips, ["a", "b"], total=10.0)
+        graph = tl.build_filter_complex(manifest)
+        check("zoompan" in graph, "grafikte-zoompan-var")
+        check(graph.count("zoompan") == 1,
+              "yalnizca-GORSEL-klip-zoompan-aliyor", str(graph.count("zoompan")))
+
+        args = tl.build_ffmpeg_args(
+            manifest, resolve=lambda c: root / c["source"]["relative_path"],
+            narration_path=root / "nar.wav", output_path=root / "final.mp4",
+            graph_path=tl.write_graph(graph, root / "graph.txt"),
+            preset="final")
+        check("-loop" in args, "gorsel-girdi-loop-ile-besleniyor")
+        image_at = args.index(str(root / "b.jpg"))
+        image_args = args[image_at - 5:image_at + 1]
+        check(image_args[:3] == ["-loop", "1", "-t"],
+              "gorsel-girdisi-LOOP-ile-basliyor", str(image_args))
+        check("-ss" not in image_args, "gorselde-ss-KULLANILMIYOR",
+              "fotografta aranacak bir zaman ekseni yok")
+
+        # The decisive check: ffmpeg actually accepts this graph. A zoompan
+        # expression that is merely plausible fails here, not in production.
+        ru.run_ffmpeg(ffmpeg_bin, args)
+        check((root / "final.mp4").is_file(),
+              "GORSEL-VE-VIDEO-birlikte-RENDER-oldu")
+
+        probe = subprocess.run(
+            [ffprobe_bin, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,sample_aspect_ratio,nb_frames",
+             "-of", "csv=p=0", str(root / "final.mp4")],
+            capture_output=True, text=True).stdout.strip()
+        width, height, sar, frames = probe.split(",")
+        check((width, height) == ("1080", "1920"), "gorselli-cikti-9:16",
+              f"{width}x{height}")
+        check(sar == "1:1", "gorselli-cikti-SAR-kare", sar)
+        check(abs(int(frames) - 10 * 30) <= 2,
+              "gorsel-SLOTUNU-TAM-dolduruyor",
+              f"{frames} kare, beklenen {10 * 30}")
+
+        # Ken Burns must be a real difference in the PIXELS, not just a string
+        # in the graph. Compared as RAW rgb24, because encoded frames differ by
+        # compression noise even when nothing moved -- an earlier version of
+        # this check compared PNG bytes and passed with the motion disabled.
+        # Measured separation: ~95 mean absolute difference with the pan, 0.004
+        # without it, so the threshold is nowhere near either value.
+        def _raw_frame(second):
+            done = subprocess.run(
+                [ffmpeg_bin, "-v", "error", "-ss", str(second),
+                 "-i", str(root / "final.mp4"), "-frames:v", "1",
+                 "-vf", "scale=64:114", "-pix_fmt", "rgb24",
+                 "-f", "rawvideo", "-"], capture_output=True)
+            return done.stdout
+
+        early, late = _raw_frame(6.2), _raw_frame(9.5)
+        span_bytes = min(len(early), len(late))
+        difference = (sum(abs(early[i] - late[i]) for i in range(span_bytes))
+                      / span_bytes) if span_bytes else 0.0
+        check(span_bytes > 0, "hareket-olcumu-kare-okuyabildi", str(span_bytes))
+        check(difference > 5.0, "GORSEL-GERCEKTEN-HAREKET-EDIYOR",
+              f"ortalama mutlak fark {difference:.3f}; hareketsiz fotograf "
+              "bozuk video gibi gorunur")
+
+        # And the fingerprint has to notice a Ken Burns change, or a revision
+        # would report success while rendering the identical file.
+        before = tl.render_fingerprint(manifest)
+        moved = json.loads(json.dumps(manifest))
+        for clip in moved["clips"]:
+            if clip["kind"] == "image":
+                clip["ken_burns"] = {"direction": "left", "amount": 0.2}
+        check(tl.render_fingerprint(moved) != before,
+              "ken-burns-degisimi-PARMAK-IZINI-degistiriyor")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_music_licensing():
     section("N. Muzik lisansi (hicbir parca telifsiz ilan edilmez)")
 
@@ -1677,6 +1823,7 @@ def main():
     test_timeline_packing()
     test_timeline_revisions()
     test_real_render()
+    test_image_clips_and_ken_burns()
     test_music_licensing()
     test_render_gating()
     test_env_contract()
