@@ -262,8 +262,17 @@ tekrarlanmaz.
 - Fault-injection, tarayıcı, yerel kabul ve gerçek kaynak preview testleri.
 - İki geçişli tam kaynak taraması, output-slot izolasyonu ve batch render mekaniği.
 - Long-form kalıcı aşamalar, kota/billing blokları ve yeniden başlatılabilir TTS defteri.
-- Stok medya adaptörleri, sağlayıcı/secret güvenliği ve telif iddiası yapmayan kayıtlar.
+- Stok medya adaptörleri (Pexels, Pixabay, **Coverr**), sağlayıcı/secret güvenliği,
+  CDN alan adı allowlist'i ve telif iddiası yapmayan kayıtlar.
 - Turbo Studio aşama grafiği, timeline/FFmpeg motoru, müzik lisans durumu ve arşivleme.
+- Turbo dinamik altyazı: aktif kelime vurgulu ASS, ana render yoluyla **ortak**
+  yardımcılar; hizalama başarısızsa SRT'ye bozunuyor ve bayat ASS siliniyor.
+- Caption teması tek kontrol: ASS ve SRT görünümü aynı profilden türüyor,
+  tema değişimi altyazıyı yeniden ürettiriyor (`force_style` ile ezmiyor).
+- Görsel klip desteği ve Ken Burns hareketi; video+görsel karışık timeline
+  gerçek FFmpeg render'ıyla doğrulandı, hareket piksel düzeyinde ölçülüyor.
+- Turbo script üretiminde çapraz sağlayıcı zinciri (Google → Groq → Cloudflare);
+  geçiş artefakta yazılıyor, güvenlik reddi başka sağlayıcıya taşınmıyor.
 
 Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları arşivdedir.
 
