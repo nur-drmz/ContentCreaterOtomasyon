@@ -118,13 +118,21 @@ def build_segments(artifact, *, low_confidence_threshold: float) -> list:
         start = cue.get("start")
         end = cue.get("end")
         members = _words_in(words, start, end) if words else []
-        probabilities = [float(w.get("probability") or 0.0) for w in members
-                         if w.get("probability") is not None]
+        probabilities = [float(w.get("probability")) for w in members
+                         if isinstance(w.get("probability"), (int, float))
+                         and not isinstance(w.get("probability"), bool)]
+        # `probability is None` means a HUMAN wrote this word, so there is no
+        # recogniser confidence to doubt (see `_rewrite_segment_words`). Reading
+        # None as 0.0 flagged every hand-fixed word as "unsure" and sent the
+        # reviewer back to re-check what they had just corrected -- the exact
+        # outcome that code comment says must not happen.
         low = [
             {"text": w.get("text"), "probability": w.get("probability"),
              "start_sec": w.get("start")}
             for w in members
-            if float(w.get("probability") or 0.0) < low_confidence_threshold
+            if isinstance(w.get("probability"), (int, float))
+            and not isinstance(w.get("probability"), bool)
+            and float(w.get("probability")) < low_confidence_threshold
         ]
         identifier = segment_id(index)
         segments.append({

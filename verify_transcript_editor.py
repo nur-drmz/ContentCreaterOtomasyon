@@ -190,8 +190,34 @@ def main() -> int:
           "ayni-kelime-sayisi-zamanlamayi-KORUR",
           "hizalama hayattayken tahmine gecmek vurguyu sesten ayirir")
     check(all(w.get("probability") is None for w in same["words"]),
-          "duzeltilen-kelime-artik-dusuk-guvenli-degil",
+          "duzeltilen-kelime-probability-None",
           "insanin yazdigi kelimeye ASR guveni atfetmek yaniltir")
+    # Clearing the field is only half the contract: the CONSUMER must stop
+    # counting it. Reading None as 0.0 kept every hand-fixed word flagged
+    # "unsure" and dragged the segment average to zero, so correcting a name
+    # made the transcript look worse than leaving the misrecognition in.
+    same_segments = transcript_edit.build_segments(same, low_confidence_threshold=0.6)
+    check(same_segments[0]["low_confidence_count"] == 0,
+          "duzeltilen-kelime-DUSUK-GUVENLI-SAYILMAZ",
+          str(same_segments[0]["low_confidence_words"]))
+    check(same_segments[0]["average_probability"] is None,
+          "elle-yazilan-segmentin-ortalamasi-0.0-DEGIL",
+          str(same_segments[0]["average_probability"]))
+
+    # Mixed segment: one hand-fixed word must not drag the surviving ASR word's
+    # average down, and must not be listed as low confidence next to it.
+    mixed_base = transcript_edit.ensure_v2({
+        "words": [{"text": "Rainer", "start": 0.0, "end": 0.5, "probability": 0.41},
+                   {"text": "flew", "start": 0.5, "end": 0.9, "probability": 0.95}],
+        "cues": [{"start": 0.0, "end": 0.9, "text": "Rainer flew"}]})
+    mixed = transcript_edit.apply_segment_texts(mixed_base, [("seg_0001", "Rhaenyra flew")])
+    mixed_segments = transcript_edit.build_segments(mixed, low_confidence_threshold=0.6)
+    check(mixed_segments[0]["average_probability"] == 0.95,
+          "karisik-segment-ortalamasi-yalnizca-ASR-kelimelerinden",
+          str(mixed_segments[0]["average_probability"]))
+    check(mixed_segments[0]["low_confidence_count"] == 0,
+          "karisik-segmentte-elle-yazilan-kelime-sayilmaz",
+          str(mixed_segments[0]["low_confidence_words"]))
 
     grown = transcript_edit.apply_segment_texts(base, [("seg_0001", "the rider of Sheepstealer")])
     check(len(grown["words"]) == 4, "kelime-sayisi-degisebilir")
@@ -370,6 +396,138 @@ def main() -> int:
     call(api, "POST", f"/api/projects/{pid}/transcript/segments",
          {"segments": [{"id": "seg_0002", "text": "Sheepstealer's rider"}]})
 
+    # --- legacy /transcript/corrections must keep the v2 fields -------------
+    # The word-level path predates revisions. Rebuilding without `asr` made the
+    # builder seed a fresh snapshot from the ALREADY-CORRECTED words, so "restore
+    # the raw recognition" would hand back the corrections -- the one escape
+    # hatch a reviewer has, quietly welded shut.
+    legacy_root = Path(tempfile.mkdtemp(prefix="transcript_legacy_"))
+    TMP.append(legacy_root)
+    legacy_app = make_app(legacy_root)
+    legacy_api = ConsoleApi(legacy_app)
+    legacy_pid, legacy_svc = build_project(legacy_app, legacy_api, title="Eski duzeltme yolu")
+    seed_transcript(legacy_svc)
+    # One segment edit first, so there is real v2 history to lose.
+    call(legacy_api, "POST", f"/api/projects/{legacy_pid}/transcript/segments",
+         {"segments": [{"id": "seg_0001", "text": "Rhaena flew north"}]})
+    pre = legacy_svc.load_artifact("moment_transcript")["data"]
+    pre_asr_text = ((pre.get("asr") or {}).get("text") or "")
+    pre_revisions = len(pre.get("revisions") or [])
+    pre_edited = list(pre.get("edited_segment_ids") or [])
+    check(bool(pre_asr_text) and pre_revisions >= 1 and pre_edited == ["seg_0001"],
+          "eski-yol-on-kosul",
+          f"asr={bool(pre_asr_text)} rev={pre_revisions} edited={pre_edited}")
+
+    status, payload = call(legacy_api, "POST",
+                           f"/api/projects/{legacy_pid}/transcript/corrections",
+                           {"corrections": [{"from": "Steelers", "to": "Sheepstealer"}],
+                            "edited_by": "verify"})
+    check(status == 200, "eski-yol-hala-calisiyor", f"HTTP {status}")
+    post = legacy_svc.load_artifact("moment_transcript")["data"]
+    check(((post.get("asr") or {}).get("text") or "") == pre_asr_text,
+          "eski-yol-HAM-ASR-i-KORUYOR",
+          f"{((post.get('asr') or {}).get('text') or '')!r} != {pre_asr_text!r}")
+    check(not (post.get("asr") or {}).get("reconstructed"),
+          "eski-yol-asr-i-yeniden-uydurmadi",
+          str((post.get("asr") or {}).get("reconstructed")))
+    check(len(post.get("revisions") or []) > pre_revisions,
+          "eski-yol-revizyon-gecmisini-KORUYOR-ve-kendini-EKLIYOR",
+          f"{pre_revisions} -> {len(post.get('revisions') or [])}")
+    check(list(post.get("edited_segment_ids") or []) == pre_edited,
+          "eski-yol-duzenlenmis-segment-kumesini-KORUYOR",
+          str(post.get("edited_segment_ids")))
+    check("Sheepstealer" in (post.get("text") or ""),
+          "eski-yol-duzeltmeyi-yine-de-UYGULUYOR", str(post.get("text"))[:80])
+    # And the escape hatch still works after the legacy path ran.
+    status, payload = call(legacy_api, "POST",
+                           f"/api/projects/{legacy_pid}/transcript/restore-asr", {})
+    restored = payload.get("transcript", {}).get("full_text", "")
+    # Must contain the word the recogniser ACTUALLY heard ("Rainer"), not the
+    # corrected one: asserting only the untouched second line let a broken
+    # rebuild pass, because that line was never corrected in the first place.
+    check(status == 200 and "Rainer flew north" in restored
+          and "Steelers Rider!" in restored,
+          "eski-yol-sonrasi-ham-ASR-GERI-YUKLENEBILIYOR", repr(restored)[:90])
+
+    # --- re-transcription must not silently eat the manual edits -------------
+    # Its OWN project: a re-run replaces the transcript wholesale, so doing this
+    # on the shared fixture would pull the rug from the downstream checks below.
+    retr_root = Path(tempfile.mkdtemp(prefix="transcript_retranscribe_"))
+    TMP.append(retr_root)
+    retr_app = make_app(retr_root)
+    retr_api = ConsoleApi(retr_app)
+    retr_pid, retr_svc = build_project(retr_app, retr_api, title="Yeniden transkripsiyon")
+    seed_transcript(retr_svc)
+    call(retr_api, "POST", f"/api/projects/{retr_pid}/transcript/segments",
+         {"segments": [{"id": "seg_0002", "text": "Sheepstealer's rider"}]})
+    before = retr_svc.load_artifact("moment_transcript")["data"]
+    before_edited = list(before.get("edited_segment_ids") or [])
+    check(before_edited == ["seg_0002"], "yeniden-transkripsiyon-on-kosul",
+          str(before_edited))
+
+    def _retranscribe(app_api, project_id):
+        previous_mod = install_fake_whisper({})
+        try:
+            return call(app_api, "POST", f"/api/projects/{project_id}/jobs",
+                        {"job_type": "transcript",
+                         "params": {"subtitle_whisper_model_size": "tiny",
+                                     "subtitle_language": "en"}})
+        finally:
+            if previous_mod is None:
+                sys.modules.pop("faster_whisper", None)
+            else:
+                sys.modules["faster_whisper"] = previous_mod
+
+    status, payload = _retranscribe(retr_api, retr_pid)
+    job = (payload or {}).get("job") or {}
+    check(job.get("status") == "review_required", "yeniden-transkripsiyon-isi-basarili",
+          f"HTTP {status} {job.get('status')}: {str(job.get('error'))[:160]}")
+
+    after = retr_svc.load_artifact("moment_transcript")["data"] or {}
+    # Archiving MOVES the old file, so a crash between the move and the write
+    # would leave the slot empty. Prove the replacement actually landed.
+    check(bool(after.get("words")), "yeniden-transkripsiyon-artefakti-YERINDE",
+          "arsivleme sonrasi transcript ortada kalmis")
+    replaced = after.get("replaced_manual_edit") or {}
+    check(bool(replaced), "yeniden-transkripsiyon-SESSIZ-DEGIL",
+          "elle duzenleme ustune yazildi ama artefakt bunu bildirmiyor")
+    check(replaced.get("edited_segment_ids") == before_edited,
+          "arsiv-kaydi-hangi-segmentlerin-dustugunu-soyluyor", str(replaced))
+
+    archived_revisions = [r for r in retr_svc.revisions(limit=100)
+                          if r.get("action") == "retranscribe"]
+    check(len(archived_revisions) == 1, "eski-surum-ARSIVLENDI",
+          str([r.get("action") for r in retr_svc.revisions(limit=100)]))
+    check(archived_revisions[0]["revision_id"] == replaced.get("revision_id"),
+          "artefakt-arsivi-isaret-ediyor",
+          f"{replaced.get('revision_id')} != {archived_revisions[0]['revision_id']}")
+
+    # An archive nobody can read back is the same as a delete.
+    archived_path = retr_svc.storage.resolve(
+        retr_svc.ownership, ".revisions", archived_revisions[0]["revision_id"],
+        retr_svc.artifact_relative("moment_transcript", 1))
+    check(archived_path.is_file(), "arsivlenen-dosya-diskte", str(archived_path))
+    archived_data = json.loads(archived_path.read_text(encoding="utf-8"))
+    check(archived_data.get("text") == before.get("text"),
+          "arsivlenen-icerik-onceki-surumun-AYNISI",
+          repr(archived_data.get("text"))[:80])
+
+    # A re-run over pure recogniser output must stay quiet: ceremony for nothing
+    # trains the user to ignore the warning that matters.
+    clean_root = Path(tempfile.mkdtemp(prefix="transcript_clean_rerun_"))
+    TMP.append(clean_root)
+    clean_app = make_app(clean_root)
+    clean_api = ConsoleApi(clean_app)
+    clean_pid, clean_svc = build_project(clean_app, clean_api, title="Duzenlenmemis")
+    seed_transcript(clean_svc)
+    _retranscribe(clean_api, clean_pid)
+    clean_after = clean_svc.load_artifact("moment_transcript")["data"] or {}
+    check(not clean_after.get("replaced_manual_edit"),
+          "elle-emek-yokken-ARSIV-UYARISI-YOK", str(clean_after.get("replaced_manual_edit")))
+    check(not [r for r in clean_svc.revisions(limit=100)
+               if r.get("action") == "retranscribe"],
+          "elle-emek-yokken-yeni-arsiv-YOK", "gereksiz arsiv olusturuldu")
+
     # 5. downstream: the render refuses while the transcript approval is stale.
     # The render must refuse for the TRANSCRIPT's sake, so it is called with the
     # approved plan's own settings -- otherwise config drift rejects it first and
@@ -493,15 +651,29 @@ def main() -> int:
 
     glossary_view = service.glossary_view()
     check(glossary_view["term_count"] == 2, "sozluk-kalici", str(glossary_view["term_count"]))
-    check(bool(glossary_view.get("suggestions")), "manuel-duzeltme-terim-onerisi-uretti",
-          json.dumps(glossary_view.get("suggestions") or [])[:100])
+    suggested_terms = [item.get("term") for item in (glossary_view.get("suggestions") or [])]
+    check(bool(suggested_terms), "manuel-duzeltme-terim-onerisi-uretti",
+          json.dumps(suggested_terms)[:120])
+    # The whole point of the phrase case: "Steelers Rider!" -> "Sheepstealer's
+    # rider" teaches a TWO-WORD name. Proposing only "Sheepstealer's" loses the
+    # half that makes it one, and "rider" alone is correctly dropped as an
+    # ordinary lowercase word -- so a per-word proposal silently forgets the
+    # name the human just taught.
+    check("Sheepstealer's rider" in suggested_terms,
+          "TAM-IFADE-terim-onerisi-uretildi", json.dumps(suggested_terms)[:160])
+    check("Sheepstealer's" not in suggested_terms,
+          "yarim-isim-ayrica-onerilmiyor", json.dumps(suggested_terms)[:160])
 
     check(bool(fixtures.PROVIDER_CALLS) is False, "sifir-saglayici-cagrisi",
           str(len(fixtures.PROVIDER_CALLS)))
 
     # ================================================== 1/9. gercek tarayici
     section("1+9. Tarayici: transkript gorunur, butonlar hatadan sonra geri geliyor")
-    browser_ok = run_browser_checks(app, pid)
+    # A second project in the SAME app: switching between them exercises the
+    # in-memory draft state, which a full page reload would hide.
+    other_pid, other_svc = build_project(app, api, title="Ikinci proje")
+    seed_transcript(other_svc)
+    browser_ok = run_browser_checks(app, pid, other_pid)
     if not browser_ok:
         print("  (tarayici bolumu atlandi)")
 
@@ -516,7 +688,7 @@ def main() -> int:
     return 0
 
 
-def run_browser_checks(app, pid) -> bool:
+def run_browser_checks(app, pid, other_pid) -> bool:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -541,9 +713,28 @@ def run_browser_checks(app, pid) -> bool:
                   page.locator("[data-testid=seg-time-seg_0001]").inner_text())
             check("guven" in page.locator("[data-testid=seg-conf-seg_0001]").inner_text(),
                   "1-ui-guven-skoru-gosteriyor")
-            check(page.locator("[data-testid=seg-low-seg_0002] .transcript-word--unsure")
-                  .count() > 0,
-                  "1-ui-dusuk-guvenli-kelimeleri-isaretliyor")
+            # Which segments still HAVE low-confidence words depends on what the
+            # console section edited above, so pinning one segment id made this
+            # check a hostage of unrelated edits. Assert the contract instead:
+            # the UI marks exactly what the server counts -- no more, no fewer.
+            _svc = app.service(app.ownership(pid))
+            _segments = _svc.transcript_view()["segments"]
+            for _seg in _segments:
+                _marked = page.locator(
+                    f"[data-testid=seg-low-{_seg['id']}] .transcript-word--unsure").count()
+                check(_marked == _seg["low_confidence_count"],
+                      f"1-ui-dusuk-guven-{_seg['id']}-sunucuyla-tutarli",
+                      f"UI {_marked} isaret / sunucu {_seg['low_confidence_count']}")
+            # And the point of the whole exercise: a segment a human rewrote
+            # carries no ASR confidence, so it must show NO "unsure" markers --
+            # re-flagging a word the reviewer already fixed sends them back to
+            # re-check their own correction.
+            _edited = [s for s in _segments if s.get("edited")]
+            check(bool(_edited), "1-ui-duzenlenmis-segment-var",
+                  "duzenlenmis segment yok; kontrol bos gecerdi")
+            check(all(s["low_confidence_count"] == 0 for s in _edited),
+                  "1-ui-elle-duzeltilen-segment-UNSURE-degil",
+                  str([(s["id"], s["low_confidence_count"]) for s in _edited]))
             check(page.locator("[data-testid=transcript-full-input]").count() == 1,
                   "1-ui-tum-metin-duzenleyicisi-var")
             check(page.locator("[data-testid=glossary-input]").count() == 1,
@@ -585,6 +776,38 @@ def run_browser_checks(app, pid) -> bool:
             check(page.input_value("[data-testid=seg-input-seg_0001]") == "Rhaena flew north",
                   "3-ui-yenilemeden-sonra-metin-duruyor",
                   page.input_value("[data-testid=seg-input-seg_0001]"))
+
+            # --- drafts must not follow the user into another project --------
+            # Segment ids repeat across projects, so an UNSAVED draft that
+            # survived a project switch would sit under the other project's
+            # identical id and a Save would write these words into a transcript
+            # they were never typed for. Switched through the app's own
+            # history/popstate path, not a reload: a reload rebuilds state from
+            # scratch and would hide the bug entirely.
+            leaked = "BU METIN DIGER PROJEYE GECMEMELI"
+            page.fill("[data-testid=seg-input-seg_0001]", leaked)
+            page.fill("[data-testid=transcript-full-input]", leaked)
+            page.fill("[data-testid=glossary-input]", leaked)
+            page.wait_for_timeout(300)
+            page.evaluate(
+                """(target) => {
+                    const url = new URL(location.href);
+                    url.searchParams.set('project', target);
+                    history.pushState(null, '', url);
+                    window.dispatchEvent(new PopStateEvent('popstate'));
+                }""", other_pid)
+            page.wait_for_timeout(2500)
+            page.wait_for_selector("[data-testid=transcript-segments]", timeout=20000)
+            check(page.input_value("[data-testid=seg-input-seg_0001]") == "Rainer flew north",
+                  "proje-degisince-segment-taslagi-SIZMIYOR",
+                  page.input_value("[data-testid=seg-input-seg_0001]"))
+            check(leaked not in page.input_value("[data-testid=transcript-full-input]"),
+                  "proje-degisince-tam-metin-taslagi-SIZMIYOR",
+                  page.input_value("[data-testid=transcript-full-input]")[:60])
+            check(leaked not in page.input_value("[data-testid=glossary-input]"),
+                  "proje-degisince-sozluk-taslagi-SIZMIYOR",
+                  page.input_value("[data-testid=glossary-input]")[:60])
+
             browser.close()
         return True
     finally:
