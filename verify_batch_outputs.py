@@ -150,6 +150,10 @@ def main() -> int:
     check(slot_dirs[1:] == ["output_02", "output_03"], "slot-n-isolated-dirs",
           f"{slot_dirs}")
 
+    # Plan approval is gated on the copyright checklist; this suite is not
+    # about that gate, so it answers it and moves on. verify_copyright_gate.py
+    # is what proves the gate really blocks.
+    fixtures.complete_copyright_review(app, pid, actor="verify_batch")
     digest = service.describe_plan_review()["review"]["content_sha256"]
     status, _ = call(api, "POST", f"/api/projects/{pid}/approvals/processing_plan",
                      {"reviewed_sha256": digest, "approved_by": "verify_batch"})

@@ -546,6 +546,27 @@ class ConsoleApi:
                     slot=slot)}
             raise ApiError("validation_failed", detail=f"eylem: {action!r}")
 
+        if rest == ["copyright-review"] and method == "GET":
+            return 200, {"copyright_review": service.copyright_review_state()}
+
+        if rest == ["copyright-review"] and method == "POST":
+            payload = _json_body(body)
+            action = payload.get("action") or "set_item"
+            if action == "set_item":
+                return 200, {"copyright_review": service.set_copyright_review_item(
+                    payload.get("key", ""), checked=bool(payload.get("checked")),
+                    reviewed_by=payload.get("reviewed_by") or service.project_actor(),
+                    note=payload.get("note", ""))}
+            if action == "request_revision":
+                return 200, {"copyright_review": service.request_copyright_revision(
+                    requested_by=payload.get("requested_by") or service.project_actor(),
+                    notes=_required({"note": payload.get("notes")}, "note"),
+                    target_tab=payload.get("target_tab", "phase0"))}
+            if action == "clear_revision":
+                return 200, {"copyright_review": service.clear_copyright_revision(
+                    cleared_by=payload.get("resolved_by") or service.project_actor())}
+            raise ApiError("validation_failed", detail=f"eylem: {action!r}")
+
         if rest == ["voice-review"] and method == "GET":
             return 200, {"voice_review": service.voice_review_state()}
 

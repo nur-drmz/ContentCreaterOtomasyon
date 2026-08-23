@@ -147,6 +147,8 @@ def main() -> int:
         "notes": "IZOLE TEST PLANI - kullanicinin gercek projesi degildir"})
     check(status == 201 and payload["plan"]["status"] == "review_required",
           "plan-created", f"HTTP {status}, status={payload['plan']['status']}")
+    # Same gate, same reasoning as above: answered here, PROVEN elsewhere.
+    fixtures.complete_copyright_review(app, pid, actor="verify_real_preview")
     digest = service.describe_plan_review()["review"]["content_sha256"]
     status, payload = call(api, "POST", f"/api/projects/{pid}/approvals/processing_plan",
                            {"reviewed_sha256": digest,

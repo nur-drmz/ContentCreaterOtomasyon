@@ -1885,6 +1885,9 @@ function screenPhase0() {
       ? el('div', { class: 'stack' },
           el('pre', { class: 'pre', text: phase0.plan_panel || '' }),
           phase0PlanEditor(phase0, selectedPlanMode),
+          // Plan approval is gated on this list server-side, so it has to be
+          // answerable HERE. A gate the console cannot satisfy is a wall.
+          copyrightReviewCard(),
           approvalPanel('processing_plan', 'Plani onayla'))
       : el('div', { class: 'stack' },
           el('div', { class: 'dim', text: `Karari kaydeden: ${projectActor()}` }),
@@ -2242,6 +2245,19 @@ function approvalPanel(kind, actionLabel) {
   const approval = (state.project.approvals || {})[kind] || {};
   if (!approval.present) {
     return el('div', { class: 'muted', text: 'Onaylanacak artefakt henuz uretilmedi.' });
+  }
+  // The plan carries a checklist gate like the render and voice screens do, and
+  // the same rule applies: hide the button rather than let the click bounce off
+  // a server refusal. `PipelineService.approve` refuses independently, so this
+  // is a courtesy, not the gate itself.
+  if (kind === 'processing_plan') {
+    const rights = (state.project.copyright_review) || {};
+    const rightsOpen = Boolean(rights.complete && !rights.open_revision);
+    if ((rights.items || []).length && !rightsOpen) {
+      return alertBox('warn', 'Once telif kontrol listesini tamamla',
+        rights.blocker || 'Plan onayi telif sorulari cevaplanmadan acilmaz.',
+        'Sorular yukaridaki karttadir.');
+    }
   }
   return el('div', { class: 'stack' },
     el('div', { class: 'row' },
@@ -3317,6 +3333,15 @@ const REVIEW_KINDS = {
               ['render', 'Render Studio (yeniden render)'],
               ['phase0', 'Faz 0 (plan / render ayarlari)']],
   },
+  copyright: {
+    viewKey: 'copyright_review', endpoint: 'copyright-review',
+    testid: (name) => `copyright-${name}`,
+    mediaNoun: 'kaynak video', regeneratedNoun: 'kaynak degisirse',
+    revisionLead: 'Bir dayanak eksik gorunuyorsa not birak. Bu islem hicbir sey '
+                  + 'onaylamaz ve sistem telif hakkinda bir sonuca VARMAZ.',
+    targets: [['phase0', 'Faz 0 (kaynak / plan)'],
+              ['moments', 'Moment Explorer (daha kisa moment sec)']],
+  },
   voice: {
     viewKey: 'voice_review', endpoint: 'voice-review',
     testid: (name) => `voice-${name}`,
@@ -3327,6 +3352,23 @@ const REVIEW_KINDS = {
               ['script', 'Script Studio (metni duzelt)']],
   },
 };
+
+/* The rights questions, shown on the plan screen because that is where the
+ * gate is. Deliberately reuses the shared checklist component: the digest
+ * binding, the staleness warning and the "who ticked it" record are the same
+ * rules the render and voice lists follow. */
+function copyrightReviewCard() {
+  const review = (state.project && state.project.copyright_review) || {};
+  if (!(review.items || []).length) return null;
+  const source = review.source || {};
+  return el('div', { class: 'stack', 'data-testid': 'copyright-review' },
+    el('div', { class: 'dim',
+      text: `Telif sorulari su kaynak icin: ${source.display_name || '(kaynak yok)'}` }),
+    el('p', { class: 'dim',
+      text: 'Sistem bu icerigin adil kullanim oldugunu IDDIA ETMEZ. Sorular '
+            + 'senin cevaplarindir ve artefakta kaydedilir.' }),
+    reviewChecklist('copyright'));
+}
 
 function reviewChecklist(kind) {
   const config = REVIEW_KINDS[kind];

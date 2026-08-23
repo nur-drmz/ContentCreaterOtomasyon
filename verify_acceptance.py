@@ -52,6 +52,7 @@ except ImportError:  # pragma: no cover
           "'python -m playwright install chromium' calistir.")
     sys.exit(2)
 
+from creator_console import copyright_review  # noqa: E402
 from creator_console import fixtures  # noqa: E402
 from creator_console.api import ConsoleApi  # noqa: E402
 from creator_console.app import ConsoleApp, ConsoleConfig  # noqa: E402
@@ -318,6 +319,26 @@ def main(argv=None) -> int:
             goto(page, base, "phase0", pid)
             check(page.locator("#processing_plan-hash").count() == 0,
                   "plan:no-manual-hash", "hash kopyalama alani gorunuyor")
+
+            # The rights questions gate this approval. Answered THROUGH THE UI,
+            # because a server gate the console cannot satisfy is a wall -- and
+            # that is exactly what this suite exists to catch.
+            check(page.locator("[data-testid=approve-processing_plan]").count() == 0,
+                  "rights:approval-hidden-until-answered",
+                  "telif listesi bosken plan onay dugmesi acik")
+            boxes = page.locator("[data-testid^=copyright-checkbox-]")
+            check(boxes.count() == len(copyright_review.CHECKLIST_KEYS),
+                  "rights:questions-visible", f"{boxes.count()} soru")
+            for index in range(boxes.count()):
+                page.locator("[data-testid^=copyright-checkbox-]").nth(index).click()
+                page.wait_for_timeout(500)
+            rights_state = service.copyright_review_state()
+            check(rights_state["complete"], "rights:answered-through-ui",
+                  f"{rights_state['done_count']}/{rights_state['total_count']}")
+            check(rights_state["items"][0].get("checked_by"),
+                  "rights:answer-records-WHO",
+                  "cevabi kimin verdigi kayitli olmali")
+            page.wait_for_selector("[data-testid=approve-processing_plan]", timeout=10000)
             page.locator("[data-testid=approve-processing_plan]").click()
             page.wait_for_timeout(1800)
             allowed, reason = service.plan_gate("video_analysis")

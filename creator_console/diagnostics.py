@@ -130,6 +130,7 @@ class _Fixture:
         if self._video_error is not None:
             raise RuntimeError(self._video_error)
         from .fixtures import make_test_source_video
+        from . import copyright_review
 
         try:
             record = self.app.create_project(title="diagnostics", created_by="diagnostics")
@@ -142,6 +143,13 @@ class _Fixture:
                                            payload=staging.read_bytes(),
                                            registered_by="diagnostics")
             staging.unlink(missing_ok=True)
+            # Plan approval is gated on the copyright checklist. Diagnostics is
+            # not what PROVES that gate works (verify_copyright_gate.py is);
+            # here it only has to be walked so the capability checks can reach
+            # the phases they are actually about.
+            for key in copyright_review.CHECKLIST_KEYS:
+                service.set_copyright_review_item(key, checked=True,
+                                                  reviewed_by="diagnostics")
             self._project = (ownership, service)
         except Exception as exc:  # noqa: BLE001
             self._video_error = f"{type(exc).__name__}: {exc}"

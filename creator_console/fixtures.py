@@ -163,6 +163,21 @@ def write_wav(path, *, seconds: float = 1.0, sample_rate: int = 24000) -> Path:
     return path
 
 
+def complete_copyright_review(app, project_id, *, actor: str = "fixtures") -> dict:
+    """Tick every copyright/transformative-use item for a project.
+
+    Fixtures and tests that are not ABOUT the rights gate use this so they can
+    reach the phases they do test. Anything asserting the gate itself must drive
+    the real service calls instead.
+    """
+    from . import copyright_review
+
+    service = app.service(app.ownership(project_id))
+    for key in copyright_review.CHECKLIST_KEYS:
+        service.set_copyright_review_item(key, checked=True, reviewed_by=actor)
+    return service.copyright_review_state()
+
+
 def seed_demo_project(app, *, title: str = "Demo proje (fixture)") -> dict:
     """Create a project with a real synthetic source video and a fresh assessment.
 
@@ -180,6 +195,11 @@ def seed_demo_project(app, *, title: str = "Demo proje (fixture)") -> dict:
     staging.unlink(missing_ok=True)
 
     assessment = service.run_source_assessment(actor="fixtures")
+    # The copyright checklist gates plan approval, and a fixture stands for an
+    # operator who has already answered it -- the same way the fake credentials
+    # above stand for keys that were already configured. That the gate REALLY
+    # blocks when unanswered is proven in verify_copyright_gate.py, not here.
+    complete_copyright_review(app, ownership.project_id, actor="fixtures")
     return {
         "project_id": ownership.project_id,
         "title": title,

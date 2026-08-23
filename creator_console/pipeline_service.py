@@ -44,6 +44,7 @@ from local_pipeline import (
 
 from .audit import AuditLog
 from . import progress as progress_module
+from . import copyright_review as copyright_review_module
 from . import render_review as render_review_module
 from . import voice_review as voice_review_module
 from .ids import Ownership, new_id, safe_filename
@@ -2009,6 +2010,84 @@ class PipelineService:
             return existing
         return voice_review_module.new_review(self.ownership, self.voice_audio_digest())
 
+    # ------------------------------------------------- copyright review
+    def source_fingerprint(self):
+        """The digest the copyright answers are bound to.
+
+        Deliberately the SOURCE fingerprint, not a render: the question is about
+        the material that was taken, so swapping the source has to reset the
+        answers even if every later artifact still looks fine.
+        """
+        project = self.load_artifact("project")["data"] or {}
+        return ((project.get("source") or {}).get("fingerprint_sha256")) or None
+
+    def copyright_review_state(self) -> dict:
+        review = self.load_artifact_path(
+            copyright_review_module.COPYRIGHT_REVIEW_ARTIFACT)
+        state = copyright_review_module.evaluate(
+            review, self.source_fingerprint(), self.ownership)
+        project = self.load_artifact("project")["data"] or {}
+        source = project.get("source") or {}
+        # Shown next to the questions so the operator answers about THIS file
+        # rather than whichever source they last had open.
+        state["source"] = {
+            "display_name": source.get("display_name"),
+            "registered_at": source.get("registered_at"),
+            "license_type": source.get("license_type"),
+        }
+        return state
+
+    def _save_copyright_review(self, review: dict) -> dict:
+        path = self.storage.resolve(
+            self.ownership, copyright_review_module.COPYRIGHT_REVIEW_ARTIFACT,
+            create_parent=True)
+        atomic_write_json(path, review)
+        return review
+
+    def _load_or_new_copyright_review(self) -> dict:
+        existing = self.load_artifact_path(
+            copyright_review_module.COPYRIGHT_REVIEW_ARTIFACT)
+        if isinstance(existing, dict):
+            return existing
+        return copyright_review_module.new_review(self.ownership,
+                                                  self.source_fingerprint())
+
+    def set_copyright_review_item(self, key: str, *, checked: bool,
+                                  reviewed_by: str, note: str = "") -> dict:
+        digest = self.source_fingerprint()
+        if not digest:
+            raise PipelineServiceError(
+                "Once kaynak video yukle; telif kontrolu kaynaga baglanir.")
+        review = copyright_review_module.set_item(
+            self._load_or_new_copyright_review(), key, checked=checked,
+            source_sha256=digest, reviewed_by=reviewed_by, note=note)
+        self._save_copyright_review(review)
+        self.audit.record(
+            "artifact.written", actor=reviewed_by,
+            artifact=copyright_review_module.COPYRIGHT_REVIEW_ARTIFACT,
+            detail={"checklist_item": key, "checked": checked})
+        return self.copyright_review_state()
+
+    def request_copyright_revision(self, *, requested_by: str, notes: str,
+                                   target_tab: str = "phase0") -> dict:
+        digest = self.source_fingerprint()
+        if not digest:
+            raise PipelineServiceError(
+                "Once kaynak video yukle; telif kontrolu kaynaga baglanir.")
+        review = copyright_review_module.request_revision(
+            self._load_or_new_copyright_review(), source_sha256=digest,
+            notes=notes, requested_by=requested_by, target_tab=target_tab)
+        self._save_copyright_review(review)
+        return self.copyright_review_state()
+
+    def clear_copyright_revision(self, *, cleared_by: str) -> dict:
+        digest = self.source_fingerprint()
+        review = copyright_review_module.clear_revision(
+            self._load_or_new_copyright_review(), source_sha256=digest,
+            resolved_by=cleared_by)
+        self._save_copyright_review(review)
+        return self.copyright_review_state()
+
     def set_voice_review_item(self, key: str, *, checked: bool, reviewed_by: str,
                               note: str = "") -> dict:
         digest = self.voice_audio_digest()
@@ -2062,6 +2141,16 @@ class PipelineService:
         loaded = self.load_artifact(key, required=True, slot=slot)
         if loaded["problem"]:
             raise ArtifactProblem(loaded["problem"])
+        if kind == "processing_plan":
+            # The earliest gate in the pipeline, and the only one that asks
+            # about the SOURCE rather than something this project produced.
+            # Placed here so a project with no basis for its footage is stopped
+            # before any analysis or render time is spent on it.
+            rights = self.copyright_review_state()
+            if not rights["complete"] or rights["open_revision"]:
+                raise PipelineServiceError(
+                    "ONAY REDDEDILDI: "
+                    + (rights["blocker"] or "telif kontrol listesi tamamlanmadi"))
         if kind in ("render", "voiceover"):
             # The hash proves the reviewer saw (or heard) the bytes; the
             # checklist proves they checked the things that actually go wrong.

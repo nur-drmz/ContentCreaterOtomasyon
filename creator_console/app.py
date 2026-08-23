@@ -1218,6 +1218,9 @@ class ConsoleApp:
             "narration_presets": narration_presets.preset_public_list(),
             "render_review": service.render_review_state(),
             "voice_review": service.voice_review_state(),
+            # Gates plan approval, so the panel that answers it has to ship with
+            # the plan screen -- a server gate the UI cannot satisfy is a wall.
+            "copyright_review": service.copyright_review_state(),
             # The workflow map is derived here, from the SAME artifacts and
             # approval chain the pipeline itself uses, and shipped already
             # decided so the browser never re-implements a gate.
