@@ -149,9 +149,23 @@ tekrarlanmaz.
 ### M0.0 — Planlama ve güvenlik
 
 - [ ] MVP PRD ve kabul kriterlerinin kullanıcı son onayı.
+  Taslak hazır: [docs/M0_0_KARAR_PAKETI.md](docs/M0_0_KARAR_PAKETI.md) §1.
+  Kabul kriterleri ölçülmüş/insan-bekleyen diye ayrıldı. **Onay senin.**
 - [ ] Hedef Short türlerinin önceliklendirilmesi: recap, theory, scene explanation vb.
-- [ ] Telif ve dönüştürücü kullanım kontrol listesinin ürün akışına eklenmesi.
+  Envanter çıkarıldı ([karar paketi](docs/M0_0_KARAR_PAKETI.md) §3): kodda ana
+  hatta yalnızca `direct_clip_series` ve `narrated_theory` var; `scene
+  explanation` diye bir tür **yok**. Öncelik sırası senin kararın.
+- [x] Telif ve dönüştürücü kullanım kontrol listesinin ürün akışına eklenmesi.
+  `creator_console/copyright_review.py`: beş soru, Faz 0 **plan onayı kapısı**,
+  kaynak parmak izine bağlı (kaynak değişince sıfırlanır), cevaplayan kişi
+  kayıtlı. Sistem hiçbir hukuki sonuca varmıyor; bunu ayrıca test ediyorum.
+  `verify_copyright_gate.py` **26/26**; `verify_acceptance.py` 114 → **118/118**
+  (sorular UI'dan cevaplanıyor). Tam süpürme **30/30**.
 - [ ] Private upload yetkilendirme sınırının tanımlanması.
+  Sınır koddan çıkarılıp yazılı tanıma dönüştürüldü
+  ([karar paketi](docs/M0_0_KARAR_PAKETI.md) §2): ilk yükleme her zaman
+  `private`, görünürlük değişimi ayrı hash-bağlı insan onayı. **Onay senin**;
+  ayrıca gerçek OAuth ile hiç denenmedi (M0.7).
 
 ### M0.05 — Faz 0 kaynak stratejisi
 
@@ -302,12 +316,13 @@ Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları ar�
 
 | Alan | Son kayıtlı kanıt | Açık insan/gerçek ortam kapısı |
 |---|---|---|
-| Yerel kabul | `verify_acceptance.py` **114/114** | Final Short insan onayı |
+| Yerel kabul | `verify_acceptance.py` **118/118** | Final Short insan onayı |
 | Tam film/batch | `verify_batch_outputs.py` **95/95** | >1 saat gerçek kaynak ve üç Short izleme |
 | Tarayıcı UI | `verify_browser.py` **243/243** | Mobil/erişilebilirlik gözlemi |
 | Canlı Gemini script | `LIVE_SCRIPT_OK`, tek gerçek çağrı | Script kalite yargısı |
 | Canlı Gemini TTS | `LIVE_TTS_OK`, tek gerçek çağrı | WAV/voice karşılaştırmalı dinleme |
 | Short PoC (M0.5) | `verify_short_poc.py` **31/31**, final 1080×1920 | Script okuma, ses dinleme, videoyu izleme |
+| Telif kapısı (M0.0) | `verify_copyright_gate.py` **26/26** | Soruların hukuki yeterliliği kullanıcının yargısı |
 | Long-form | `verify_long_form_studio.py` **97/97** | Billing/kota sonrası gerçek 15–20 dk pilot |
 | Stok medya | `verify_stock_media.py` **41/41** (Pexels, Pixabay, Coverr) | Gerçek sağlayıcı araması; **Coverr şeması canlı doğrulanmadı** |
 | Turbo Studio | `verify_turbo_studio.py` **333/333**, tarayıcı **24/24** | Gerçek sağlayıcılar ve izlenmiş final video |
@@ -336,6 +351,10 @@ Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları ar�
 
 Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive taşınır.
 
+- 2026-08-23 — Telif/dönüştürücü kullanım kapısı eklendi: kaynak videonun hiçbir
+  hak kontrolü yoktu, artık plan onayı beş soru cevaplanmadan açılmıyor.
+  Sunucu kapısı ilk yazımda API/UI'sız kaldı; gerçek tarayıcıyı süren
+  `verify_acceptance` yakaladı. Tam süpürme **30/30**.
 - 2026-08-23 — Turbo yetenek farkı kapandı: dinamik ASS, caption teması, Coverr,
   görsel klip + Ken Burns, çapraz sağlayıcı script zinciri. `verify_turbo_studio`
   260 → **333/333**, `verify_stock_media` 29 → **41/41**; tam süpürme **28/28**.
@@ -356,7 +375,3 @@ Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive
 - 2026-08-23 — P0 transcript/glossary stabilizasyon testleri yeniden ölçüldü:
   `verify_transcript_editor` 113/113, `verify_revision_flow` 39/39,
   `verify_diagnostics` 110/110; ilgili 10 regresyon paketi tamamen yeşil.
-- 2026-08-23 — `main` `origin`e push edildi (`a53b751`); MoneyPrinter/Turbo fark
-  kapatma oturumu başladı. Edge-TTS (kimliksiz fallback), ses hızı normalizasyonu
-  ve WAV chunk yürütme hatası çözüldü (`914f133`). ASS aktif-kelime vurgusu
-  Turbo'ya bağlandı; aynı gün doğrulanıp commitlendi (`5a0f25f`).
