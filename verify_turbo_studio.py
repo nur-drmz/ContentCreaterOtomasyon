@@ -724,6 +724,181 @@ def _manifest(clips, order, *, total, width=1080, height=1920, music=False):
         settings_snapshot={"encode": {}})
 
 
+class _FakeWhisperWord:
+    def __init__(self, word, start, end, probability=0.9):
+        self.word, self.start, self.end = word, start, end
+        self.probability = probability
+
+
+class _FakeWhisperSegment:
+    def __init__(self, start, end, text, words):
+        self.start, self.end, self.text, self.words = start, end, text, words
+
+
+def install_fake_whisper(*, with_words: bool):
+    """Replace faster_whisper so the caption stage is testable without a model.
+
+    `with_words=False` returns segments that carry NO word timestamps, which is
+    exactly how `transcribe_for_dynamic_captions` reports the degraded path
+    (`faster-whisper-segment-fallback`). Running a real 39 MB model here would
+    prove nothing extra and would make the assertions depend on what it happens
+    to hear.
+    """
+    import types
+
+    module = types.ModuleType("faster_whisper")
+
+    class FakeModel:
+        def __init__(self, size, **kwargs):
+            pass
+
+        def transcribe(self, path, **kwargs):
+            words = ([_FakeWhisperWord("Roma", 0.0, 0.6),
+                       _FakeWhisperWord("neden", 0.6, 1.2),
+                       _FakeWhisperWord("coktu", 1.2, 2.0)]
+                     if with_words else [])
+            segment = _FakeWhisperSegment(0.0, 2.0, "Roma neden coktu", words)
+            return iter([segment]), object()
+
+    module.WhisperModel = FakeModel
+    previous = sys.modules.get("faster_whisper")
+    sys.modules["faster_whisper"] = module
+    return previous
+
+
+def _restore_whisper(previous):
+    if previous is None:
+        sys.modules.pop("faster_whisper", None)
+    else:
+        sys.modules["faster_whisper"] = previous
+
+
+def _turbo_up_to_audio(root, *, beats=3):
+    """A studio taken as far as a joined narration, ready for the caption stage."""
+    client = FakeGoogle(beats=beats)
+    _app, _api, _pid, studio = seeded_turbo(root, client)
+    studio.run_script()
+    studio.approve_stage("script_review")
+    studio.run_tts()
+    studio.concat_audio()
+    return studio
+
+
+def test_subtitles_stage():
+    section("S. Altyazi asamasi: dinamik ASS ve bozunma yolu")
+
+    # --- word alignment succeeds -> burned ASS with an active word ----------
+    root = Path(tempfile.mkdtemp(prefix="turbo_subs_ass_"))
+    try:
+        studio = _turbo_up_to_audio(root)
+        previous = install_fake_whisper(with_words=True)
+        try:
+            record = studio.run_subtitles()
+        finally:
+            _restore_whisper(previous)
+
+        check(record["format"] == "ass", "altyazi-hizalamada-ASS",
+              str(record.get("format")))
+        check(record["dynamic_word_highlight"] is True,
+              "aktif-kelime-vurgusu-bildiriliyor", str(record))
+        check(record["word_count"] > 0, "kelime-sayisi-kaydedildi",
+              str(record.get("word_count")))
+        check(record["degraded"] is False, "hizalama-bozunma-DEGIL",
+              str(record.get("source")))
+        # ASS carries its own [V4+ Styles]; a force_style would override the
+        # theme and flatten the highlight, so the style dict must stay empty.
+        check(record["style"] == {}, "ASS-yolunda-force_style-YOK",
+              str(record.get("style")))
+
+        ass_path = studio._path(turbo.SUBTITLE_ASS_PATH)
+        check(ass_path.is_file(), "ASS-dosyasi-diskte", str(ass_path.name))
+        body = ass_path.read_text(encoding="utf-8")
+        check("[V4+ Styles]" in body and "Dialogue:" in body,
+              "ASS-gecerli-bolumler-iceriyor", body[:60])
+        check(studio.subtitles() == ass_path, "yakilacak-dosya-ASS",
+              str(studio.subtitles()))
+        # The SRT is still written as the degraded-path artifact.
+        check(studio._path(turbo.SUBTITLE_PATH).is_file(),
+              "SRT-de-yaninda-duruyor")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- no word alignment -> plain SRT, and it SAYS it degraded ------------
+    root = Path(tempfile.mkdtemp(prefix="turbo_subs_srt_"))
+    try:
+        studio = _turbo_up_to_audio(root)
+        previous = install_fake_whisper(with_words=False)
+        try:
+            record = studio.run_subtitles()
+        finally:
+            _restore_whisper(previous)
+
+        check(record["format"] == "srt", "hizalama-yoksa-SRT",
+              str(record.get("format")))
+        check(record["degraded"] is True, "bozunma-ACIKCA-bildiriliyor",
+              str(record.get("source")))
+        check(record["dynamic_word_highlight"] is False,
+              "bozunmada-vurgu-iddia-EDILMIYOR", str(record))
+        check(record["word_count"] == 0, "bozunmada-kelime-sayisi-sifir",
+              str(record.get("word_count")))
+        check(record["style"], "SRT-yolunda-force_style-KORUNUYOR",
+              str(record.get("style")))
+        check(not studio._path(turbo.SUBTITLE_ASS_PATH).is_file(),
+              "bozunmada-ASS-URETILMEZ")
+        check(studio.subtitles() == studio._path(turbo.SUBTITLE_PATH),
+              "yakilacak-dosya-SRT", str(studio.subtitles()))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- a degraded RERUN must not leave the earlier ASS behind -------------
+    # The renderer prefers ASS whenever it exists, so a stale one from a
+    # previously successful pass would keep being burned while the record says
+    # "srt" -- captions from an older narration, silently.
+    root = Path(tempfile.mkdtemp(prefix="turbo_subs_stale_"))
+    try:
+        studio = _turbo_up_to_audio(root)
+        previous = install_fake_whisper(with_words=True)
+        try:
+            studio.run_subtitles()
+        finally:
+            _restore_whisper(previous)
+        check(studio._path(turbo.SUBTITLE_ASS_PATH).is_file(),
+              "on-kosul-ASS-uretildi")
+
+        previous = install_fake_whisper(with_words=False)
+        try:
+            record = studio.run_subtitles()
+        finally:
+            _restore_whisper(previous)
+        check(record["format"] == "srt", "bayat-kosu-SRT-e-donuyor",
+              str(record.get("format")))
+        check(not studio._path(turbo.SUBTITLE_ASS_PATH).is_file(),
+              "BAYAT-ASS-SILINDI",
+              "eski ASS kalirsa render yeni SRT yerine onu yakar")
+        check(studio.subtitles() == studio._path(turbo.SUBTITLE_PATH),
+              "bayat-kosudan-sonra-SRT-yakilir", str(studio.subtitles()))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- subtitles disabled by the brief -----------------------------------
+    root = Path(tempfile.mkdtemp(prefix="turbo_subs_off_"))
+    try:
+        client = FakeGoogle(beats=3)
+        _app, _api, _pid, studio = seeded_turbo(root, client,
+                                                subtitles_enabled=False)
+        studio.run_script()
+        studio.approve_stage("script_review")
+        studio.run_tts()
+        studio.concat_audio()
+        record = studio.run_subtitles()
+        check(record["enabled"] is False, "brief-altyaziyi-kapatabiliyor",
+              str(record))
+        check(not studio._path(turbo.SUBTITLE_ASS_PATH).is_file(),
+              "kapaliyken-ASS-uretilmez")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_render_helpers():
     section("J. Render yardimcilari (etiket catismasi ve yatay kadraj)")
 
@@ -1389,6 +1564,7 @@ def main():
     test_tts_resumability()
     test_script_revision_preserves_audio()
     test_stock_media_stage()
+    test_subtitles_stage()
     test_render_helpers()
     test_timeline_packing()
     test_timeline_revisions()

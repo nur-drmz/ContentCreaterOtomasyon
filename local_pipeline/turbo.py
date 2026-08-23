@@ -36,6 +36,11 @@ TIMELINE_ARTIFACT = "results/turbo/timeline.json"
 CHUNK_ARTIFACT = "results/turbo/tts_chunks.json"
 NARRATION_PATH = "results/turbo/narration.wav"
 SUBTITLE_PATH = "results/turbo/subtitles.srt"
+#: Dynamic captions are a SEPARATE file, not the same name with another
+#: extension: when word alignment succeeds the ASS is burned, and keeping the
+#: SRT beside it means a degraded rerun cannot leave a stale ASS behind that the
+#: renderer would silently prefer.
+SUBTITLE_ASS_PATH = "results/turbo/subtitles.ass"
 
 #: (key, label, automatic). Automatic means an unattended runner may start it.
 #: `final_render` is deliberately NOT automatic: it costs minutes of CPU and it

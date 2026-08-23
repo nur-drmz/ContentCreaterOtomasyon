@@ -695,39 +695,82 @@ class TurboStudio:
                     "reason": "brief altyaziyi kapatiyor"}
 
         script = self.script() or {}
-        cues, source = render_utils.transcribe_for_subtitles(
+        # Word timestamps come from the SAME canonical helper the main render
+        # path uses, so Turbo gets the active-word highlight instead of a second,
+        # plainer caption implementation. It degrades to cues on its own.
+        words, cues, source = render_utils.transcribe_for_dynamic_captions(
             combined["path"], fallback_text=script.get("narration") or "",
             max_chars_per_cue=42, whisper_model_size="small",
             language=(brief.get("language") or "tr"))
-        path = self._path(turbo.SUBTITLE_PATH)
-        render_utils.write_srt(cues, path)
         degraded = "fallback" in str(source).lower()
+
+        srt_path = self._path(turbo.SUBTITLE_PATH)
+        ass_path = self._path(turbo.SUBTITLE_ASS_PATH)
+        render_utils.write_srt(cues, srt_path)
+
+        profile = render_utils.CAPTION_THEME_PROFILES["default"]
+        caption_meta = None
+        if words:
+            caption_meta = render_utils.write_active_word_ass(
+                words, ass_path,
+                play_res_x=int(brief.get("width") or 1080),
+                play_res_y=int(brief.get("height") or 1920),
+                font_name=profile["font_name"], font_size=profile["font_size"],
+                margin_v=profile["margin_v"], max_words=profile["max_words"],
+                max_chars=profile["max_chars"],
+                active_color_ass=profile["active_color_ass"],
+                base_color_ass=profile["base_color_ass"],
+                uppercase=bool(profile.get("uppercase", False)),
+                letter_spacing=float(profile.get("letter_spacing", 0.0)))
+            path = ass_path
+        else:
+            # No word alignment: burn the SRT and delete any ASS from a previous
+            # successful run, so the renderer cannot pick up stale captions.
+            ass_path.unlink(missing_ok=True)
+            path = srt_path
+
         record = {
             "enabled": True,
             "relative_path": self.storage.relative_to_namespace(
                 self.ownership, path),
-            "format": "srt",
+            "format": "ass" if words else "srt",
             "sha256": tts_chunks.sha256_file(path),
             "cue_count": len(cues),
+            "word_count": len(words),
+            "dynamic_word_highlight": bool(words),
             "source": source,
             "degraded": degraded,
-            "style": {"font_size": 42, "margin_v": 120, "border_style": 3,
-                      "outline": 2},
+            "caption_theme": "default",
+            "caption_meta": caption_meta,
+            # ASS carries its own [V4+ Styles]; force_style would override the
+            # theme, so it is only meaningful for the SRT path.
+            "style": ({} if words else
+                      {"font_size": 42, "margin_v": 120, "border_style": 3,
+                       "outline": 2}),
         }
         if degraded:
             self.log_event("subtitles.degraded", cue_count=len(cues),
                            source=str(source))
         else:
             self.log_event("subtitles.completed", cue_count=len(cues),
-                           source=str(source))
+                           word_count=len(words), source=str(source))
         self._save_workflow(turbo.set_stage(
             self._require_workflow(), "subtitles", turbo.COMPLETED,
             detail=(f"{len(cues)} cue"
                     + (" -- ORANSAL TAHMIN, hizalama yapilamadi" if degraded
-                       else " (ses hizalamali)"))), actor=actor)
+                       else (" (aktif kelime vurgulu)" if words
+                             else " (ses hizalamali)")))), actor=actor)
         return record
 
     def subtitles(self):
+        """The file that must actually be burned.
+
+        ASS wins when it exists, because that is the run that achieved word
+        alignment; the SRT is kept only as the degraded-path artifact.
+        """
+        ass_path = self._path(turbo.SUBTITLE_ASS_PATH)
+        if ass_path.is_file():
+            return ass_path
         path = self._path(turbo.SUBTITLE_PATH)
         return path if path.is_file() else None
 
