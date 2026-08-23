@@ -69,6 +69,9 @@ ARTIFACTS = {
     "moment_transcript": "results/moment_transcript.json",
     "glossary": "results/glossary.json",
     "long_form_plan": "results/long_form_plan.json",
+    "turbo_brief": "results/turbo/brief.json",
+    "turbo_workflow": "results/turbo/workflow.json",
+    "turbo_timeline": "results/turbo/timeline.json",
     "render_manifest": "results/render/render_manifest.json",
 }
 
@@ -129,6 +132,11 @@ REQUIRED_FIELDS = {
     "glossary": ("artifact_type", "status", "terms"),
     "long_form_plan": ("artifact_type", "status", "topic", "content_type",
                        "target_duration_min", "chapter_count"),
+    "turbo_brief": ("artifact_type", "topic", "duration_sec", "aspect_ratio",
+                    "brief_sha256"),
+    "turbo_workflow": ("artifact_type", "status", "stages"),
+    "turbo_timeline": ("artifact_type", "status", "clips", "video", "audio",
+                       "duration_sec"),
     "render_manifest": ("status", "output", "approval"),
 }
 
@@ -244,6 +252,21 @@ REWIND_LABELS = {
 }
 
 
+def _contiguous_runs(indices) -> list:
+    """Group sorted indices into runs of consecutive values.
+
+    `[0, 1, 4]` -> `[[0, 1], [4]]`. Used so two adjacent corrected words are
+    read as one multi-word name instead of two unrelated ones.
+    """
+    runs: list = []
+    for index in indices:
+        if runs and index == runs[-1][-1] + 1:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    return runs
+
+
 class PipelineServiceError(RuntimeError):
     pass
 
@@ -267,7 +290,7 @@ class PipelineService:
                  google_client_factory=None, openai_client_factory=None,
                  anthropic_client_factory=None, elevenlabs_client_factory=None,
                  probe_fn=None, ffmpeg_bin=None, ffprobe_bin=None, audit: AuditLog | None = None,
-                 youtube_provider=None):
+                 youtube_provider=None, music_root=None):
         self.storage = storage
         self.ownership = ownership
         self.secrets = secret_resolver
@@ -282,6 +305,10 @@ class PipelineService:
         self._ffmpeg_bin = ffmpeg_bin
         self._ffprobe_bin = ffprobe_bin
         self._cancel_check = None
+        # Injected like every other environment fact, rather than read
+        # from a global config: this class must stay constructible in a
+        # test without an app around it.
+        self.music_root = music_root
         # Publication provider: injectable for the same reason, and lazily built
         # so merely constructing the service never touches the OAuth token file.
         self._youtube_provider = youtube_provider
@@ -597,6 +624,16 @@ class PipelineService:
         """
         from .long_form_studio import LongFormStudio
         return LongFormStudio(self)
+
+    def turbo_studio(self):
+        """The Turbo workflow for this project.
+
+        Same on-demand construction as `long_form_studio`: a project that never
+        opens the Turbo tab never builds one, and neither of the other two
+        pipelines holds a reference to it.
+        """
+        from .turbo_studio import TurboStudio
+        return TurboStudio(self)
 
     # ------------------------------------------------------- project lifecycle
     def _archive_revision(self, paths, *, action: str, actor: str,
@@ -2744,10 +2781,20 @@ class PipelineService:
             # Word-for-word replacements are the ones that name something; a
             # wholesale rewrite is a sentence fix, not a proper noun.
             if old_tokens and len(old_tokens) == len(new_tokens):
-                for old_token, new_token in zip(old_tokens, new_tokens):
-                    if old_token != new_token:
-                        proposals.extend(glossary_module.suggest_terms_from_correction(
-                            old_token, new_token, record))
+                # ADJACENT changed words are ONE name, not several. Suggesting
+                # them separately turned "Steelers Rider!" -> "Sheepstealer's
+                # rider" into the term "Sheepstealer's", losing the half that
+                # makes it a name -- and "rider" alone is dropped as an ordinary
+                # lowercase word, so the phrase the human actually taught was
+                # never offered back.
+                changed = [index for index, (old_token, new_token)
+                           in enumerate(zip(old_tokens, new_tokens))
+                           if old_token != new_token]
+                for run in _contiguous_runs(changed):
+                    start, stop = run[0], run[-1] + 1
+                    proposals.extend(glossary_module.suggest_terms_from_correction(
+                        " ".join(old_tokens[start:stop]),
+                        " ".join(new_tokens[start:stop]), record))
             elif new_tokens:
                 proposals.extend(glossary_module.suggest_terms_from_correction(
                     " ".join(old_tokens), " ".join(new_tokens), record))
@@ -2896,14 +2943,65 @@ class PipelineService:
             if carried:
                 artifact = self._apply_transcript_corrections(artifact, carried)
                 tracker.note(f"{len(carried)} onceki duzeltme yeniden uygulandi")
+            # Word-level corrections survive a re-run, but SEGMENT-level manual
+            # work does not: the new recognition has its own words, timings and
+            # segment boundaries, so a hand-rewritten line cannot be replayed
+            # onto it honestly. Dropping it silently is the one thing that must
+            # not happen, so the previous artifact is archived into
+            # revisions/<id>/ first and the new one records what was set aside
+            # and where to find it.
+            artifact = self._archive_replaced_transcript(
+                previous, artifact, slot=slot, actor=actor, tracker=tracker)
             self.write_artifact("moment_transcript", artifact, job_id=job_id,
                                 actor=actor, slot=slot)
+            # Audited only once the replacement is safely on disk. Archiving
+            # MOVES the old file, so anything that raises between the move and
+            # the write would leave the slot with no transcript at all -- which
+            # is exactly the silent loss this whole branch exists to prevent.
+            replaced = artifact.get("replaced_manual_edit")
+            if replaced:
+                self.audit.record(
+                    "transcript.manual_edits_archived", actor=actor, job_id=job_id,
+                    detail={"slot": slot, "revision_id": replaced["revision_id"],
+                            "edited_segment_ids": replaced["edited_segment_ids"]})
             tracker.finish(message=(f"{artifact['word_count']} kelime, inceleme bekliyor"
                                     if artifact["has_speech"] else "konusma yok"))
             return artifact
         except Exception as exc:  # noqa: BLE001
             tracker.fail(f"{type(exc).__name__}: {exc}")
             raise
+
+    def _archive_replaced_transcript(self, previous, artifact, *, slot, actor,
+                                      tracker=None) -> dict:
+        """Preserve a hand-edited transcript that a re-run is about to replace.
+
+        Returns the new artifact, annotated with `replaced_manual_edit` when
+        something was archived. A previous pass that only ever held recogniser
+        output is replaced without ceremony -- there is no human work to lose.
+        """
+        edited_ids = list((previous or {}).get("edited_segment_ids") or [])
+        history = list((previous or {}).get("revisions") or [])
+        if not edited_ids and not history:
+            return artifact
+        revision = self._archive_revision(
+            [self.artifact_relative("moment_transcript", slot)],
+            action="retranscribe", actor=actor, target=f"transcript_slot_{slot}")
+        record = dict(artifact)
+        record["replaced_manual_edit"] = {
+            "revision_id": revision["revision_id"],
+            "archived_path": f"revisions/{revision['revision_id']}/",
+            "edited_segment_ids": edited_ids,
+            "revision_count": len(history),
+            "previous_content_sha256": transcript_edit.content_sha256(
+                transcript_edit.ensure_v2(previous)),
+            "note": ("Yeniden transkripsiyon elle duzenlenmis segmentleri "
+                      "TASIMAZ; onceki surum arsivlendi ve geri alinabilir."),
+        }
+        if tracker is not None:
+            tracker.note(
+                f"{len(edited_ids)} elle duzenlenmis segment tasinmadi; onceki surum "
+                f"revisions/{revision['revision_id']}/ altina arsivlendi")
+        return record
 
     def _apply_transcript_corrections(self, artifact: dict, corrections) -> dict:
         """Re-derive the corrected text from the ORIGINAL recognition.
@@ -2916,6 +3014,12 @@ class PipelineService:
             {k: v for k, v in word.items() if k != "corrected"}
             for word in (artifact.get("words") or [])
         ]
+        # The v2 fields have to be carried through. Rebuilding without `asr`
+        # makes the builder seed a FRESH snapshot from the already-corrected
+        # words, so "restore the raw recognition" would hand back the
+        # corrections instead of what was actually heard -- and the revision
+        # history, the edited-segment set and the glossary context would vanish
+        # with it. Every other caller passes these; this one did not.
         rebuilt = render_utils.build_moment_transcript_artifact(
             base_words, artifact.get("cues") or [],
             source=artifact.get("source"), language=artifact.get("language"),
@@ -2923,7 +3027,10 @@ class PipelineService:
             moment_selection_sha256=artifact.get("moment_selection_sha256"),
             whisper_model_size=artifact.get("whisper_model_size"),
             initial_prompt_used=artifact.get("initial_prompt_used"),
-            corrections=corrections)
+            corrections=corrections, asr=artifact.get("asr"),
+            revisions=artifact.get("revisions"),
+            edited_segment_ids=artifact.get("edited_segment_ids"),
+            glossary_context=artifact.get("glossary_context"))
         return rebuilt
 
     def set_transcript_corrections(self, *, corrections, edited_by: str, slot: int = 1) -> dict:
@@ -2947,7 +3054,14 @@ class PipelineService:
             cleaned.append({"from": source, "to": target})
         if len(cleaned) > 100:
             raise PipelineServiceError("en fazla 100 duzeltme tanimlanabilir")
-        artifact = self._apply_transcript_corrections(loaded["data"], cleaned)
+        previous = transcript_edit.ensure_v2(loaded["data"])
+        artifact = self._apply_transcript_corrections(previous, cleaned)
+        # Recorded like any other edit, so the legacy word-level path shows up in
+        # the same history as the segment editor instead of changing the text
+        # invisibly.
+        artifact = transcript_edit.append_revision(
+            artifact, actor=edited_by, kind="corrections",
+            previous_sha256=transcript_edit.content_sha256(previous))
         relative = self.write_artifact("moment_transcript", artifact, actor=edited_by, slot=slot)
         self.audit.record("artifact.written", actor=edited_by, artifact=relative,
                           detail={"corrections": len(cleaned), "slot": slot})

@@ -154,7 +154,15 @@ FIELD_LABELS = {
     "language_code": "Dil kodu",
     "confirmation": "Proje adi dogrulamasi",
     "script_text": "Script metni",
-    "topic": "Uzun video konusu",
+    # Shared by the long-form plan and the Turbo brief, so the label must not
+    # name one of them.
+    "topic": "Video konusu",
+    "stage": "Asama",
+    # `to_dict` indexes FIELD_LABELS directly, so a required field with no
+    # label raises KeyError instead of returning the 400 it was meant to.
+    "slot_id": "Klip slotu",
+    "candidate_id": "Aday klip",
+    "kind": "Revizyon turu",
     "content_type": "Video turu",
     "target_duration_min": "Hedef sure",
     "chapter_count": "Bolum sayisi",

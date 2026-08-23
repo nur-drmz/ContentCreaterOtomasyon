@@ -167,13 +167,18 @@ const state = {
   // would be wiped mid-sentence.
   transcriptDraft: null,
   longFormStudio: null,
+  turboStudio: null,
+  turboDraft: null,
   longFormDraft: null,
   revision: null,
   revisionStage: null,
   revisionNotes: '',
   transcriptFullDraft: null,
   glossaryDraft: null,
-  longFormDraft: null,
+  // Which (project, slot) each draft above belongs to. A mismatch clears it.
+  transcriptDraftOwner: null,
+  transcriptFullDraftOwner: null,
+  glossaryDraftOwner: null,
   uploadRequest: null,
   uploadProgress: null,
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
@@ -197,6 +202,7 @@ const SCREENS = [
   { key: 'history',   label: 'Kayitlar',        needsProject: false },
   { key: 'phase0',    label: 'Faz 0 · Strateji', needsProject: true },
   { key: 'longform',  label: 'Uzun Video',       needsProject: true },
+  { key: 'turbo',     label: 'Turbo Studio',     needsProject: true },
   { key: 'jobs',      label: 'Is akisi',         needsProject: true },
   { key: 'moments',   label: 'Moment Explorer',  needsProject: true },
   { key: 'script',    label: 'Script Studio',    needsProject: true },
@@ -1181,6 +1187,7 @@ function longFormStudioPanel() {
     longFormControlPanel(progress),
     longFormStagePanel(progress),
     longFormScriptPanel(studio),
+    longFormBrollPanel(studio.broll || {}, studio.chapters || []),
     longFormChunkPanel(studio.tts || {}),
     longFormEventPanel(studio.events || [], studio.quota || {}));
 }
@@ -1434,6 +1441,107 @@ function longFormChunkPanel(tts) {
       (combined.duration_check && !combined.duration_check.within_target)
         ? alertBox('warn', 'Sure hedef disinda', combined.duration_check.reason)
         : null) : null);
+}
+
+function longFormBrollPanel(broll, chapters) {
+  if (!chapters.length) return null;
+  const providers = broll.providers || [];
+  const configured = providers.filter(item => item.configured);
+  const slots = broll.slots || [];
+  const post = async (body, title) => {
+    const result = await guard(() => api.post(
+      `/api/projects/${state.projectId}/long-form/broll`, body), title);
+    if (result) state.longFormStudio = result.long_form_studio;
+    await refresh();
+  };
+  if (!broll.available) {
+    return el('div', { class: 'card', 'data-testid': 'lf-broll' },
+      el('div', { class: 'card__head' },
+        el('h2', { text: 'B-roll materyal plani' }),
+        badge('planned', 'MoneyPrinterTurbo uyarlamasi')),
+      el('p', { class: 'dim', text:
+        'Bolum sirasina gore duzenlenebilir arama slotlari olusturur. Bu adim API cagrisi yapmaz.' }),
+      inputField({ id: 'lf-broll-duration', label: 'Klip degistirme suresi (sn)',
+        type: 'number', attrs: { value: 5, min: 2, max: 12,
+          'data-testid': 'lf-broll-duration' } }),
+      el('button', { class: 'btn btn--primary', 'data-testid': 'lf-broll-plan',
+        onclick: (e) => withButton(e, () => post({ action: 'plan',
+          clip_duration_sec: Number(document.getElementById('lf-broll-duration').value || 5),
+        }, 'B-roll plani olusturuldu')) }, 'B-roll plani olustur'));
+  }
+  return el('div', { class: 'card', 'data-testid': 'lf-broll' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'B-roll materyal plani' }),
+      badge(broll.downloaded_count === broll.slot_count ? 'completed' : 'review_required',
+        `${broll.downloaded_count || 0}/${broll.slot_count || 0} indirildi`)),
+    el('p', { class: 'dim', text:
+      `${broll.aspect_ratio || '16:9'} - klip degisimi ${broll.clip_duration_sec || 5} sn. `
+      + `${broll.policy || ''}` }),
+    broll.stale ? alertBox('danger', 'B-roll plani guncel degil',
+      'Bolum scripti plan olusturulduktan sonra degisti. Eski secimleri kullanmadan plani yeniden olustur.') : null,
+    broll.stale ? el('button', { class: 'btn btn--primary',
+      'data-testid': 'lf-broll-rebuild',
+      onclick: (e) => withButton(e, () => post({ action: 'plan',
+        clip_duration_sec: broll.clip_duration_sec || 5,
+      }, 'B-roll plani guncellendi')) }, 'Plani yeni scriptle olustur') : null,
+    configured.length
+      ? alertBox('info', 'Stok saglayicisi hazir',
+          configured.map(item => item.label).join(', ')
+          + '. Her arama yalnizca Arama dugmesine basildiginda bir API istegi yapar.')
+      : alertBox('warn', 'Stok API anahtari eksik',
+          '.env.local icine PEXELS_API_KEY veya PIXABAY_API_KEY ekle. Planlama ve yerel materyal kullanimi yine calisir.'),
+    el('div', { class: 'stack' }, slots.map(slot => {
+      const selected = slot.selected;
+      const providerId = `lf-broll-provider-${slot.id}`;
+      const queryId = `lf-broll-query-${slot.id}`;
+      return el('div', { class: 'moment-card', 'data-testid': `lf-broll-slot-${slot.id}` },
+        el('div', { class: 'spread' },
+          el('strong', { text: `${slot.sequence}. Bolum ${slot.chapter_index}: ${slot.chapter_title}` }),
+          badge(_lfStageBadge(slot.status === 'downloaded' ? 'completed' : 'review_required'),
+            slot.status || 'planned')),
+        el('div', { class: 'dim', text: slot.script_excerpt || '' }),
+        el('div', { class: 'grid grid--2' },
+          longFormSelect(providerId, 'Saglayici', slot.provider || (configured[0] || {}).id || 'pexels',
+            providers.map(item => [item.id, `${item.label}${item.configured ? '' : ' (anahtar yok)'}`]),
+            () => {}),
+          inputField({ id: queryId, label: 'Arama metni', attrs: {
+            value: slot.query || '', maxlength: 180,
+            'data-testid': queryId } })),
+        el('button', { class: 'btn btn--sm', 'data-testid': `lf-broll-search-${slot.id}`,
+          disabled: broll.stale,
+          onclick: (e) => withButton(e, () => post({
+            action: 'search', slot_id: slot.id,
+            provider: document.getElementById(providerId).value,
+            query: document.getElementById(queryId).value, per_page: 6,
+          }, 'Stok video adaylari getirildi')) }, '6 aday ara'),
+        (slot.candidates || []).length ? el('div', { class: 'stack' },
+          slot.candidates.map((candidate, index) => el('div', {
+            class: 'spread', 'data-testid': `lf-broll-candidate-${slot.id}-${index}` },
+            el('span', {},
+              el('strong', { text: candidate.attribution || candidate.id }),
+              el('span', { class: 'dim', text:
+                ` - ${candidate.width}x${candidate.height} - ${candidate.duration_sec || '?'} sn` })),
+            candidate.source_page ? el('a', { href: candidate.source_page,
+              target: '_blank', rel: 'noopener noreferrer', text: 'Kaynak sayfasi' }) : null,
+            el('button', { class: 'btn btn--sm',
+              disabled: broll.stale || (selected && selected.id === candidate.id),
+              onclick: (e) => withButton(e, () => post({ action: 'select',
+                slot_id: slot.id, candidate_id: candidate.id,
+              }, 'B-roll adayi secildi')) },
+              selected && selected.id === candidate.id ? 'Secili' : 'Sec')))) : null,
+        selected ? el('div', { class: 'row' },
+          el('span', { class: 'dim', text:
+            `Secili: ${selected.attribution || selected.id}` }),
+          slot.download
+            ? badge('completed', `${slot.download.local_file} - ${formatBytes(slot.download.bytes)}`)
+            : el('button', { class: 'btn btn--primary',
+                disabled: broll.stale,
+                'data-testid': `lf-broll-download-${slot.id}`,
+                onclick: (e) => withButton(e, () => post({ action: 'download',
+                  slot_id: slot.id }, 'Secili B-roll proje deposuna indirildi')) },
+                'Secili videoyu indir')) : null);
+    })),
+    el('p', { class: 'dim', text: broll.source_credit_note || '' }));
 }
 
 function longFormEventPanel(events, quota) {
@@ -2475,9 +2583,50 @@ function formatClock(seconds) {
  *   2. "Save" and "Approve" stay separate buttons. Saving changes the content
  *      and therefore DROPS the approval; merging them would approve text the
  *      reviewer had not read in its saved form. */
+/* Drafts belong to ONE project and ONE output slot. Segment ids repeat across
+ * projects (`seg_0001` exists in every transcript), so an unsaved draft that
+ * outlived a project switch would appear under the new project's identical ids
+ * and a Save would write the OTHER project's words into this transcript. The
+ * owner key is re-checked on every read, exactly as `longFormDraft` does. */
+function draftOwner(slot) {
+  return `${state.projectId || ''}::${slot === undefined || slot === null ? '' : slot}`;
+}
+
 function transcriptDraft(t) {
-  if (!state.transcriptDraft) state.transcriptDraft = {};
+  const owner = draftOwner(t && t.slot);
+  if (!state.transcriptDraft || state.transcriptDraftOwner !== owner) {
+    state.transcriptDraft = {};
+    state.transcriptDraftOwner = owner;
+  }
   return state.transcriptDraft;
+}
+
+function transcriptFullDraftValue(t) {
+  const owner = draftOwner(t && t.slot);
+  if (state.transcriptFullDraftOwner !== owner) {
+    state.transcriptFullDraft = null;
+    state.transcriptFullDraftOwner = owner;
+  }
+  return state.transcriptFullDraft;
+}
+
+function setTranscriptFullDraft(t, value) {
+  state.transcriptFullDraftOwner = draftOwner(t && t.slot);
+  state.transcriptFullDraft = value;
+}
+
+function glossaryDraftValue() {
+  const owner = draftOwner(null);
+  if (state.glossaryDraftOwner !== owner) {
+    state.glossaryDraft = null;
+    state.glossaryDraftOwner = owner;
+  }
+  return state.glossaryDraft;
+}
+
+function setGlossaryDraft(value) {
+  state.glossaryDraftOwner = draftOwner(null);
+  state.glossaryDraft = value;
 }
 
 function transcriptDirty(t) {
@@ -2706,9 +2855,9 @@ function validateSegmentValue(value, limits) {
 }
 
 function transcriptFullTextPanel(t) {
-  const current = state.transcriptFullDraft !== null
-                  && state.transcriptFullDraft !== undefined
-    ? state.transcriptFullDraft : (t.full_text || '');
+  const draftValue = transcriptFullDraftValue(t);
+  const current = draftValue !== null && draftValue !== undefined
+    ? draftValue : (t.full_text || '');
   return el('div', { class: 'card', 'data-testid': 'transcript-full' },
     el('h2', { text: 'Tum metni birden duzenle' }),
     el('p', { class: 'dim',
@@ -2718,7 +2867,7 @@ function transcriptFullTextPanel(t) {
       class: 'transcript-full-input', 'data-testid': 'transcript-full-input',
       rows: Math.min(20, Math.max(4, (t.segments || []).length + 1)),
       spellcheck: 'false',
-      oninput: (event) => { state.transcriptFullDraft = event.currentTarget.value; },
+      oninput: (event) => { setTranscriptFullDraft(t, event.currentTarget.value); },
     }, current),
     el('div', { class: 'row' },
       el('button', {
@@ -2771,8 +2920,9 @@ function transcriptHistoryPanel(t) {
 
 function glossaryPanel(glossary, suggestions) {
   const terms = (glossary.terms || []).map(entry => entry.term);
-  const current = state.glossaryDraft !== null && state.glossaryDraft !== undefined
-    ? state.glossaryDraft : terms.join('\n');
+  const draftValue = glossaryDraftValue();
+  const current = draftValue !== null && draftValue !== undefined
+    ? draftValue : terms.join('\n');
   return el('div', { class: 'card', 'data-testid': 'glossary' },
     el('div', { class: 'card__head' },
       el('h2', { text: 'Terimler / Ozel isimler' }),
@@ -2781,7 +2931,7 @@ function glossaryPanel(glossary, suggestions) {
     el('textarea', {
       class: 'transcript-full-input', 'data-testid': 'glossary-input', rows: 5,
       spellcheck: 'false', placeholder: 'Her satira bir terim: Rhaena',
-      oninput: (event) => { state.glossaryDraft = event.currentTarget.value; },
+      oninput: (event) => { setGlossaryDraft(event.currentTarget.value); },
     }, current),
     el('div', { class: 'row' },
       el('button', {
@@ -3780,9 +3930,583 @@ function screenSettings() {
       el('div', { class: 'stack' }, plannedRows)));
 }
 
+/* ----------------------------------------------------------- Turbo Studio */
+/* Fourteen stages layered over the existing script, TTS, stock-media, timeline
+   and render services. Every control a phase has not yet wired is stated as
+   not-yet-connected rather than rendered as a button that does nothing -- a
+   dead control is worse than an absent one, because it invites a click and
+   teaches the operator not to trust the screen. */
+
+const TURBO_STAGE_BADGE = {
+  completed: 'completed', failed: 'failed', running: 'running',
+  queued: 'queued', not_started: 'planned', review_required: 'review_required',
+  waiting_rate_limit: 'queued', waiting_daily_quota: 'queued',
+  blocked_billing: 'failed', cancelled: 'failed',
+};
+
+function turboDraft() {
+  if (state.turboDraft) return state.turboDraft;
+  const studio = state.turboStudio || {};
+  const base = studio.brief || studio.brief_defaults || {};
+  state.turboDraft = {
+    topic: base.topic || '',
+    content_type: base.content_type || 'explainer',
+    duration_sec: base.duration_sec || 60,
+    aspect_ratio: base.aspect_ratio || '9:16',
+    fps: base.fps || 30,
+    clip_duration_sec: base.clip_duration_sec || 5,
+    fit_mode: base.fit_mode || 'crop',
+    transition: base.transition || 'none',
+    transition_sec: base.transition_sec || 0.4,
+    ordering: base.ordering || 'sequential',
+    seed_input: base.seed_input || '',
+    notes: base.notes || '',
+  };
+  return state.turboDraft;
+}
+
+function setTurboDraft(key, value) {
+  turboDraft()[key] = value;
+}
+
+function turboSelect(id, label, key, options, hint = '') {
+  const draft = turboDraft();
+  return field({ id, label, required: true, hint,
+    control: el('select', { id, 'data-testid': id, 'aria-required': 'true',
+      onchange: event => setTurboDraft(key, event.currentTarget.value) },
+    options.map(([value, text]) => el('option', {
+      value, selected: String(draft[key]) === String(value),
+    }, text))) });
+}
+
+function turboBriefCard() {
+  const studio = state.turboStudio;
+  const draft = turboDraft();
+  const limits = studio.limits || {};
+  const options = studio.options || {};
+  const update = key => event => setTurboDraft(key, event.currentTarget.value);
+
+  const save = el('button', {
+    class: 'btn btn--primary', type: 'button', 'data-testid': 'turbo-save-brief',
+    onclick: async () => {
+      const result = await guard(() => api.post(
+        `/api/projects/${state.projectId}/turbo/brief`, {
+          ...draft,
+          duration_sec: Number(draft.duration_sec),
+          clip_duration_sec: Number(draft.clip_duration_sec),
+          fps: Number(draft.fps),
+          transition_sec: Number(draft.transition_sec),
+        }), 'Brief kaydedildi');
+      if (result) {
+        state.turboStudio = result.turbo_studio;
+        state.turboDraft = null;
+        if (result.saved) {
+          pushAlert('warning', 'Brief degisti',
+            'Ciktiyi etkileyen bir alan degisti; script ve sonrasindaki '
+            + 'asamalar sifirlandi. Onceki ciktilar silinmedi.');
+        }
+        render();
+      }
+    },
+  }, 'Brief kaydet');
+
+  return el('div', { class: 'card' },
+    el('h2', { text: 'Brief' }),
+    requiredLegend(),
+    inputField({ id: 'turbo-topic', label: 'Konu', required: true,
+      hint: 'En az 8 karakter. Ornek: Roma imparatorlugunun cokus nedenleri.',
+      attrs: { value: draft.topic, maxlength: 200, 'data-testid': 'turbo-topic',
+        oninput: update('topic') } }),
+    el('div', { class: 'grid grid--2' },
+      turboSelect('turbo-content-type', 'Icerik turu', 'content_type',
+        (options.content_types || []).map(value => [value, value])),
+      turboSelect('turbo-aspect', 'En-boy orani', 'aspect_ratio',
+        (options.aspect_ratios || []).map(item => [item.value, item.label]))),
+    el('div', { class: 'grid grid--3' },
+      inputField({ id: 'turbo-duration', label: 'Sure (saniye)', required: true,
+        type: 'number',
+        hint: `${limits.min_duration_sec || 15}-${limits.max_duration_sec || 1800} sn`,
+        attrs: { value: draft.duration_sec, min: limits.min_duration_sec,
+          max: limits.max_duration_sec, 'data-testid': 'turbo-duration',
+          oninput: update('duration_sec') } }),
+      inputField({ id: 'turbo-clip-duration', label: 'Klip suresi (sn)',
+        required: true, type: 'number',
+        hint: `en fazla ${limits.max_clips || 240} klip`,
+        attrs: { value: draft.clip_duration_sec, min: limits.min_clip_sec,
+          max: limits.max_clip_sec, step: '0.5',
+          'data-testid': 'turbo-clip-duration',
+          oninput: update('clip_duration_sec') } }),
+      turboSelect('turbo-fps', 'fps', 'fps',
+        (options.fps_choices || [30]).map(value => [value, String(value)]))),
+    el('div', { class: 'grid grid--3' },
+      turboSelect('turbo-fit-mode', 'Kadraj', 'fit_mode', [
+        ['crop', 'Kirp (kenarlar kesilir)'],
+        ['fit', 'Sigdir (bulanik arka plan)'],
+      ]),
+      turboSelect('turbo-transition', 'Gecis', 'transition', [
+        ['none', 'Gecis yok'], ['fade', 'Karartmali gecis'],
+      ], 'Karartmali gecis toplam sureyi degistirmez.'),
+      turboSelect('turbo-ordering', 'Siralama', 'ordering', [
+        ['sequential', 'Script sirasi'], ['seeded_random', 'Seed ile rastgele'],
+      ])),
+    inputField({ id: 'turbo-seed', label: 'Seed (istege bagli)',
+      hint: 'Ayni seed ayni klip sirasini uretir; bos birakilirsa script sirasi kullanilir.',
+      attrs: { value: draft.seed_input, maxlength: 80,
+        'data-testid': 'turbo-seed', oninput: update('seed_input') } }),
+    el('div', { class: 'actions' }, save));
+}
+
+function turboEstimateCard() {
+  const estimates = ((state.turboStudio.brief || {}).estimates) || null;
+  if (!estimates) return null;
+  return el('div', { class: 'card', 'data-testid': 'turbo-estimates' },
+    el('h2', { text: 'Harcama oncesi tahmin' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Tahmini kelime', estimates.narration_words),
+      techCell('Klip sayisi', estimates.clip_count),
+      techCell('TTS parcasi', estimates.tts_chunks_estimate)),
+    alertBox('info', 'Bunlar tahmindir', estimates.note));
+}
+
+/* One place that posts to a Turbo route and folds the fresh view back in, so
+   every control behaves identically and none of them can forget to refresh. */
+async function turboPost(path, body, successTitle) {
+  const result = await guard(
+    () => api.post(`/api/projects/${state.projectId}/turbo${path}`, body || {}),
+    successTitle);
+  if (result && result.turbo_studio) {
+    state.turboStudio = result.turbo_studio;
+    render();
+  }
+  return result;
+}
+
+function turboButton(label, testid, handler, { primary = false,
+                                               disabled = false,
+                                               reason = '' } = {}) {
+  // A control that cannot be used is shown DISABLED WITH ITS REASON rather than
+  // hidden: hiding it makes the workflow look broken, and enabling it makes the
+  // click look broken.
+  const button = el('button', {
+    class: `btn${primary ? ' btn--primary' : ''}`, type: 'button',
+    'data-testid': testid, disabled: disabled || undefined,
+    title: disabled ? reason : '',
+    onclick: disabled ? undefined : handler,
+  }, label);
+  if (!disabled) return button;
+  return el('span', { class: 'row' }, button,
+    el('span', { class: 'muted', text: reason }));
+}
+
+function turboStagesCard() {
+  const studio = state.turboStudio;
+  const progress = studio.progress || {};
+  const next = progress.next || {};
+  const stages = progress.stages || [];
+  const completed = new Set(stages.filter(s => s.state === 'completed')
+    .map(s => s.key));
+
+  const rows = stages.map((stage, index) => {
+    const earlierDone = stages.slice(0, index)
+      .every(s => s.state === 'completed');
+    const controls = el('div', { class: 'row' });
+    if (!stage.automatic && stage.state !== 'completed'
+        && stage.key !== 'final_render' && stage.key !== 'archive') {
+      controls.appendChild(turboButton(
+        'Onayla', `turbo-approve-${stage.key}`,
+        () => turboPost('/approve', { stage: stage.key },
+          `${stage.label} onaylandi`),
+        { disabled: !earlierDone,
+          reason: 'onceki asamalar tamamlanmadi' }));
+    }
+    controls.appendChild(badge(TURBO_STAGE_BADGE[stage.state] || 'missing',
+      stage.state));
+    return el('div', { class: 'row', 'data-testid': `turbo-stage-${stage.key}` },
+      el('div', {},
+        el('strong', { text: `${index + 1}. ${stage.label}` }),
+        el('div', { class: 'muted',
+          text: stage.automatic ? 'otomatik calisir' : 'insan karari gerekir' }),
+        stage.detail ? el('div', { class: 'muted', text: stage.detail }) : null,
+        stage.error ? el('div', { class: 'muted', text: stage.error }) : null,
+        stage.resume_at
+          ? el('div', { class: 'muted',
+            text: `kota beklemesi, devam: ${stage.resume_at}` })
+          : null),
+      controls);
+  });
+
+  const runnable = !next.blocked && next.stage;
+  const actions = el('div', { class: 'actions' },
+    turboButton('Siradaki asamayi calistir', 'turbo-run-stage',
+      () => turboPost('/stage', {}, 'Asama calistirildi'),
+      { primary: true, disabled: !runnable,
+        reason: next.reason || 'calistirilabilir asama yok' }));
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-stages' },
+    el('h2', { text: `Asamalar (${progress.completed_count || 0}/${progress.total_count || 14})` }),
+    el('div', { class: 'stack' }, rows),
+    next.reason
+      ? alertBox(next.blocked ? 'warning' : 'info', 'Siradaki', next.reason)
+      : null,
+    actions);
+}
+
+function turboScriptCard() {
+  const script = state.turboStudio.script;
+  if (!script) return null;
+  return el('div', { class: 'card', 'data-testid': 'turbo-script' },
+    el('h2', { text: 'Script ve sahne plani' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Kelime', script.word_count),
+      techCell('Sahne', script.beat_count),
+      techCell('Model', script.model)),
+    script.beat_coverage !== undefined && script.beat_coverage < 0.9
+      ? alertBox('warning', 'Sahne-anlatim uyumu', script.coverage_note)
+      : null,
+    el('div', { class: 'stack' },
+      (script.beats || []).map(beat => el('div', { class: 'row' },
+        el('div', {},
+          el('strong', { text: `${beat.index}. ${beat.search_query}` }),
+          el('div', { class: 'muted', text: beat.text }))))));
+}
+
+function turboNarrationCard() {
+  const narration = state.turboStudio.narration;
+  if (!narration) return null;
+  const summary = narration.summary || {};
+  const combined = narration.combined;
+  return el('div', { class: 'card', 'data-testid': 'turbo-narration' },
+    el('h2', { text: 'Anlatim' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Parca', `${summary.completed_count || 0}/${summary.chunk_count || 0}`),
+      techCell('Birlesik sure', combined ? `${combined.duration_sec} sn` : '-'),
+      techCell('Brief hedefinden sapma',
+        combined && combined.drift_sec !== null && combined.drift_sec !== undefined
+          ? `${combined.drift_sec} sn` : '-')),
+    el('div', { class: 'stack' },
+      (narration.chunks || []).map(chunk => el('div', { class: 'row' },
+        el('span', { text: `${chunk.sequence}. parca (${chunk.word_count || 0} kelime)` }),
+        el('div', { class: 'row' },
+          chunk.resume_at
+            ? el('span', { class: 'muted', text: `devam: ${chunk.resume_at}` })
+            : null,
+          badge(chunk.status === 'completed' ? 'completed'
+            : (chunk.status === 'failed' ? 'failed' : 'queued'),
+          chunk.status))))));
+}
+
+function turboMediaCard() {
+  const media = state.turboStudio.media;
+  if (!media) {
+    return el('div', { class: 'card', 'data-testid': 'turbo-media' },
+      el('h2', { text: 'Stok materyal' }),
+      alertBox('info', 'Slotlar henuz olusturulmadi',
+        'Script uretildikten sonra "Siradaki asamayi calistir" klip slotlarini olusturur. '
+        + 'Slot olusturmak hicbir saglayici istegi yapmaz.'));
+  }
+  const readiness = media.readiness || {};
+  const rows = (media.slots || []).map(slot => {
+    const controls = el('div', { class: 'row' });
+    media.providers.forEach(provider => {
+      controls.appendChild(turboButton(
+        `${provider} ara`, `turbo-search-${slot.id}-${provider}`,
+        () => turboPost('/media',
+          { action: 'search', slot_id: slot.id, provider },
+          `${provider} aramasi tamamlandi`),
+        { disabled: readiness.stale,
+          reason: 'script degisti; once slotlari yenileyin' }));
+    });
+    if (slot.selected_id && !slot.downloaded) {
+      controls.appendChild(turboButton(
+        'Indir', `turbo-download-${slot.id}`,
+        () => turboPost('/media', { action: 'download', slot_id: slot.id },
+          'Klip indirildi'),
+        { primary: true, disabled: readiness.stale,
+          reason: 'script degisti; once slotlari yenileyin' }));
+    }
+
+    const candidates = el('div', { class: 'stack' },
+      (slot.candidates || []).map(candidate => el('div', { class: 'row' },
+        el('div', {},
+          el('span', { text: `${candidate.provider} · ${candidate.width}x${candidate.height} · ${candidate.duration_sec}sn` }),
+          el('div', { class: 'muted', text: candidate.attribution || '' }),
+          candidate.source_page
+            ? el('a', { href: candidate.source_page, target: '_blank',
+              rel: 'noopener noreferrer', text: 'kaynak sayfasi' })
+            : null),
+        candidate.id === slot.selected_id
+          ? badge('completed', 'secili')
+          : turboButton('Sec', `turbo-select-${slot.id}-${candidate.id}`,
+            () => turboPost('/media',
+              { action: 'select', slot_id: slot.id, candidate_id: candidate.id },
+              'Aday secildi'),
+            { disabled: readiness.stale,
+              reason: 'script degisti; once slotlari yenileyin' }))));
+
+    return el('div', { class: 'stack', 'data-testid': `turbo-slot-${slot.id}` },
+      el('div', { class: 'row' },
+        el('div', {},
+          el('strong', { text: `${slot.sequence}. ${slot.query}` }),
+          el('div', { class: 'muted', text: slot.excerpt || '' })),
+        el('div', { class: 'row' },
+          badge(slot.downloaded ? 'completed'
+            : (slot.selected_id ? 'review_required' : 'planned'),
+          slot.downloaded ? 'indirildi'
+            : (slot.selected_id ? 'secildi' : 'bekliyor')),
+          controls)),
+      candidates);
+  });
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-media' },
+    el('h2', { text: `Stok materyal (${readiness.downloaded_count || 0}/${readiness.slot_count || 0} indirildi)` }),
+    alertBox('info', 'Arama, secim ve indirme ayri eylemlerdir',
+      media.policy || ''),
+    readiness.stale
+      ? alertBox('warning', 'Plan bayat',
+        'Script degisti. Arama, secim ve indirme, slot listesi yenilenene kadar kilitli.')
+      : null,
+    el('div', { class: 'row' },
+      turboButton('Slotlari yenile', 'turbo-media-plan',
+        () => turboPost('/media', { action: 'plan' }, 'Slotlar yenilendi'),
+        { reason: '' })),
+    el('div', { class: 'stack' }, rows));
+}
+
+function turboMusicCard() {
+  const music = state.turboStudio.music || {};
+  const chosen = music.chosen;
+  const library = music.library || { tracks: [] };
+  const tracks = [...(library.tracks || []), ...(music.uploaded || [])];
+
+  const rows = tracks.map(track => el('div', {
+    class: 'row', 'data-testid': `turbo-music-${track.filename}`,
+  },
+  el('div', {},
+    el('strong', { text: track.display_name }),
+    el('div', { class: 'muted', text: track.license.label })),
+  el('div', { class: 'row' },
+    badge(track.license.status === 'verified' ? 'completed' : 'review_required',
+      track.license.status),
+    turboButton('Sec', `turbo-music-pick-${track.filename}`,
+      () => turboPost('/music',
+        { origin: track.origin, filename: track.filename },
+        'Muzik secildi')))));
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-music' },
+    el('h2', { text: 'Muzik' }),
+    alertBox('warning', 'Telif iddiasi yapilmaz',
+      music.policy
+      || 'Bu proje hicbir parcayi telifsiz olarak nitelemez. Lisans kaydi eksik '
+         + 'olan parcalar isaretlenir; kullanmadan once siz dogrulayin.'),
+    chosen
+      ? el('div', { class: 'row' },
+        el('span', { text: chosen.present
+          ? `Secili: ${chosen.display_name}` : 'Muzik yok (acik karar)' }),
+        chosen.present
+          ? badge(chosen.license && chosen.license.status === 'verified'
+            ? 'completed' : 'review_required',
+          (chosen.license || {}).status || 'bilinmiyor')
+          : null)
+      : null,
+    !library.configured
+      ? alertBox('info', 'Kutuphane tanimli degil',
+        'CREATOR_CONSOLE_MUSIC_ROOT ayarlayin veya muziksiz devam edin.')
+      : null,
+    el('div', { class: 'stack' }, rows),
+    el('div', { class: 'actions' },
+      turboButton('Muziksiz devam et', 'turbo-music-none',
+        () => turboPost('/music', { origin: 'none' }, 'Muziksiz devam')),
+      (() => {
+        // The second music source: a file the operator owns. Streamed with the
+        // filename in a header, like the source-video upload, so the extension
+        // is checked before a byte is written.
+        const picker = el('input', {
+          type: 'file', accept: '.mp3,.wav,.m4a,.aac,.ogg,.flac',
+          'data-testid': 'turbo-music-upload',
+          onchange: async (event) => {
+            const file = event.currentTarget.files[0];
+            if (!file) return;
+            await guard(async () => {
+              const response = await fetch(
+                `/api/projects/${state.projectId}/turbo/music/upload`,
+                { method: 'POST', body: file,
+                  headers: { 'X-Filename': encodeURIComponent(file.name) } });
+              const payload = await response.json();
+              if (!response.ok) throw new Error((payload.error || {}).message
+                || 'Muzik yuklenemedi');
+              state.turboStudio = payload.turbo_studio;
+              render();
+            }, 'Muzik yuklendi');
+          },
+        });
+        return field({ id: 'turbo-music-upload-field',
+          label: 'Kendi muzigini yukle',
+          hint: 'Lisans kaydi icin yaninda <dosya>.license.json arayin; yoksa '
+            + 'parca "lisans dogrulanmadi" olarak isaretlenir.',
+          control: picker });
+      })()));
+}
+
+function turboTimelineCard() {
+  const line = state.turboStudio.timeline;
+  if (!line) return null;
+  return el('div', { class: 'card', 'data-testid': 'turbo-timeline' },
+    el('h2', { text: 'Zaman cizelgesi' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Klip', line.clip_count),
+      techCell('Sure', `${line.duration_sec} sn`),
+      techCell('Tekrar kullanilan', line.reuse_count)),
+    line.reuse_count
+      ? alertBox('warning', 'Klipler tekrar kullanildi',
+        `${line.reuse_count} yuva ayni kaynaktan tekrar dolduruldu. Daha fazla `
+        + 'klip indirirseniz tekrar azalir.')
+      : null,
+    el('div', { class: 'stack' },
+      (line.clips || []).map(clip => el('div', {
+        class: 'row', 'data-testid': `turbo-clip-${clip.clip_id}`,
+      },
+      el('div', {},
+        el('span', { text: `${clip.clip_id}  ${clip.start}-${clip.end} sn` }),
+        el('div', { class: 'muted', text: clip.attribution || '' })),
+      el('div', { class: 'row' },
+        clip.reuse_index ? badge('review_required', `tekrar ${clip.reuse_index}`) : null,
+        turboButton('Kirp', `turbo-frame-crop-${clip.clip_id}`,
+          () => turboPost('/revision',
+            { kind: 'frame', target: clip.clip_id, values: { mode: 'crop' } },
+            'Kadraj guncellendi')),
+        turboButton('Sigdir', `turbo-frame-fit-${clip.clip_id}`,
+          () => turboPost('/revision',
+            { kind: 'frame', target: clip.clip_id, values: { mode: 'fit' } },
+            'Kadraj guncellendi')))))),
+    line.attribution_lines && line.attribution_lines.length
+      ? el('div', {},
+        el('h3', { text: 'Atif' }),
+        el('ul', {}, line.attribution_lines.map(t => el('li', { text: t }))))
+      : null);
+}
+
+function turboRenderCard() {
+  const studio = state.turboStudio;
+  const renders = studio.renders || {};
+  const stages = (studio.progress || {}).stages || [];
+  const stageState = key => (stages.find(s => s.key === key) || {}).state;
+  const timelineReady = stageState('timeline') === 'completed';
+  const previewDone = stageState('preview_render') === 'completed';
+
+  const panel = (preset, label) => {
+    const record = renders[preset];
+    return el('div', { class: 'stack', 'data-testid': `turbo-render-${preset}` },
+      el('div', { class: 'row' },
+        el('strong', { text: label }),
+        record ? badge(record.stale ? 'review_required' : 'completed',
+          record.stale ? 'zaman cizelgesi degisti' : 'hazir')
+          : badge('planned', 'uretilmedi')),
+      record
+        ? el('video', {
+          class: 'preview', controls: true, preload: 'metadata',
+          'data-testid': `turbo-player-${preset}`,
+          src: `/api/projects/${state.projectId}/media/${record.relative_path}`,
+        })
+        : null,
+      record && record.stale
+        ? alertBox('warning', 'Bu video guncel degil',
+          'Zaman cizelgesi bu render uretildikten sonra degisti. Izlediginiz '
+          + 'kayit artik projedeki kurgu degil; yeniden render alin.')
+        : null,
+      record && record.music_license && record.music_license !== 'verified'
+        ? alertBox('warning', 'Muzik lisansi dogrulanmadi',
+          'Bu videoda lisans kaydi tamamlanmamis bir parca var.')
+        : null);
+  };
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-renders' },
+    el('h2', { text: 'Render' }),
+    panel('preview', 'Onizleme (yarim olcek, hizli)'),
+    panel('final', 'Final (tam 1080p)'),
+    el('div', { class: 'actions' },
+      turboButton('Onizleme uret', 'turbo-render-preview-btn',
+        () => turboPost('/render', { preset: 'preview' }, 'Onizleme uretildi'),
+        { primary: true, disabled: !timelineReady,
+          reason: 'once zaman cizelgesini olusturun' }),
+      turboButton('Final uret', 'turbo-render-final-btn',
+        () => turboPost('/render', { preset: 'final' }, 'Final uretildi'),
+        { disabled: !previewDone,
+          reason: 'once onizlemeyi uretip izleyin' })),
+    alertBox('info', 'Onizleme ve final ayridir',
+      'Onizlemeyi onaylamak finali onaylamaz. Final render dakikalar surer ve '
+      + 'yalnizca siz istediginizde baslar.'));
+}
+
+function turboRevisionCard() {
+  const kinds = state.turboStudio.revision_kinds || [];
+  return el('div', { class: 'card', 'data-testid': 'turbo-revisions' },
+    el('h2', { text: 'Revizyon turleri ve maliyeti' }),
+    el('div', { class: 'stack' },
+      kinds.map(item => el('div', { class: 'row' },
+        el('span', { text: item.label }),
+        badge(item.manifest_only ? 'completed' : 'review_required',
+          item.manifest_only ? 'yalnizca render yenilenir'
+            : 'yukari-akis yeniden calisir')))),
+    alertBox('info', 'Hicbir sey silinmez',
+      'Bir revizyon uygulandiginda eski cikti arsive tasinir, uzerine yazilmaz.'));
+}
+
+function turboArchiveCard() {
+  const archive = state.turboStudio.archive;
+  if (!archive) return null;
+  const mb = (archive.total_bytes / (1024 * 1024)).toFixed(1);
+  const clipMb = (archive.clip_bytes / (1024 * 1024)).toFixed(1);
+  return el('div', { class: 'card', 'data-testid': 'turbo-archive' },
+    el('h2', { text: 'Arsiv' }),
+    el('div', { class: 'grid grid--2' },
+      techCell('Toplam boyut', `${mb} MB`),
+      techCell('Bunun klipleri', `${clipMb} MB`)),
+    // Stated before the operator commits: a Turbo project carries every
+    // downloaded clip, and that is not obvious from the rest of the screen.
+    alertBox(archive.ready ? 'info' : 'warning',
+      archive.ready ? 'Arsivlemeye hazir' : 'Henuz hazir degil',
+      archive.ready ? archive.control : archive.reason));
+}
+
+function screenTurbo() {
+  const studio = state.turboStudio;
+  if (!studio) {
+    return el('div', { 'data-testid': 'turbo-screen' },
+      el('div', { class: 'page-head' }, el('h1', { text: 'Turbo Studio' })),
+      alertBox('info', 'Yukleniyor',
+        'Turbo is akisi okunuyor. Bu sekmeyi acmak hicbir saglayici istegi yapmaz.'));
+  }
+  const progress = studio.progress || {};
+  return el('div', { 'data-testid': 'turbo-screen' },
+    el('div', { class: 'page-head' },
+      el('div', {},
+        el('h1', { text: 'Turbo Studio' }),
+        el('p', { class: 'subtitle',
+          text: 'Brief girdisinden stok goruntulu, seslendirilmis ve altyazili '
+            + 'videoya kadar 14 asamali akis.' })),
+      studio.started ? badge('review_required', progress.status || 'hazir')
+        : badge('planned', 'brief bekliyor')),
+    alertBox('info', 'Bu sekmeyi acmak hicbir sey harcamaz',
+      'Gorunum yalnizca diskteki artefaktlari okur. Model, seslendirme, stok '
+      + 'materyal ve render istekleri yalnizca acikca bir eylem baslattiginizda '
+      + 'yapilir.'),
+    turboBriefCard(),
+    turboEstimateCard(),
+    turboStagesCard(),
+    turboScriptCard(),
+    turboNarrationCard(),
+    turboMediaCard(),
+    turboMusicCard(),
+    turboTimelineCard(),
+    turboRenderCard(),
+    turboRevisionCard(),
+    turboArchiveCard());
+}
+
 const RENDERERS = {
   projects: screenProjects, history: screenHistory, phase0: screenPhase0,
   longform: screenLongForm,
+  turbo: screenTurbo,
   jobs: screenJobs, moments: screenMoments,
   script: screenScript, voice: screenVoice, render: screenRender, outputs: screenOutputs,
   settings: screenSettings,
@@ -3876,6 +4600,13 @@ async function refresh() {
     const lf = await api.get(
       `/api/projects/${state.projectId}/long-form`).catch(() => null);
     state.longFormStudio = lf ? lf.long_form_studio : null;
+  }
+  // Same contract for Turbo: opening the tab reads. It never spends an LLM,
+  // TTS, stock-provider, download or render request.
+  if (state.screen === 'turbo' && state.projectId) {
+    const tb = await api.get(
+      `/api/projects/${state.projectId}/turbo`).catch(() => null);
+    state.turboStudio = tb ? tb.turbo_studio : null;
   }
   if (state.projectId) {
     try {

@@ -57,6 +57,18 @@ try:
               "bundle-includes-long-form-studio")
         check("local_pipeline/long_form.py" in names,
               "bundle-includes-long-form-engine")
+        check("local_pipeline/stock_media.py" in names,
+              "bundle-includes-stock-media-engine")
+        for module, label in (
+                ("local_pipeline/stage_machine.py", "stage-machine"),
+                ("local_pipeline/turbo.py", "turbo-engine"),
+                ("local_pipeline/turbo_script.py", "turbo-script"),
+                ("local_pipeline/timeline.py", "timeline-engine"),
+                ("local_pipeline/music_library.py", "music-library"),
+                ("creator_console/turbo_studio.py", "turbo-studio"),
+                ("creator_console/tts_runner.py", "tts-runner"),
+                ("creator_console/quota_signals.py", "quota-signals")):
+            check(module in names, f"bundle-includes-{label}")
         archive.extractall(temp / "app")
 
     notebook_path = ROOT / "experiments" / "colab" / "07_creator_console.ipynb"
@@ -74,6 +86,10 @@ try:
     check("DRIVE_ROOT / 'projects'" in source
           and "DRIVE_ROOT / 'archive'" in source,
           "projects-and-archive-derived-from-drive-root")
+    check("PEXELS_API_KEY" in source and "PIXABAY_API_KEY" in source,
+          "colab-stock-credentials-remain-server-only")
+    check("gemini_key" not in source and "env.get('GeminiKey')" in source,
+          "colab-secret-loop-has-no-stale-variable")
 
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))

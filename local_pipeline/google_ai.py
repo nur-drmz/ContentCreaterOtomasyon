@@ -548,6 +548,36 @@ TASK_REQUIRED_ACTION = {
     "antigravity_research": ACTION_AGENT,
 }
 
+#: Task -> default output-token ceiling. This is a RUNAWAY BOUND, not a way to
+#: shave tokens off the normal path: on Gemini the thinking budget is spent from
+#: the same `max_output_tokens` allowance, so a tight cap does not save money --
+#: it truncates the JSON mid-object, fails validation, and costs a SECOND
+#: request. Every value here is therefore deliberately generous, sized to the
+#: largest legitimate response for the task plus its thinking level. Callers may
+#: still pass an explicit `max_output_tokens=` and it wins.
+TASK_MAX_OUTPUT_TOKENS = {
+    # Route A, thinking_level=medium: one long-form chapter (~1500 TR words is
+    # roughly 3k tokens) plus summary/fact lists, plus the thinking budget.
+    "hotmoment_review": 16_384,
+    "script_generation": 16_384,
+    "consistency_review": 16_384,
+    "quality_audit": 16_384,
+    # Route B, thinking_level=minimal: short structured payloads only.
+    "bulk_classification": 8_192,
+    "viral_interpretation": 8_192,
+    "metadata_generation": 8_192,
+    "transcript_cleanup": 8_192,
+    # Route C: grounded answers stay short; the citations live in metadata.
+    "grounded_research": 8_192,
+}
+
+
+def max_output_tokens_for(task: str) -> int | None:
+    """The configured ceiling for a text task, or None when the task has no
+    default (TTS/embeddings do not go through `_build_generate_config`)."""
+    return TASK_MAX_OUTPUT_TOKENS.get(task)
+
+
 DEFAULT_MAX_GOOGLE_MODEL_ATTEMPTS = 4
 
 
@@ -1963,6 +1993,8 @@ def _text_task(task, prompt, *, system_instruction=None, response_schema=None,
                required_fields=(), checks=(), max_output_tokens=None, grounding=False,
                **router_kwargs):
     tokens = estimate_input_tokens(prompt) + estimate_input_tokens(system_instruction)
+    if max_output_tokens is None:
+        max_output_tokens = max_output_tokens_for(task)
 
     def call(client, model_id, spec):
         contents = prompt

@@ -456,6 +456,32 @@ class ConsoleApi:
                                max_chunks=int(payload.get("max_chunks") or 0))
             return 200, {"long_form_studio": studio.view()}
 
+        if rest == ["long-form", "broll"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "")
+            if action == "plan":
+                studio.create_broll_plan(
+                    clip_duration_sec=int(payload.get("clip_duration_sec") or 5),
+                    actor=actor)
+            elif action == "search":
+                studio.search_broll(
+                    _required(payload, "slot_id"),
+                    provider=_required(payload, "provider"),
+                    query=_required(payload, "query"),
+                    per_page=int(payload.get("per_page") or 6), actor=actor)
+            elif action == "select":
+                studio.select_broll(
+                    _required(payload, "slot_id"),
+                    _required(payload, "candidate_id"), actor=actor)
+            elif action == "download":
+                studio.download_broll(_required(payload, "slot_id"), actor=actor)
+            else:
+                raise ApiError("validation_failed",
+                               detail=f"B-roll eylemi: {action!r}")
+            return 200, {"long_form_studio": studio.view()}
+
         if rest == ["outputs"] and method == "GET":
             return 200, {"outputs": service.outputs(), "batch": service.batch_state()}
 
@@ -767,6 +793,133 @@ class ConsoleApi:
                 submitted_by=_header(headers, "x-actor") or _json_body(body).get("actor") or "console",
                 run_request_id=_json_body(body).get("run_request_id"))
             return (201 if created else 200), {"job": record, "created": created}
+
+        # GET only DESCRIBES the Turbo workflow. Opening the tab must not spend
+        # an LLM, TTS, stock-provider or render request -- this is a pure read.
+        if rest == ["turbo"] and method == "GET":
+            return 200, {"turbo_studio": service.turbo_studio().view()}
+
+        if rest == ["turbo", "brief"] and method == "POST":
+            payload = _json_body(body)
+            # Presence only. The length/range rules belong to
+            # `turbo.validate_brief` -- duplicating them here would give the
+            # project two sources of truth that silently drift apart, and
+            # would skip the rejection event the studio records.
+            _required(payload, "topic")
+            studio = service.turbo_studio()
+            actor = payload.get("actor") or service.project_actor()
+            result = studio.save_brief(payload, actor=actor)
+            return 200, {"saved": result["invalidated"],
+                         "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "approve"] and method == "POST":
+            payload = _json_body(body)
+            _required(payload, "stage")
+            studio = service.turbo_studio()
+            studio.approve_stage(
+                str(payload.get("stage") or ""),
+                actor=payload.get("actor") or service.project_actor(),
+                note=str(payload.get("note") or ""))
+            return 200, {"turbo_studio": studio.view()}
+
+        # Runs whatever is runnable NOW. It never skips a human gate: if the
+        # next stage is one, this returns the reason and runs nothing.
+        if rest == ["turbo", "stage"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            outcome = studio.run_next_stage(
+                actor=payload.get("actor") or service.project_actor(),
+                max_chunks=int(payload.get("max_chunks") or 0))
+            return 200, {"ran": outcome["ran"], "decision": outcome["decision"],
+                         "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "media"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "")
+            # Search, select and download stay three separate operator actions.
+            # Collapsing them would make opening a slot spend a provider request.
+            if action == "plan":
+                studio.run_media_plan(actor=actor)
+            elif action == "search":
+                _required(payload, "slot_id")
+                studio.search_slot(
+                    payload["slot_id"], provider=str(payload.get("provider") or ""),
+                    query=str(payload.get("query") or ""),
+                    per_page=int(payload.get("per_page") or 6), actor=actor)
+            elif action == "select":
+                _required(payload, "slot_id")
+                _required(payload, "candidate_id")
+                studio.select_clip(payload["slot_id"], payload["candidate_id"],
+                                   actor=actor)
+            elif action == "download":
+                _required(payload, "slot_id")
+                studio.download_clip(payload["slot_id"], actor=actor)
+            else:
+                raise ApiError("validation_failed",
+                               detail="materyal eylemi plan, search, select veya "
+                                      "download olmali")
+            return 200, {"turbo_studio": studio.view()}
+
+        if rest == ["turbo", "music"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            studio.choose_music(
+                origin=str(payload.get("origin") or "none"),
+                filename=str(payload.get("filename") or ""),
+                volume=float(payload.get("volume") or 0.18),
+                ducking=bool(payload.get("ducking", True)),
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"turbo_studio": studio.view()}
+
+        if rest == ["turbo", "music", "upload"] and method == "POST":
+            # Streamed like the source-video upload: the extension is checked
+            # before a byte is written and the size cap is enforced twice.
+            filename = unquote(_header(headers, "x-filename")
+                               or _first(query.get("filename")) or "")
+            studio = service.turbo_studio()
+            actor = _header(headers, "x-actor") or service.project_actor()
+            if body_stream is not None:
+                try:
+                    length = int(content_length)
+                except (TypeError, ValueError):
+                    length = 0
+                if length <= 0:
+                    raise ApiError("empty_upload")
+                track = studio.upload_music(
+                    filename=filename, stream=body_stream,
+                    content_length=length, actor=actor)
+            else:
+                if not body:
+                    raise ApiError("empty_upload")
+                track = studio.upload_music(
+                    filename=filename, payload=body,
+                    content_length=len(body), actor=actor)
+            return 201, {"track": track, "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "render"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            preset = str(payload.get("preset") or "preview")
+            record = studio.render(
+                preset=preset,
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"render": record, "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "revision"] and method == "POST":
+            payload = _json_body(body)
+            _required(payload, "kind")
+            studio = service.turbo_studio()
+            result = studio.apply_revision(
+                str(payload["kind"]), target=str(payload.get("target") or ""),
+                values=payload.get("values") or {},
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"revision": result, "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "revision-preview"] and method == "GET":
+            kind = _first(query.get("kind")) or ""
+            return 200, {"effect": service.turbo_studio().revision_preview(kind)}
 
         raise ApiError("unknown_route", detail=f"{method} /{'/'.join(parts)}")
 

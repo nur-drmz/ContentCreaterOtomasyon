@@ -196,6 +196,13 @@ def section_progress_records():
     hot = service.load_artifact("hot_moments")["data"]
     service.record_moment_selection(selected_rank=hot["hot_moments"][0]["rank"],
                                      reviewed_by="tester", require_preview=False)
+    # Render stays shut until the source's own words have been read; walk it.
+    call(app, "POST", f"/api/projects/{pid}/jobs", {
+        "job_type": "transcript",
+        "params": {"subtitle_whisper_model_size": "tiny", "subtitle_language": "auto"}})
+    _tr = service.approval_state("transcript")
+    service.approve("transcript", reviewed_sha256=_tr["content_sha256"],
+                    approved_by="tester")
     call(app, "POST", f"/api/projects/{pid}/jobs", {
         "job_type": "render",
         "params": {"render_mode": "blurred_background", "preview_mode": True,

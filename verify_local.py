@@ -1549,15 +1549,21 @@ print("CANONICAL_FUNCTION_USAGE_OK")
 
 
 # ---------------------------------------------------------------------------
-# All seven notebooks: JSON + Python AST validation.
+# Every notebook: JSON + Python AST validation.
 # ---------------------------------------------------------------------------
 
 print("\n--- All notebooks: JSON + Python AST validation ---")
 
+#: Asserted so a notebook cannot be silently deleted or added without someone
+#: noticing. The count went stale when `07_creator_console.ipynb` landed, which
+#: turned this guard into an unconditional failure that hid every section after
+#: it.
+EXPECTED_NOTEBOOKS = 8
 _notebook_paths = sorted(NOTEBOOK_DIR.glob("*.ipynb"))
-if len(_notebook_paths) != 7:
-    raise AssertionError(f"7 notebook bekleniyordu, {len(_notebook_paths)} bulundu: "
-                          f"{[p.name for p in _notebook_paths]}")
+if len(_notebook_paths) != EXPECTED_NOTEBOOKS:
+    raise AssertionError(
+        f"{EXPECTED_NOTEBOOKS} notebook bekleniyordu, {len(_notebook_paths)} "
+        f"bulundu: {[p.name for p in _notebook_paths]}")
 
 for _nb_path in _notebook_paths:
     with open(_nb_path, "r", encoding="utf-8") as f:
@@ -4005,8 +4011,11 @@ if _p0_direct["pipeline_mode"] != "original_audio_subtitles" or \
     raise AssertionError("[p0] mod -> pipeline_mode esleme yanlis")
 if sorted(_p0_direct["disabled_phases"]) != ["script_generation", "tts"]:
     raise AssertionError(f"[p0] clip-series yanlis fazlari kapatti: {_p0_direct['disabled_phases']}")
-if _p0_narr["disabled_phases"]:
-    raise AssertionError(f"[p0] narrated_theory faz kapatmamali: {_p0_narr['disabled_phases']}")
+# narrated_theory writes its OWN narration, so the source-transcript phase is
+# the one it shuts -- the mirror image of clip-series shutting script+tts.
+if sorted(_p0_narr["disabled_phases"]) != ["transcript"]:
+    raise AssertionError(
+        f"[p0] narrated_theory yalnizca transcript'i kapatmali: {_p0_narr['disabled_phases']}")
 if _p0_direct["consumes_generation_api"] is not False or \
         _p0_narr["consumes_generation_api"] is not True:
     raise AssertionError("[p0] consumes_generation_api bayragi yanlis")
@@ -4035,7 +4044,7 @@ except ValueError:
     pass
 else:
     raise AssertionError("[p0] secen kisi olmadan plan uretildi")
-print("  [p0:both-routes] clip-series -> script/tts KAPALI, narrated_theory -> tum fazlar ACIK; "
+print("  [p0:both-routes] clip-series -> script/tts KAPALI, narrated_theory -> transcript KAPALI; "
       "yer tutucu mod yok")
 
 # --- 4. Approval is hash-bound and gates every downstream phase -------------
@@ -4059,14 +4068,23 @@ if _p0_narr_approved["status"] != "approved":
     raise AssertionError("[p0] dogru hash ile onay basarisiz")
 if _approval.check_approval(_p0_narr_approved, "processing_plan")["valid"] is not True:
     raise AssertionError("[p0] taze onay gecersiz gorundu")
-for _phase in _ss.GATED_PHASES:
-    if not _ss.plan_allows_phase(_p0_narr_approved, _phase)[0]:
-        raise AssertionError(f"[p0] onayli narrated_theory planinda {_phase} kapali")
+# narrated_theory writes its OWN narration, so the source-transcript phase is
+# the one it shuts; everything else is open. Stated as an explicit table (like
+# the clip-series one below) so the closure is ASSERTED, not just tolerated.
+for _phase, _expected in (("video_analysis", True), ("moment_selection", True),
+                           ("transcript", False), ("script_generation", True),
+                           ("tts", True), ("render", True)):
+    if _ss.plan_allows_phase(_p0_narr_approved, _phase)[0] is not _expected:
+        raise AssertionError(f"[p0] onayli narrated_theory planinda {_phase} kapisi yanlis")
+if set(_ss.GATED_PHASES) != {"video_analysis", "moment_selection", "transcript",
+                              "script_generation", "tts", "render"}:
+    raise AssertionError(f"[p0] GATED_PHASES beklenmeyen: {_ss.GATED_PHASES}")
 _p0_direct_approved = _approval.approve_artifact(
     _p0_direct, "processing_plan",
     _approval.content_hash_for("processing_plan", _p0_direct), "verify_local")
 for _phase, _expected in (("video_analysis", True), ("moment_selection", True),
-                           ("script_generation", False), ("tts", False), ("render", True)):
+                           ("transcript", True), ("script_generation", False),
+                           ("tts", False), ("render", True)):
     if _ss.plan_allows_phase(_p0_direct_approved, _phase)[0] is not _expected:
         raise AssertionError(f"[p0] onayli clip-series planinda {_phase} kapisi yanlis")
 print("  [p0:approval-gating] hash disi onay reddedildi; onaysiz plan TUM fazlari durduruyor; "

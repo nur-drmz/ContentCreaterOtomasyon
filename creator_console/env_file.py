@@ -29,11 +29,19 @@ SUPPORTED_LOCAL_ENV_KEYS = frozenset({
     "AZURE_SPEECH_KEY",
     "AZURE_SPEECH_REGION",
     "TMDB_API_KEY",
+    "PEXELS_API_KEY",
+    "PIXABAY_API_KEY",
     "HF_TOKEN",
     "GITHUB_TOKEN",
     "YOUTUBE_OAUTH_CLIENT_SECRETS_PATH",
     "YOUTUBE_AUTOMATION_USE_GPU",
     "CREATOR_CONSOLE_ARCHIVE_ROOT",
+    # Documented in `.env.example` alongside ARCHIVE_ROOT and read the same way
+    # (`os.environ` in `__main__.py`), but it was never allowlisted -- so
+    # copying `.env.example` to `.env.local` made the console refuse to start
+    # with "desteklenmeyen degisken".
+    "CREATOR_CONSOLE_SOURCE_LIBRARY_ROOT",
+    "CREATOR_CONSOLE_MUSIC_ROOT",
 })
 
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

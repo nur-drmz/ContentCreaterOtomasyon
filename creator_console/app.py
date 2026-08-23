@@ -134,6 +134,9 @@ class ConsoleConfig:
     storage_root: Path
     archive_root: Path | None = None
     source_library_root: Path | None = None
+    #: Optional licensed music library. Tracks are listed with their
+    #: licence status; none is ever reported as cleared for use.
+    music_root: Path | None = None
     user_id: str = DEFAULT_USER_ID
     workspace_id: str = DEFAULT_WORKSPACE_ID
     host: str = "127.0.0.1"
@@ -215,6 +218,7 @@ class ConsoleApp:
             elevenlabs_client_factory=self.config.elevenlabs_client_factory,
             probe_fn=self.config.probe_fn,
             ffmpeg_bin=self.config.ffmpeg_bin, ffprobe_bin=self.config.ffprobe_bin,
+            music_root=self.config.music_root,
         )
 
     def save_local_secret(self, *, kind: str, value: str) -> dict:

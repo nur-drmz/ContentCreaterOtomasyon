@@ -266,9 +266,36 @@ _selection = _service.record_moment_selection(
 check(_selection["status"] == "approved", "flow:moment-selection", "secim kaydedilmedi")
 ok("flow:moment-selection", f"rank={_selection['selected_moment_rank']}")
 _auto_after_selection = _app.automatic_next_step(_own, submit=False)
+# direct_clip_series burns the source's OWN words in, so the transcript is a
+# mandatory human-read step between selection and render -- not render.
 check(_auto_after_selection["state"] == "ready" and
-      _auto_after_selection["next_job_type"] == "render",
-      "flow:auto-next", f"moment seciminden sonra render bulunamadi: {_auto_after_selection}")
+      _auto_after_selection["next_job_type"] == "transcript",
+      "flow:auto-next", f"moment seciminden sonra transcript bulunamadi: {_auto_after_selection}")
+
+# Produce and approve the caption transcript the render gate requires. Walked
+# the way a user walks it: the gate is proven, not bypassed.
+_status, _payload = api_call(_app, "POST", f"/api/projects/{_pid}/jobs",
+                             {"job_type": "transcript", "params": {
+                                 "subtitle_whisper_model_size": "small",
+                                 "subtitle_language": "auto"}})
+_transcript_job = _app.job_store(_own).get(_payload["job"]["job_id"])
+check(_transcript_job["status"] in (STATUS_REVIEW_REQUIRED, STATUS_COMPLETED),
+      "flow:transcript",
+      f"transkript isi {_transcript_job['status']}: {_transcript_job.get('error')}")
+_transcript_state = _service.approval_state("transcript")
+check(_transcript_state["present"] and _transcript_state.get("content_sha256"),
+      "flow:transcript", f"transkript incelenemez: {_transcript_state}")
+_service.approve("transcript", reviewed_sha256=_transcript_state["content_sha256"],
+                 approved_by="verify")
+check(_service.approval_state("transcript")["valid"], "flow:transcript-onay",
+      f"transkript onayi gecerli degil: {_service.approval_state('transcript')}")
+ok("flow:transcript", "transkript uretildi, okundu ve hash ile onaylandi")
+
+_auto_after_transcript = _app.automatic_next_step(_own, submit=False)
+check(_auto_after_transcript["state"] == "ready" and
+      _auto_after_transcript["next_job_type"] == "render",
+      "flow:auto-next-render",
+      f"transkript onayindan sonra render bulunamadi: {_auto_after_transcript}")
 
 fixtures.reset_provider_calls()
 _status, _payload = api_call(_app, "POST", f"/api/projects/{_pid}/jobs",
@@ -818,6 +845,24 @@ for _ in range(5):
     _view = _auto_app.automation_action(_auto_own, "tick")
     if _view["state"] != STATE_RUNNING:
         break
+# The captions are the source's own words, so automation runs the recognition
+# itself but must STOP for a human to read it -- it may not approve captions
+# any more than it may approve a narrated script.
+check(_view["blocker"] == "transcript_approval" and _view["state"] == STATE_BLOCKED,
+      "auto:stops-at-transcript", f"blocker={_view['blocker']} state={_view['state']}")
+check(_auto_svc.load_artifact("moment_transcript")["data"] is not None,
+      "auto:runs-transcript-phase", "otomasyon transkripti kendi calistirdi")
+check(_auto_svc.approval_state("transcript")["approved"] is False,
+      "auto:no-auto-transcript-approval", "otomasyon transkripti ONAYLADI")
+
+_auto_transcript_state = _auto_svc.approval_state("transcript")
+_auto_svc.approve("transcript", reviewed_sha256=_auto_transcript_state["content_sha256"],
+                  approved_by="verify_console")
+_auto_app.automation_action(_auto_own, "resume")
+for _ in range(5):
+    _view = _auto_app.automation_action(_auto_own, "tick")
+    if _view["state"] != STATE_RUNNING:
+        break
 check(_view["blocker"] == "render_approval" and _view["state"] == STATE_BLOCKED,
       "auto:stops-at-render-approval", f"blocker={_view['blocker']} state={_view['state']}")
 check(_auto_svc.approval_state("render")["approved"] is False,
@@ -919,7 +964,8 @@ check(all(j["status"] == STATUS_FAILED for j in _fail_jobs), "auto:failure-recor
       "basarisizlik is kaydinda")
 
 check(set(HUMAN_GATES) == {"plan_selection", "moment_selection", "script_approval",
-                            "voiceover_approval", "render_approval"},
+                            "voiceover_approval", "transcript_approval",
+                            "render_approval"},
       "auto:gate-vocabulary", f"insan kapilari: {HUMAN_GATES}")
 ok("auto:state-machine", "kalici durum makinesi: 5 insan kapisinda duruyor, "
    "restart'i asiyor, dongu yapmiyor, hicbir seyi onaylamiyor")
@@ -1108,7 +1154,7 @@ _wf = build_workflow_map(_pf_svc, _pf_own)
 
 _KEYS = [s["key"] for s in _wf["steps"]]
 check(_KEYS == ["source", "assessment", "plan", "analysis", "moment",
-                "script", "voice", "render", "review"],
+                "transcript", "script", "voice", "render", "review"],
       "workflow:step-order", f"sira={_KEYS}")
 check(all(s["state"] in ("completed", "current", "waiting", "blocked",
                           "failed", "skipped") for s in _wf["steps"]),
@@ -1133,7 +1179,7 @@ check(0 < _wf["percent"] < 100, "workflow:percent",
 check(_wf["mode"] is None and _wf["skipped_count"] == 0,
       "workflow:no-premature-skip",
       f"mod={_wf['mode']} atlanan={_wf['skipped_count']}")
-check(_wf["total_count"] == 9, "workflow:full-length-before-mode",
+check(_wf["total_count"] == 10, "workflow:full-length-before-mode",
       f"{_wf['total_count']} adim")
 
 api_call(_pf_app, "POST", f"/api/projects/{_pf_own.project_id}/plan", {
@@ -1156,7 +1202,7 @@ check(_states["script"]["state"] == "skipped" and _states["voice"]["state"] == "
       f"script={_states['script']['state']} voice={_states['voice']['state']}")
 check(_states["script"]["skipped_reason"] and _states["voice"]["skipped_reason"],
       "workflow:skip-explained", "atlanan adim gerekcesini soylemiyor")
-check(_after["total_count"] == 7 and _after["skipped_count"] == 2,
+check(_after["total_count"] == 8 and _after["skipped_count"] == 2,
       "workflow:skipped-not-counted",
       f"toplam={_after['total_count']} atlanan={_after['skipped_count']}")
 check(_states["render"]["state"] == "waiting",
@@ -1179,7 +1225,12 @@ _nt_states = {step["key"]: step["state"] for step in _nt_wf["steps"]}
 check(_nt_states["script"] != "skipped" and _nt_states["voice"] != "skipped",
       "workflow:narrated-keeps-narration",
       f"script={_nt_states['script']} voice={_nt_states['voice']}")
-check(_nt_wf["total_count"] == 9 and _nt_wf["skipped_count"] == 0,
+# narrated_theory writes its own script, so the source-transcript step is the
+# one that drops out -- the mirror image of direct_clip_series skipping script
+# and voice.
+check(_nt_states["transcript"] == "skipped", "workflow:narrated-skips-transcript",
+      f"transcript={_nt_states['transcript']}")
+check(_nt_wf["total_count"] == 9 and _nt_wf["skipped_count"] == 1,
       "workflow:narrated-full-length",
       f"toplam={_nt_wf['total_count']} atlanan={_nt_wf['skipped_count']}")
 check(_nt_wf["mode"] == "narrated_theory", "workflow:mode-reported", str(_nt_wf["mode"]))
@@ -1269,6 +1320,13 @@ api_call(_rr_app, "POST", f"/api/projects/{_rr_pid}/jobs", {
 _rr_hot = _rr_svc.load_artifact("hot_moments")["data"]
 _rr_svc.record_moment_selection(selected_rank=_rr_hot["hot_moments"][0]["rank"],
                                 reviewed_by="verify_console", require_preview=False)
+# The render gate needs an approved transcript in this mode; walk it.
+api_call(_rr_app, "POST", f"/api/projects/{_rr_pid}/jobs", {
+    "job_type": "transcript",
+    "params": {"subtitle_whisper_model_size": "tiny", "subtitle_language": "auto"}})
+_rr_tr = _rr_svc.approval_state("transcript")
+_rr_svc.approve("transcript", reviewed_sha256=_rr_tr["content_sha256"],
+                approved_by="verify_console")
 api_call(_rr_app, "POST", f"/api/projects/{_rr_pid}/jobs", {"job_type": "render", "params": {
     "render_mode": "blurred_background", "preview_mode": True,
     "subtitle_whisper_model_size": "small", "caption_style": "active_word_yellow",

@@ -206,10 +206,22 @@ def escape_path_for_filter(path) -> str:
 
 def build_vertical_filtergraph(mode: str, width: int, height: int, blur_sigma: int = 20,
                                zoom_scale: float = 1.0, focus_x: float = 0.5,
-                               focus_y: float = 0.5) -> str:
-    """Returns an ffmpeg filtergraph fragment (no leading/trailing brackets on the
-    overall chain) that reframes [0:v] into a vertical WxH output labeled [framed].
-    mode: 'center_crop' or 'blurred_background'.
+                               focus_y: float = 0.5, *, in_label: str = "0:v",
+                               out_label: str = "framed",
+                               label_suffix: str = "") -> str:
+    """Reframe one video stream into a WxH output. mode: 'center_crop' or
+    'blurred_background'.
+
+    Returns a COMPLETE statement, not a splice-able fragment: it names its own
+    input and output labels. With the defaults it names `[0:v]` and `[framed]`,
+    which is what every existing caller expects and what this function has
+    always produced -- byte for byte.
+
+    `in_label`, `out_label` and `label_suffix` exist because concatenating N
+    clips in one graph needs N copies of this chain, and every label in it has
+    to be unique. `blurred_background` emits FIVE labels, not one, so a caller
+    that only renamed the input and output would still collide on `bg_src`,
+    `fg_src`, `bg` and `fg`. `label_suffix` is appended to all four.
     """
     zoom = min(2.0, max(1.0, float(zoom_scale or 1.0)))
     anchor_x = min(1.0, max(0.0, float(focus_x)))
@@ -219,41 +231,57 @@ def build_vertical_filtergraph(mode: str, width: int, height: int, blur_sigma: i
         if zoom > 1.0001 else ""
     )
     crop = f"crop={width}:{height}:(iw-ow)*{anchor_x:.4f}:(ih-oh)*{anchor_y:.4f}"
+    sfx = label_suffix
     if mode == 'center_crop':
         return (
-            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"{zoom_filter.lstrip(',') + ',' if zoom_filter else ''}{crop}[framed]"
+            f"[{in_label}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"{zoom_filter.lstrip(',') + ',' if zoom_filter else ''}{crop}[{out_label}]"
         )
     if mode == 'blurred_background':
+        # Both dimensions are bound. `scale=W:-2:decrease` only constrains the
+        # width, which is harmless for a portrait target (the width is the
+        # binding edge anyway) but overflows a landscape or square one: a
+        # portrait source scaled to width 1920 becomes 3413 tall inside a 1080
+        # frame. ffmpeg does not error on that -- it silently overlays an
+        # oversized foreground at a negative offset, which is the worst kind of
+        # failure because the render still "succeeds".
         return (
-            f"[0:v]split=2[bg_src][fg_src];"
-            f"[bg_src]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},gblur=sigma={blur_sigma}[bg];"
-            f"[fg_src]scale={width}:-2:force_original_aspect_ratio=decrease"
-            f"{zoom_filter}[fg];"
-            f"[bg][fg]overlay=(W-w)*{anchor_x:.4f}:(H-h)*{anchor_y:.4f}[framed]"
+            f"[{in_label}]split=2[bg_src{sfx}][fg_src{sfx}];"
+            f"[bg_src{sfx}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},gblur=sigma={blur_sigma}[bg{sfx}];"
+            f"[fg_src{sfx}]scale={width}:{height}:force_original_aspect_ratio=decrease"
+            f"{zoom_filter}[fg{sfx}];"
+            f"[bg{sfx}][fg{sfx}]overlay=(W-w)*{anchor_x:.4f}:(H-h)*{anchor_y:.4f}"
+            f"[{out_label}]"
         )
     raise ValueError(f"bilinmeyen render mode: {mode!r} (beklenen: center_crop, blurred_background)")
 
 
 def build_audio_filtergraph(has_original_audio: bool, ducking_enabled: bool,
-                             duck_ratio: float, base_volume: float, narration_volume: float) -> str:
-    """Returns an ffmpeg filtergraph fragment mixing [0:a] (original clip audio,
-    only referenced if has_original_audio) with [1:a] (narration) into [aout]."""
+                             duck_ratio: float, base_volume: float,
+                             narration_volume: float, *, bed_label: str = "0:a",
+                             narration_label: str = "1:a",
+                             out_label: str = "aout") -> str:
+    """Mix a bed (original clip audio or music) with narration into one output.
+
+    The bed is referenced only when `has_original_audio`. Labels default to
+    `[0:a]`, `[1:a]` and `[aout]`, so existing callers get byte-identical
+    output; a timeline whose narration is input N passes its own.
+    """
     if not has_original_audio:
-        return f"[1:a]volume={narration_volume}[aout]"
+        return f"[{narration_label}]volume={narration_volume}[{out_label}]"
     if ducking_enabled:
         return (
-            f"[0:a]volume={base_volume}[bgvol];"
-            f"[1:a]volume={narration_volume}[narvol];"
+            f"[{bed_label}]volume={base_volume}[bgvol];"
+            f"[{narration_label}]volume={narration_volume}[narvol];"
             f"[narvol]asplit=2[narside][narmix];"
             f"[bgvol][narside]sidechaincompress=threshold=0.05:ratio={duck_ratio}:attack=5:release=300[ducked];"
-            f"[ducked][narmix]amix=inputs=2:duration=longest:dropout_transition=200[aout]"
+            f"[ducked][narmix]amix=inputs=2:duration=longest:dropout_transition=200[{out_label}]"
         )
     return (
-        f"[0:a]volume={base_volume}[bgvol];"
-        f"[1:a]volume={narration_volume}[narvol];"
-        f"[bgvol][narvol]amix=inputs=2:duration=longest:dropout_transition=200[aout]"
+        f"[{bed_label}]volume={base_volume}[bgvol];"
+        f"[{narration_label}]volume={narration_volume}[narvol];"
+        f"[bgvol][narvol]amix=inputs=2:duration=longest:dropout_transition=200[{out_label}]"
     )
 
 
@@ -691,12 +719,20 @@ def build_moment_transcript_artifact(words: list, cues: list, *, source: str,
     """
     corrected_words, corrected_cues, applied = apply_transcript_corrections(
         words, cues, corrections)
-    probabilities = [float(w.get('probability') or 0.0) for w in (words or [])]
+    # A word a human typed carries `probability: None` -- there is no recogniser
+    # confidence to average or to doubt. Coercing None to 0.0 both dragged the
+    # average down and marked the corrected word low-confidence, so hand-fixing
+    # a name made the transcript look WORSE. None is excluded from both.
+    probabilities = [float(w.get('probability')) for w in (words or [])
+                     if isinstance(w.get('probability'), (int, float))
+                     and not isinstance(w.get('probability'), bool)]
     low_confidence = [
         {'text': w.get('text'), 'start_sec': w.get('start'),
          'probability': w.get('probability')}
         for w in (words or [])
-        if float(w.get('probability') or 0.0) < LOW_CONFIDENCE_WORD_THRESHOLD
+        if isinstance(w.get('probability'), (int, float))
+        and not isinstance(w.get('probability'), bool)
+        and float(w.get('probability')) < LOW_CONFIDENCE_WORD_THRESHOLD
     ]
     text = ' '.join(str(w.get('text', '')) for w in corrected_words).strip()
     if not text:

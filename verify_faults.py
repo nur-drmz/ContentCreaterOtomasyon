@@ -172,6 +172,15 @@ _target.write_bytes(_good)
 
 # Manifest that references media which does not exist.
 _hot = analyze(_app, _pid, _svc)
+# direct_clip_series gates render behind a produced AND approved transcript;
+# walk that gate so this section tests the missing-media fault it is about,
+# not the caption gate.
+call(_app, "POST", f"/api/projects/{_pid}/jobs", {
+    "job_type": "transcript",
+    "params": {"subtitle_whisper_model_size": "tiny", "subtitle_language": "auto"}})
+_tr_state = _svc.approval_state("transcript")
+_svc.approve("transcript", reviewed_sha256=_tr_state["content_sha256"],
+             approved_by="verify_faults")
 call(_app, "POST", f"/api/projects/{_pid}/jobs", {"job_type": "render", "params": {
     "render_mode": "blurred_background", "preview_mode": True,
     "subtitle_whisper_model_size": "small", "caption_style": "active_word_yellow",

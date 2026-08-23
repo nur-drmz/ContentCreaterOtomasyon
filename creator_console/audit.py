@@ -50,6 +50,7 @@ EVENT_TYPES = {
     "job.recovered",
     "artifact.written",
     "artifact.rejected",
+    "transcript.manual_edits_archived",
     "approval.granted",
     "approval.rejected",
     "approval.invalidated",

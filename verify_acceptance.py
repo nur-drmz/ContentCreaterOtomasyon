@@ -46,6 +46,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 except ImportError:  # pragma: no cover
     print("PLAYWRIGHT_MISSING: 'pip install playwright' ve "
           "'python -m playwright install chromium' calistir.")
@@ -241,7 +242,7 @@ def main(argv=None) -> int:
             goto(page, base, "phase0", pid)
             check(page.locator("[data-testid=workflow-map]").count() == 1,
                   "workflow:present", "akis haritasi yok")
-            check(page.locator(".wf-step").count() == 9, "workflow:nine-steps",
+            check(page.locator(".wf-step").count() == 10, "workflow:ten-steps",
                   f"{page.locator('.wf-step').count()} adim")
             now = page.locator("[data-testid=workflow-now]").inner_text()
             check("Kaynak" in now, "workflow:starts-at-source", now.split("\n")[0])
@@ -428,6 +429,39 @@ def main(argv=None) -> int:
             view = app.automation(ownership).view()
             check(view["state"] in ("blocked", "completed"), "automation:settles",
                   f"{view['state']}/{view.get('blocker')}")
+            # The captions are the source's OWN words burned into the video, so
+            # automation runs the recognition but STOPS for a human to read it.
+            check(view.get("blocker") == "transcript_approval",
+                  "automation:stops-at-transcript", str(view.get("blocker")))
+            check(service.load_artifact("moment_transcript")["data"] is not None,
+                  "automation:ran-transcript", "otomasyon transkripti uretmedi")
+            check(service.approval_state("transcript")["approved"] is False,
+                  "automation:never-approves-transcript",
+                  "otomasyon altyaziyi kendi onayladi")
+
+            # A human reads the captions and approves them THROUGH THE UI --
+            # this is an acceptance test, so the gate is cleared the way a user
+            # clears it, not by calling the service behind the screen.
+            goto(page, base, "script", pid)
+            page.wait_for_timeout(700)
+            check(page.locator("[data-testid=approve-transcript]").count() == 1,
+                  "ui:transcript-approve-visible", "altyazi onay butonu ekranda yok")
+            page.locator("[data-testid=approve-transcript]").click()
+            page.wait_for_timeout(1200)
+            check(service.approval_state("transcript")["valid"],
+                  "ui:transcript-approved",
+                  str(service.approval_state("transcript").get("reason")))
+
+            goto(page, base, "jobs", pid)
+            page.locator("[data-testid=automation-resume]").click()
+            page.wait_for_timeout(2000)
+            auto_deadline = time.time() + 600
+            while time.time() < auto_deadline:
+                view = app.automation(ownership).view()
+                if view["state"] != "running":
+                    break
+                page.wait_for_timeout(2000)
+            view = app.automation(ownership).view()
             check(view.get("blocker") in (None, "render_approval"),
                   "automation:stops-at-human-gate", str(view.get("blocker")))
             check((service.load_artifact("render_manifest")["data"] or {}).get("status")
@@ -600,6 +634,15 @@ while True:
             state = service.render_review_state()
             check(state["done_count"] == 6, "review:checklist-persisted",
                   f"{state['done_count']}/6")
+            # The button appears on the re-render that FOLLOWS the sixth tick,
+            # and that round trip is async. A bare fixed pause passed on an idle
+            # machine and failed whenever the suite ran alongside others -- so
+            # wait for the element instead. The assertion is unchanged: the
+            # button must exist; only the deadline is explicit.
+            try:
+                page.wait_for_selector("[data-testid=approve-render]", timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
             check(page.locator("[data-testid=approve-render]").count() == 1,
                   "review:approval-unlocks", "liste tamamlaninca onay acilmadi")
 
