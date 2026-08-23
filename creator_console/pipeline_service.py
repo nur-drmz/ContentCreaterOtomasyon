@@ -21,11 +21,13 @@ import hashlib
 import io
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 from local_pipeline import (
     approval,
+    glossary as glossary_module,
     google_ai,
     metadata_studio,
     publish as publish_module,
@@ -34,6 +36,7 @@ from local_pipeline import (
     scene_editor,
     script_generation,
     source_strategy,
+    transcript_edit,
     trend_ingest,
     tts as tts_module,
     video_analysis,
@@ -64,6 +67,11 @@ ARTIFACTS = {
     "selected_script": "results/selected_script.json",
     "selected_voiceover": "results/selected_voiceover.json",
     "moment_transcript": "results/moment_transcript.json",
+    "glossary": "results/glossary.json",
+    "long_form_plan": "results/long_form_plan.json",
+    "turbo_brief": "results/turbo/brief.json",
+    "turbo_workflow": "results/turbo/workflow.json",
+    "turbo_timeline": "results/turbo/timeline.json",
     "render_manifest": "results/render/render_manifest.json",
 }
 
@@ -121,10 +129,21 @@ REQUIRED_FIELDS = {
     "selected_script": ("status", "provider_attempts"),
     "selected_voiceover": ("status",),
     "moment_transcript": ("artifact_type", "status", "words", "cues"),
+    "glossary": ("artifact_type", "status", "terms"),
+    "long_form_plan": ("artifact_type", "status", "topic", "content_type",
+                       "target_duration_min", "chapter_count"),
+    "turbo_brief": ("artifact_type", "topic", "duration_sec", "aspect_ratio",
+                    "brief_sha256"),
+    "turbo_workflow": ("artifact_type", "status", "stages"),
+    "turbo_timeline": ("artifact_type", "status", "clips", "video", "audio",
+                       "duration_sec"),
     "render_manifest": ("status", "output", "approval"),
 }
 
-SUPPORTED_SCHEMA_VERSIONS = {1}
+#: v2 adds the transcript's raw-ASR copy and revision history. Both versions
+#: stay readable: a project written before revisions existed is upgraded in
+#: memory on read and only rewritten when its owner actually edits it.
+SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 
 #: `production_ready` is normally proof that a file was hand-edited, because no
 #: phase in this project may promote itself. The publish manifest is the ONE
@@ -180,6 +199,37 @@ REWIND_PATHS = {
     ),
 }
 
+#: The caption transcript was missing from EVERY stage, so rewinding to the
+#: analysis or the moment left the previous moment's transcript in place and the
+#: next run silently reused it. Slots 2+ keep theirs under `results/render/...`
+#: and were already covered; only slot 1's historical path was orphaned.
+#:
+#: It stops at `script` because in `direct_clip_series` the transcript IS that
+#: stage's artifact. Rewinding to `voice` or `render` must NOT discard it -- the
+#: transcript is upstream of both, and throwing away a reviewed caption to redo
+#: an encode would destroy human work for no reason.
+#:
+#: `results/glossary.json` is deliberately absent from all of them: proper names
+#: are knowledge about the SOURCE, not output of a stage, and a reviewer who
+#: taught the system "Sheepstealer" should not have to teach it again because
+#: they re-ran the analysis.
+REWIND_PATHS = {
+    stage: (paths + ("results/moment_transcript.json",)
+            if stage in ("assessment", "plan", "analysis", "moment", "script")
+            else paths)
+    for stage, paths in REWIND_PATHS.items()
+}
+
+# Framing adjustments belong to the selected moment. Re-encoding the same
+# moment preserves them; selecting a different moment archives them so an old
+# face focus cannot silently carry onto a new shot.
+REWIND_PATHS = {
+    stage: (paths + ("results/render_adjustments",)
+            if stage in ("assessment", "plan", "analysis", "moment")
+            else paths)
+    for stage, paths in REWIND_PATHS.items()
+}
+
 #: A publish INTENT authorizes ONE upload of ONE exact video hash, so rewinding
 #: to any stage at or above the render invalidates it and it is archived with the
 #: rest. `publish_manifest.json` is deliberately NOT archived: it is the
@@ -200,6 +250,21 @@ REWIND_LABELS = {
     "voice": "seslendirme",
     "render": "render",
 }
+
+
+def _contiguous_runs(indices) -> list:
+    """Group sorted indices into runs of consecutive values.
+
+    `[0, 1, 4]` -> `[[0, 1], [4]]`. Used so two adjacent corrected words are
+    read as one multi-word name instead of two unrelated ones.
+    """
+    runs: list = []
+    for index in indices:
+        if runs and index == runs[-1][-1] + 1:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    return runs
 
 
 class PipelineServiceError(RuntimeError):
@@ -225,7 +290,7 @@ class PipelineService:
                  google_client_factory=None, openai_client_factory=None,
                  anthropic_client_factory=None, elevenlabs_client_factory=None,
                  probe_fn=None, ffmpeg_bin=None, ffprobe_bin=None, audit: AuditLog | None = None,
-                 youtube_provider=None):
+                 youtube_provider=None, music_root=None):
         self.storage = storage
         self.ownership = ownership
         self.secrets = secret_resolver
@@ -240,6 +305,10 @@ class PipelineService:
         self._ffmpeg_bin = ffmpeg_bin
         self._ffprobe_bin = ffprobe_bin
         self._cancel_check = None
+        # Injected like every other environment fact, rather than read
+        # from a global config: this class must stay constructible in a
+        # test without an app around it.
+        self.music_root = music_root
         # Publication provider: injectable for the same reason, and lazily built
         # so merely constructing the service never touches the OAuth token file.
         self._youtube_provider = youtube_provider
@@ -469,6 +538,103 @@ class PipelineService:
         )
         return record
 
+    def save_long_form_plan(self, *, topic: str, content_type: str,
+                            target_duration_min: int, chapter_count: int,
+                            language: str, tone: str, audience: str,
+                            angle: str = "", narration_mode: str = "undecided",
+                            include_subtitles: bool = True, notes: str = "",
+                            updated_by: str = "console") -> dict:
+        """Persist a planning-only long-form brief; never starts generation."""
+        topic = str(topic or "").strip()
+        angle = str(angle or "").strip()
+        audience = str(audience or "").strip()
+        notes = str(notes or "").strip()
+        content_type = str(content_type or "").strip()
+        language = str(language or "").strip()
+        tone = str(tone or "").strip()
+        narration_mode = str(narration_mode or "").strip()
+        if not topic:
+            raise PipelineServiceError("uzun video konusu bos olamaz")
+        if len(topic) > 300:
+            raise PipelineServiceError("uzun video konusu en fazla 300 karakter olabilir")
+        if len(angle) > 1000:
+            raise PipelineServiceError("anlatim acisi en fazla 1000 karakter olabilir")
+        if len(audience) > 300:
+            raise PipelineServiceError("hedef kitle en fazla 300 karakter olabilir")
+        if len(notes) > 3000:
+            raise PipelineServiceError("uzun video notlari en fazla 3000 karakter olabilir")
+        if content_type not in {"theory", "explainer", "comparison"}:
+            raise PipelineServiceError("uzun video turu gecersiz")
+        if language not in {"tr-TR", "en-US"}:
+            raise PipelineServiceError("uzun video dili gecersiz")
+        if tone not in {"cinematic", "documentary", "conversational", "analytical"}:
+            raise PipelineServiceError("uzun video tonu gecersiz")
+        if narration_mode not in {"undecided", "tts", "own_voice"}:
+            raise PipelineServiceError("uzun video ses tercihi gecersiz")
+        try:
+            duration_value = float(target_duration_min)
+            chapters_value = float(chapter_count)
+        except (TypeError, ValueError) as exc:
+            raise PipelineServiceError("uzun video suresi ve bolum sayisi sayi olmali") from exc
+        if not duration_value.is_integer() or not chapters_value.is_integer():
+            raise PipelineServiceError("uzun video suresi ve bolum sayisi tam sayi olmali")
+        duration = int(duration_value)
+        chapters = int(chapters_value)
+        if duration < 15 or duration > 20:
+            raise PipelineServiceError("uzun video hedef suresi 15-20 dakika olmali")
+        if chapters < 5 or chapters > 7:
+            raise PipelineServiceError("uzun video bolum sayisi 5-7 olmali")
+
+        current = self.load_artifact("long_form_plan").get("data") or {}
+        now = _now_iso()
+        record = {
+            "schema_version": 1,
+            "artifact_type": "long_form_plan",
+            "status": "draft",
+            "status_reason": "plan kaydedildi; outline ve uretim henuz baslatilmadi",
+            "topic": topic,
+            "content_type": content_type,
+            "target_duration_min": duration,
+            "estimated_word_range": {
+                "minimum": duration * 130,
+                "maximum": duration * 150,
+            },
+            "chapter_count": chapters,
+            "language": language,
+            "tone": tone,
+            "audience": audience,
+            "angle": angle,
+            "narration_mode": narration_mode,
+            "include_subtitles": bool(include_subtitles),
+            "notes": notes,
+            "planning_only": True,
+            "generation_started": False,
+            "created_at": current.get("created_at") or now,
+            "updated_at": now,
+            "updated_by": str(updated_by or "console")[:120],
+        }
+        self.write_artifact("long_form_plan", record, actor=updated_by)
+        return record
+
+    def long_form_studio(self):
+        """The long-form workflow for this project.
+
+        Built on demand rather than in __init__ so a Shorts-only project never
+        pays for it and the Shorts pipeline keeps no reference to it.
+        """
+        from .long_form_studio import LongFormStudio
+        return LongFormStudio(self)
+
+    def turbo_studio(self):
+        """The Turbo workflow for this project.
+
+        Same on-demand construction as `long_form_studio`: a project that never
+        opens the Turbo tab never builds one, and neither of the other two
+        pipelines holds a reference to it.
+        """
+        from .turbo_studio import TurboStudio
+        return TurboStudio(self)
+
     # ------------------------------------------------------- project lifecycle
     def _archive_revision(self, paths, *, action: str, actor: str,
                           target: str | None = None) -> dict:
@@ -550,6 +716,280 @@ class PipelineService:
             "moved_paths": revision["moved_paths"],
         })
         return {"project": project, "revision": revision}
+
+    # ------------------------------------------------------- guided revision
+    #: Which rewind stage each review item's fix really lives at. A SUGGESTION,
+    #: never applied on its own: "crop is wrong" can mean the plan's framing was
+    #: wrong (re-plan) or that this one moment is badly framed (re-select), and
+    #: only the person who watched the video knows which.
+    REVISION_STAGE_HINTS = {
+        "clip_boundaries": "moment",
+        "crop": "plan",
+        "subtitle_sync": "script",
+        "active_word_highlight": "script",
+        "font_readability": "plan",
+        "audio_continuity": "moment",
+    }
+
+    def render_adjustment_relative(self, slot: int = 1) -> str:
+        index = self.require_slot(slot)
+        return f"results/render_adjustments/output_{index:02d}.json"
+
+    def render_adjustment(self, slot: int = 1) -> dict:
+        loaded = self.load_artifact_path(self.render_adjustment_relative(slot))
+        if not isinstance(loaded, dict):
+            return {"frame_zoom": 1.0, "frame_focus_x": 0.5,
+                    "frame_focus_y": 0.5, "source": "default"}
+        return {
+            "frame_zoom": min(2.0, max(1.0, float(loaded.get("frame_zoom", 1.0)))),
+            "frame_focus_x": min(1.0, max(0.0, float(loaded.get("frame_focus_x", 0.5)))),
+            "frame_focus_y": min(1.0, max(0.0, float(loaded.get("frame_focus_y", 0.5)))),
+            "source": loaded.get("source") or "saved_revision",
+            "reason": loaded.get("reason") or "",
+            "updated_at": loaded.get("updated_at"),
+        }
+
+    @staticmethod
+    def infer_render_adjustment(notes: str, current=None) -> dict | None:
+        """Parse a deliberately small, auditable framing vocabulary.
+
+        This is not an LLM pretending to understand arbitrary edit direction.
+        It only acts when the note contains an unambiguous zoom/focus command.
+        """
+        text = str(notes or "").casefold().translate(str.maketrans({
+            "ı": "i", "ş": "s", "ğ": "g", "ü": "u", "ö": "o", "ç": "c",
+        }))
+        base = current or {}
+        zoom = float(base.get("frame_zoom", 1.0) or 1.0)
+        focus_x = float(base.get("frame_focus_x", 0.5) or 0.5)
+        focus_y = float(base.get("frame_focus_y", 0.5) or 0.5)
+        matched = []
+        if any(token in text for token in
+               ("yakinlas", "yakinlastir", "zoom in", "zoomla", "daha yakin")):
+            zoom = 1.12 if "biraz" in text else 1.20
+            matched.append("zoom_in")
+        elif any(token in text for token in ("uzaklas", "zoom out", "uzaklastir")):
+            zoom = 1.0
+            matched.append("zoom_out")
+        if any(token in text for token in ("sola odak", "sol tarafa", "sola kaydir")):
+            focus_x = 0.30
+            matched.append("focus_left")
+        elif any(token in text for token in ("saga odak", "sag tarafa", "saga kaydir")):
+            focus_x = 0.70
+            matched.append("focus_right")
+        if any(token in text for token in
+               ("yukariya odak", "yukari odak", "yukari kaydir")):
+            focus_y = 0.30
+            matched.append("focus_up")
+        elif any(token in text for token in
+                 ("asagiya odak", "asagi odak", "asagi kaydir")):
+            focus_y = 0.70
+            matched.append("focus_down")
+        if not matched:
+            return None
+        return {"frame_zoom": zoom, "frame_focus_x": focus_x,
+                "frame_focus_y": focus_y, "matched_commands": matched}
+
+    def save_render_adjustment(self, adjustment: dict, *, notes: str, actor: str,
+                               slot: int = 1) -> dict:
+        record = {
+            "artifact_type": "render_adjustment", "schema_version": 1,
+            "status": "active", "not_uploaded": True,
+            "frame_zoom": min(2.0, max(1.0, float(adjustment["frame_zoom"]))),
+            "frame_focus_x": min(1.0, max(0.0, float(adjustment["frame_focus_x"]))),
+            "frame_focus_y": min(1.0, max(0.0, float(adjustment["frame_focus_y"]))),
+            "matched_commands": list(adjustment.get("matched_commands") or []),
+            "source": "revision_note", "reason": str(notes or "")[:2000],
+            "updated_at": _now_iso(), "updated_by": str(actor or "console")[:120],
+        }
+        relative = self.render_adjustment_relative(slot)
+        atomic_write_json(self.storage.resolve(self.ownership, relative, create_parent=True),
+                          record)
+        self.audit.record("artifact.written", actor=actor, artifact=relative,
+                          detail={"slot": int(slot), "frame_zoom": record["frame_zoom"],
+                                  "matched_commands": record["matched_commands"]})
+        return record
+
+    def revision_plan(self, *, target: str, slot: int = 1) -> dict:
+        """What starting this revision WOULD archive. Pure read, changes nothing.
+
+        Shown before the button is pressed because the honest question is not
+        "are you sure" but "are you sure about THESE files". A confirmation
+        dialog that cannot name what it destroys is not consent.
+        """
+        if target not in REWIND_PATHS:
+            raise PipelineServiceError(
+                f"gecersiz revizyon asamasi: {target!r} (beklenen: {sorted(REWIND_PATHS)})")
+        entries = []
+        for relative in REWIND_PATHS[target]:
+            try:
+                path = self.storage.resolve(self.ownership, relative)
+            except StorageViolation:
+                continue
+            if not path.exists():
+                continue
+            if path.is_dir():
+                files = [child for child in path.rglob("*") if child.is_file()]
+                entries.append({"path": relative, "kind": "dir",
+                                "file_count": len(files),
+                                "size_bytes": sum(f.stat().st_size for f in files)})
+            else:
+                entries.append({"path": relative, "kind": "file", "file_count": 1,
+                                "size_bytes": path.stat().st_size})
+        current_review = self.render_review_state(slot)
+        open_note = ((current_review.get("open_revision") or {}).get("notes") or "")
+        inferred = (self.infer_render_adjustment(
+            open_note, self.render_adjustment(slot)) if target == "render" else None)
+        return {
+            "target": target,
+            "label": REWIND_LABELS.get(target, target),
+            "slot": int(slot or 1),
+            "moves": entries,
+            "file_count": sum(entry["file_count"] for entry in entries),
+            "size_bytes": sum(entry["size_bytes"] for entry in entries),
+            "nothing_to_move": not entries,
+            # Said plainly: the previous attempt is not deleted, and that is why
+            # there is no "are you sure you want to lose this" here.
+            # Where they actually land: storage.resolve strips the leading dot,
+            # so the archive is <proje>/revisions/<id>/, not '.revisions'.
+            "destination": "revisions/<revizyon-id>/",
+            "reversible": True,
+            "not_uploaded": True,
+            "suggested_render_adjustment": inferred,
+        }
+
+    def suggested_revision_stage(self, slot: int = 1) -> dict:
+        """Stage suggested by the failing review items, with the reason.
+
+        Derived from what the reviewer actually rejected rather than from free
+        text: interpreting a sentence would mean asking a model which artifacts
+        to destroy, and this mode is contractually provider-free anyway.
+        """
+        state = self.render_review_state(slot)
+        open_revision = state.get("open_revision") or {}
+        target_map = {
+            "moments": "moment", "phase0": "plan", "script": "script",
+            "voice": "voice", "render": "render",
+        }
+        explicit_stage = target_map.get(open_revision.get("target_tab"))
+        if explicit_stage:
+            return {
+                "stage": explicit_stage,
+                "reasons": [f"Kayitli duzeltme hedefi -> "
+                            f"{REWIND_LABELS.get(explicit_stage, explicit_stage)}"],
+                "note": "Revizyon kaydinda kullanicinin sectigi hedef esas alindi.",
+            }
+        order = ["assessment", "plan", "analysis", "moment", "script", "voice", "render"]
+        unchecked = [item for item in (state.get("items") or [])
+                     if not item.get("checked")]
+        stages, reasons = [], []
+        for item in unchecked:
+            stage = self.REVISION_STAGE_HINTS.get(item.get("key"))
+            if stage:
+                stages.append(stage)
+                reasons.append(f"{item.get('label') or item.get('key')} -> "
+                               f"{REWIND_LABELS.get(stage, stage)}")
+        if not stages:
+            # Everything passed, or nothing was reviewed. Redoing only the render
+            # is the smallest thing that can be meant by "do it again".
+            return {"stage": "render", "reasons": [],
+                    "note": "Isaretlenmemis inceleme maddesi yok; en dar kapsam "
+                            "olarak yalnizca render onerildi."}
+        # The EARLIEST stage wins: fixing the framing and then re-rendering with a
+        # stale moment would fix one complaint and keep the other.
+        earliest = min(stages, key=order.index)
+        return {"stage": earliest, "reasons": reasons,
+                "note": f"En erken asama secildi ({REWIND_LABELS.get(earliest, earliest)}); "
+                        "daha gec bir asamadan baslamak onceki sikayeti cozmeden birakir."}
+
+    def start_revision(self, *, target: str, notes: str = "", actor: str = "console",
+                       slot: int = 1) -> dict:
+        """Archive the invalidated stage and hand the project back for a rerun.
+
+        This is the step that was missing. Requesting a revision used to be a
+        NOTE -- it changed no artifact and moved nothing -- so the rejected clip,
+        transcript and video stayed exactly where the next run would pick them
+        up again. Nothing is deleted: `_archive_revision` MOVES the paths into
+        `.revisions/<id>/` with a manifest, so a revision taken by mistake is
+        recoverable.
+        """
+        slot = self.require_slot(slot)
+        plan = self.revision_plan(target=target, slot=slot)
+        if plan["nothing_to_move"]:
+            raise PipelineServiceError(
+                f"{plan['label']} asamasinda tasinacak bir cikti yok; "
+                "bu asama zaten bos.")
+        open_note = ((self.render_review_state(slot).get("open_revision") or {})
+                     .get("notes") or "")
+        note = str(notes or open_note or "").strip()[:2000]
+        # Record the reason BEFORE moving anything: if the move fails halfway the
+        # project still says why someone tried.
+        if note:
+            try:
+                self.request_render_revision(requested_by=actor, notes=note,
+                                             target_tab="render", slot=slot)
+            except PipelineServiceError:
+                # No render to attach the note to (rewinding from an earlier
+                # stage). The audit entry below still carries it.
+                pass
+        adjustment = None
+        if target == "render":
+            inferred = self.infer_render_adjustment(note, self.render_adjustment(slot))
+            if inferred:
+                adjustment = self.save_render_adjustment(
+                    inferred, notes=note, actor=actor, slot=slot)
+        result = self.rewind_project(target=target, actor=actor)
+        self.audit.record("project.rewound", actor=actor, detail={
+            "revision_started": True, "target": target, "slot": slot,
+            "revision_id": result["revision"]["revision_id"],
+            "moved_paths": result["revision"]["moved_paths"],
+            "has_notes": bool(note),
+        })
+        return {"revision": result["revision"], "project": result["project"],
+                "plan": plan, "next_stage": target,
+                "label": REWIND_LABELS.get(target, target),
+                "render_adjustment": adjustment}
+
+    def archive_view(self, *, limit: int = 20) -> dict:
+        """The archive, so a moved-away attempt is visible instead of merely gone."""
+        records = self.revisions(limit=limit)
+        return {
+            "revisions": [
+                {"revision_id": item.get("revision_id"), "action": item.get("action"),
+                 "target": item.get("target"), "created_at": item.get("created_at"),
+                 "created_by": item.get("created_by"),
+                 "moved_paths": item.get("moved_paths") or [],
+                 "path_count": len(item.get("moved_paths") or [])}
+                for item in records
+            ],
+            "count": len(records),
+            "hint": ("Revizyon baslatildiginda eski ciktilar silinmez, buraya "
+                     "tasinir. Kalici silme ayri ve acik bir islemdir."),
+            "not_uploaded": True,
+        }
+
+    def purge_revision(self, *, revision_id: str, confirmation: str,
+                       actor: str = "console") -> dict:
+        """Permanently delete ONE archived revision.
+
+        Separate from starting a revision, and gated by typing the id back:
+        archiving exists so a wrong decision is recoverable, and a delete that
+        rides along with the revision button would quietly remove that safety.
+        """
+        identifier = str(revision_id or "").strip()
+        if not identifier or "/" in identifier or "\\" in identifier \
+                or identifier.startswith("."):
+            raise PipelineServiceError(f"gecersiz revizyon kimligi: {revision_id!r}")
+        if str(confirmation or "").strip() != identifier:
+            raise PipelineServiceError(
+                "Kalici silme icin revizyon kimligini birebir yazmalisin.")
+        root = self.storage.resolve(self.ownership, ".revisions", identifier)
+        if not root.is_dir():
+            raise LookupError(f"arsivlenmis revizyon bulunamadi: {identifier}")
+        shutil.rmtree(root)
+        self.audit.record("project.reset", actor=actor,
+                          detail={"purged_revision": identifier})
+        return self.archive_view()
 
     def reset_project(self, *, keep_source: bool = True,
                       actor: str = "console") -> dict:
@@ -1740,6 +2180,17 @@ class PipelineService:
                     "Kendi icerigi degismedi ama YUKARI-AKIS degisti, bu yuzden bu onay "
                     "artik gecerli sayilmiyor: " + "; ".join(problems)
                 )
+            # A render built from an older transcript revision is stale even when
+            # nothing upstream still holds an INVALID approval: editing a
+            # transcript clears its approval outright, so there is no
+            # "approved but no longer valid" upstream state left to notice, and
+            # a render approved before the edit would otherwise keep looking fine.
+            if kind == "render":
+                drift = self._render_transcript_drift(slot)
+                if drift:
+                    problems = list(problems) + [drift]
+                    state["upstream_invalid"] = problems
+                    state["effective_valid"] = False
             states[kind] = state
             if state.get("present") and not state.get("effective_valid") \
                     and state.get("approved"):
@@ -1753,6 +2204,25 @@ class PipelineService:
                                       "in_chain": False})
             states[kind].setdefault("in_chain", kind in chain)
         return states
+
+    def _render_transcript_drift(self, slot: int):
+        """Message when the rendered video predates the current transcript.
+
+        Compares the digest the manifest recorded at render time with the
+        transcript's digest now. Manifests written before that digest existed
+        carry none and are NOT reported: claiming drift we cannot actually
+        observe would be worse than staying quiet about it.
+        """
+        manifest = self.load_artifact("render_manifest", slot=slot)["data"] or {}
+        recorded = (manifest.get("subtitles") or {}).get("transcript_content_sha256")
+        if not recorded:
+            return None
+        current = render_utils._transcript_digest(
+            self.load_artifact("moment_transcript", slot=slot)["data"] or {})
+        if current and current != recorded:
+            return ("transcript: render bu altyazi revizyonundan once uretildi; "
+                    "video guncel metni yansitmiyor")
+        return None
 
     def invalidated_approvals(self) -> list:
         """Approvals that were granted but no longer bind -- their own content or
@@ -2129,6 +2599,242 @@ class PipelineService:
             tracker.finish(message=f"{artifact.get('duration_sec', 0)}s ses hazir")
         return artifact
 
+    # ------------------------------------------------------------- glossary
+    def glossary(self) -> dict:
+        """Project glossary, or an empty one.
+
+        Deliberately NOT per-slot: a proper name is a fact about the source, not
+        about one Short cut from it, and every Short of a project should benefit
+        from a name its sibling's reviewer already fixed.
+        """
+        record = self.load_artifact("glossary")["data"]
+        return record if isinstance(record, dict) else glossary_module.new_glossary(
+            self.ownership)
+
+    def glossary_view(self) -> dict:
+        return glossary_module.summarise(self.glossary())
+
+    def set_glossary_terms(self, terms, *, actor: str) -> dict:
+        record = glossary_module.set_terms(self.glossary(), terms, actor=actor)
+        relative = self.write_artifact("glossary", record, actor=actor)
+        # Count only. The terms are the user's own content; an append-only log
+        # that outlives the artifact is the wrong place to copy them into.
+        self.audit.record("artifact.written", actor=actor, artifact=relative,
+                          detail={"glossary_terms": len(record.get("terms") or [])})
+        return self.glossary_view()
+
+    def accept_glossary_suggestion(self, term: str, *, actor: str) -> dict:
+        """Promote a suggested term into the list the recogniser is given."""
+        record = self.glossary()
+        entries = list(glossary_module.terms_of(record))
+        entries.append({"term": term, "source": "suggestion"})
+        record = glossary_module.set_terms(record, entries, actor=actor)
+        key = glossary_module.normalise(term)
+        record["suggestions"] = [item for item in (record.get("suggestions") or [])
+                                 if item.get("key") != key]
+        relative = self.write_artifact("glossary", record, actor=actor)
+        self.audit.record("artifact.written", actor=actor, artifact=relative,
+                          detail={"glossary_terms": len(record.get("terms") or []),
+                                  "accepted_suggestion": True})
+        return self.glossary_view()
+
+    # ----------------------------------------------------- transcript edits
+    def _transcript_artifact(self, slot: int) -> tuple:
+        """The slot's transcript upgraded to the revision-aware shape.
+
+        Upgrading on READ rather than migrating on disk is what keeps projects
+        that predate revisions working: nothing is rewritten until the user
+        actually edits, and an untouched old project stays byte-identical.
+        """
+        loaded = self.load_artifact("moment_transcript", required=True, slot=slot)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        return transcript_edit.ensure_v2(loaded["data"] or {}), loaded
+
+    def transcript_segments(self, slot: int = 1) -> list:
+        artifact, _ = self._transcript_artifact(slot)
+        return transcript_edit.build_segments(
+            artifact,
+            low_confidence_threshold=render_utils.LOW_CONFIDENCE_WORD_THRESHOLD)
+
+    def save_transcript_edits(self, *, segments=None, full_text=None,
+                              edited_by: str, slot: int = 1) -> dict:
+        """Persist a human edit as a NEW REVISION over the same timings.
+
+        Exactly one of `segments` or `full_text` is accepted. Both paths end in
+        the same per-segment application, so the whole-transcript textarea
+        cannot take a shortcut that the row editor does not.
+        """
+        slot = self.require_slot(slot)
+        if (segments is None) == (full_text is None):
+            raise PipelineServiceError(
+                "ya segment listesi ya da tam metin verilmeli (ikisi birden degil)")
+        artifact, _loaded = self._transcript_artifact(slot)
+        previous_sha = transcript_edit.content_sha256(artifact)
+
+        if full_text is not None:
+            pairs = transcript_edit.parse_full_text(
+                artifact, full_text,
+                low_confidence_threshold=render_utils.LOW_CONFIDENCE_WORD_THRESHOLD)
+        else:
+            pairs = []
+            for item in (segments or []):
+                identifier = str((item or {}).get("id") or "").strip()
+                if not identifier:
+                    raise PipelineServiceError("segment id'si eksik")
+                pairs.append((identifier, (item or {}).get("text")))
+
+        problems = transcript_edit.validate_segment_texts(pairs)
+        if problems:
+            raise PipelineServiceError("; ".join(problems[:6]))
+
+        applied = transcript_edit.apply_segment_texts(artifact, pairs)
+        if not applied["changed_segment_ids"]:
+            # Nothing changed: writing a revision would claim an edit that did
+            # not happen and would drop a still-valid approval.
+            return self.transcript_view(slot)
+
+        rebuilt = render_utils.build_moment_transcript_artifact(
+            applied["words"], applied["cues"],
+            source=artifact.get("source"), language=artifact.get("language"),
+            moment_rank=artifact.get("moment_rank"),
+            moment_selection_sha256=artifact.get("moment_selection_sha256"),
+            whisper_model_size=artifact.get("whisper_model_size"),
+            initial_prompt_used=artifact.get("initial_prompt_used"),
+            corrections=artifact.get("corrections"),
+            asr=artifact.get("asr"),
+            revisions=artifact.get("revisions"),
+            edited_segment_ids=artifact.get("edited_segment_ids"),
+            glossary_context=artifact.get("glossary_context"))
+        rebuilt = transcript_edit.append_revision(
+            rebuilt, actor=edited_by,
+            kind=("full_text_edit" if full_text is not None else "segment_edit"),
+            previous_sha256=previous_sha,
+            changed_segment_ids=applied["changed_segment_ids"])
+
+        relative = self.write_artifact("moment_transcript", rebuilt,
+                                       actor=edited_by, slot=slot)
+        # Identifiers and counts only -- never the transcript text. A caption is
+        # the user's content and the audit log is not where it should be copied.
+        self.audit.record(
+            "artifact.written", actor=edited_by, artifact=relative,
+            detail={"slot": slot, "revision": rebuilt.get("revision"),
+                    "changed_segments": applied["changed_segment_ids"],
+                    "changed_count": len(applied["changed_segment_ids"]),
+                    "edit_kind": ("full_text" if full_text is not None else "segment")})
+
+        # A manual fix is also vocabulary: offer to remember the new spelling so
+        # the NEXT transcription gets it right at recognition time.
+        self._record_glossary_suggestions_from_edit(
+            artifact, rebuilt, applied["changed_segment_ids"], actor=edited_by)
+        return self.transcript_view(slot)
+
+    def set_transcript_exclusions(self, *, segment_ids, excluded: bool,
+                                  actor: str, slot: int = 1) -> dict:
+        """Keep selected vocals reviewable while excluding them from captions."""
+        slot = self.require_slot(slot)
+        artifact, _loaded = self._transcript_artifact(slot)
+        previous_sha = transcript_edit.content_sha256(artifact)
+        try:
+            applied = transcript_edit.apply_segment_exclusions(
+                artifact, segment_ids, excluded=excluded)
+        except transcript_edit.TranscriptEditError as exc:
+            raise PipelineServiceError(str(exc)) from exc
+        if not applied["changed_segment_ids"]:
+            return self.transcript_view(slot)
+        rebuilt = render_utils.build_moment_transcript_artifact(
+            applied["words"], applied["cues"],
+            source=artifact.get("source"), language=artifact.get("language"),
+            moment_rank=artifact.get("moment_rank"),
+            moment_selection_sha256=artifact.get("moment_selection_sha256"),
+            whisper_model_size=artifact.get("whisper_model_size"),
+            initial_prompt_used=artifact.get("initial_prompt_used"),
+            corrections=artifact.get("corrections"), asr=artifact.get("asr"),
+            revisions=artifact.get("revisions"),
+            edited_segment_ids=artifact.get("edited_segment_ids"),
+            glossary_context=artifact.get("glossary_context"))
+        rebuilt = transcript_edit.append_revision(
+            rebuilt, actor=actor,
+            kind=("subtitle_exclusion" if excluded else "subtitle_inclusion"),
+            previous_sha256=previous_sha,
+            changed_segment_ids=applied["changed_segment_ids"])
+        relative = self.write_artifact("moment_transcript", rebuilt,
+                                       actor=actor, slot=slot)
+        self.audit.record(
+            "artifact.written", actor=actor, artifact=relative,
+            detail={"slot": slot, "caption_excluded": bool(excluded),
+                    "changed_segments": applied["changed_segment_ids"]})
+        return self.transcript_view(slot)
+
+    def _record_glossary_suggestions_from_edit(self, before, after, changed_ids,
+                                               *, actor: str) -> None:
+        threshold = render_utils.LOW_CONFIDENCE_WORD_THRESHOLD
+        old_map = {segment["id"]: segment["text"] for segment in
+                   transcript_edit.build_segments(before, low_confidence_threshold=threshold)}
+        new_map = {segment["id"]: segment["text"] for segment in
+                   transcript_edit.build_segments(after, low_confidence_threshold=threshold)}
+        record = self.glossary()
+        proposals = []
+        for identifier in changed_ids:
+            old_tokens = str(old_map.get(identifier, "")).split()
+            new_tokens = str(new_map.get(identifier, "")).split()
+            # Word-for-word replacements are the ones that name something; a
+            # wholesale rewrite is a sentence fix, not a proper noun.
+            if old_tokens and len(old_tokens) == len(new_tokens):
+                # ADJACENT changed words are ONE name, not several. Suggesting
+                # them separately turned "Steelers Rider!" -> "Sheepstealer's
+                # rider" into the term "Sheepstealer's", losing the half that
+                # makes it a name -- and "rider" alone is dropped as an ordinary
+                # lowercase word, so the phrase the human actually taught was
+                # never offered back.
+                changed = [index for index, (old_token, new_token)
+                           in enumerate(zip(old_tokens, new_tokens))
+                           if old_token != new_token]
+                for run in _contiguous_runs(changed):
+                    start, stop = run[0], run[-1] + 1
+                    proposals.extend(glossary_module.suggest_terms_from_correction(
+                        " ".join(old_tokens[start:stop]),
+                        " ".join(new_tokens[start:stop]), record))
+            elif new_tokens:
+                proposals.extend(glossary_module.suggest_terms_from_correction(
+                    " ".join(old_tokens), " ".join(new_tokens), record))
+        if not proposals:
+            return
+        record = glossary_module.record_suggestions(record, proposals, actor=actor)
+        self.write_artifact("glossary", record, actor=actor)
+
+    def restore_transcript_from_asr(self, *, actor: str, slot: int = 1) -> dict:
+        """Put the recogniser's own output back as the current content.
+
+        Possible only because `asr` was never overwritten. Recorded as a
+        revision like any other edit, so the history shows the revert instead of
+        looking like the manual work never happened.
+        """
+        slot = self.require_slot(slot)
+        artifact, _ = self._transcript_artifact(slot)
+        raw = artifact.get("asr") or {}
+        if not (raw.get("words") or raw.get("cues")):
+            raise PipelineServiceError("bu transkript icin saklanmis ham ASR ciktisi yok")
+        previous_sha = transcript_edit.content_sha256(artifact)
+        rebuilt = render_utils.build_moment_transcript_artifact(
+            [dict(word) for word in (raw.get("words") or [])],
+            [dict(cue) for cue in (raw.get("cues") or [])],
+            source=artifact.get("source"), language=artifact.get("language"),
+            moment_rank=artifact.get("moment_rank"),
+            moment_selection_sha256=artifact.get("moment_selection_sha256"),
+            whisper_model_size=artifact.get("whisper_model_size"),
+            initial_prompt_used=artifact.get("initial_prompt_used"),
+            corrections=[], asr=raw, revisions=artifact.get("revisions"),
+            edited_segment_ids=[], glossary_context=artifact.get("glossary_context"))
+        rebuilt = transcript_edit.append_revision(
+            rebuilt, actor=actor, kind="restore_asr",
+            previous_sha256=previous_sha, changed_segment_ids=[])
+        relative = self.write_artifact("moment_transcript", rebuilt, actor=actor, slot=slot)
+        self.audit.record("artifact.written", actor=actor, artifact=relative,
+                          detail={"slot": slot, "revision": rebuilt.get("revision"),
+                                  "edit_kind": "restore_asr"})
+        return self.transcript_view(slot)
+
     def transcript_view(self, slot: int = 1) -> dict:
         """A curated slice for the caption screen.
 
@@ -2142,9 +2848,19 @@ class PipelineService:
         allowed, gate_reason = self.plan_gate("transcript")
         state = self.approval_state("transcript", slot) if data else {}
         selection = self.load_artifact("moment_selection", slot=slot)["data"] or {}
+        upgraded = transcript_edit.ensure_v2(data) if data else {}
+        segments = (transcript_edit.build_segments(
+            upgraded, low_confidence_threshold=render_utils.LOW_CONFIDENCE_WORD_THRESHOLD)
+            if data else [])
+        suggestions = (glossary_module.suggest_for_text(
+            upgraded.get("text") or "", self.glossary(),
+            low_confidence_terms=[w.get("text") for w in
+                                  (upgraded.get("low_confidence_words") or [])])
+            if data else [])
         return {
             "slot": slot,
             "available": bool(data),
+            **transcript_edit.revision_summary(upgraded),
             "problem": loaded["problem"],
             "phase_allowed": bool(allowed),
             "phase_reason": gate_reason,
@@ -2157,11 +2873,25 @@ class PipelineService:
             "text": data.get("text"),
             "word_count": data.get("word_count"),
             "cue_count": data.get("cue_count"),
+            "excluded_cue_count": sum(
+                bool(cue.get("excluded_from_subtitles"))
+                for cue in (data.get("cues") or [])),
             "has_speech": data.get("has_speech"),
             "average_word_probability": data.get("average_word_probability"),
             "low_confidence_words": data.get("low_confidence_words") or [],
             "low_confidence_count": data.get("low_confidence_count"),
             "corrections": data.get("corrections") or [],
+            # The whole transcript, in order, one editable row per caption line.
+            # A summary was all this screen used to show, so a misheard proper
+            # noun could not be seen -- let alone fixed -- before it was burned
+            # into the video.
+            "segments": segments,
+            "full_text": transcript_edit.segments_to_text(segments),
+            "limits": {"max_segment_chars": transcript_edit.MAX_SEGMENT_CHARS,
+                       "max_total_chars": transcript_edit.MAX_TOTAL_CHARS},
+            "glossary": self.glossary_view(),
+            "glossary_context": data.get("glossary_context") or {},
+            "suggestions": suggestions,
             # Words carry the highlight timings, so the page can show the caption
             # the way it will actually appear, with unsure words marked.
             "words": [
@@ -2203,6 +2933,7 @@ class PipelineService:
                 subtitle_whisper_model_size=subtitle_whisper_model_size,
                 subtitle_language=subtitle_language, caption_theme=caption_theme,
                 source_video_path_override=str(self.source_path()),
+                glossary=self.glossary(),
                 progress=tracker)
             carried = [
                 {"from": item.get("from"), "to": item.get("to")}
@@ -2212,14 +2943,65 @@ class PipelineService:
             if carried:
                 artifact = self._apply_transcript_corrections(artifact, carried)
                 tracker.note(f"{len(carried)} onceki duzeltme yeniden uygulandi")
+            # Word-level corrections survive a re-run, but SEGMENT-level manual
+            # work does not: the new recognition has its own words, timings and
+            # segment boundaries, so a hand-rewritten line cannot be replayed
+            # onto it honestly. Dropping it silently is the one thing that must
+            # not happen, so the previous artifact is archived into
+            # revisions/<id>/ first and the new one records what was set aside
+            # and where to find it.
+            artifact = self._archive_replaced_transcript(
+                previous, artifact, slot=slot, actor=actor, tracker=tracker)
             self.write_artifact("moment_transcript", artifact, job_id=job_id,
                                 actor=actor, slot=slot)
+            # Audited only once the replacement is safely on disk. Archiving
+            # MOVES the old file, so anything that raises between the move and
+            # the write would leave the slot with no transcript at all -- which
+            # is exactly the silent loss this whole branch exists to prevent.
+            replaced = artifact.get("replaced_manual_edit")
+            if replaced:
+                self.audit.record(
+                    "transcript.manual_edits_archived", actor=actor, job_id=job_id,
+                    detail={"slot": slot, "revision_id": replaced["revision_id"],
+                            "edited_segment_ids": replaced["edited_segment_ids"]})
             tracker.finish(message=(f"{artifact['word_count']} kelime, inceleme bekliyor"
                                     if artifact["has_speech"] else "konusma yok"))
             return artifact
         except Exception as exc:  # noqa: BLE001
             tracker.fail(f"{type(exc).__name__}: {exc}")
             raise
+
+    def _archive_replaced_transcript(self, previous, artifact, *, slot, actor,
+                                      tracker=None) -> dict:
+        """Preserve a hand-edited transcript that a re-run is about to replace.
+
+        Returns the new artifact, annotated with `replaced_manual_edit` when
+        something was archived. A previous pass that only ever held recogniser
+        output is replaced without ceremony -- there is no human work to lose.
+        """
+        edited_ids = list((previous or {}).get("edited_segment_ids") or [])
+        history = list((previous or {}).get("revisions") or [])
+        if not edited_ids and not history:
+            return artifact
+        revision = self._archive_revision(
+            [self.artifact_relative("moment_transcript", slot)],
+            action="retranscribe", actor=actor, target=f"transcript_slot_{slot}")
+        record = dict(artifact)
+        record["replaced_manual_edit"] = {
+            "revision_id": revision["revision_id"],
+            "archived_path": f"revisions/{revision['revision_id']}/",
+            "edited_segment_ids": edited_ids,
+            "revision_count": len(history),
+            "previous_content_sha256": transcript_edit.content_sha256(
+                transcript_edit.ensure_v2(previous)),
+            "note": ("Yeniden transkripsiyon elle duzenlenmis segmentleri "
+                      "TASIMAZ; onceki surum arsivlendi ve geri alinabilir."),
+        }
+        if tracker is not None:
+            tracker.note(
+                f"{len(edited_ids)} elle duzenlenmis segment tasinmadi; onceki surum "
+                f"revisions/{revision['revision_id']}/ altina arsivlendi")
+        return record
 
     def _apply_transcript_corrections(self, artifact: dict, corrections) -> dict:
         """Re-derive the corrected text from the ORIGINAL recognition.
@@ -2232,6 +3014,12 @@ class PipelineService:
             {k: v for k, v in word.items() if k != "corrected"}
             for word in (artifact.get("words") or [])
         ]
+        # The v2 fields have to be carried through. Rebuilding without `asr`
+        # makes the builder seed a FRESH snapshot from the already-corrected
+        # words, so "restore the raw recognition" would hand back the
+        # corrections instead of what was actually heard -- and the revision
+        # history, the edited-segment set and the glossary context would vanish
+        # with it. Every other caller passes these; this one did not.
         rebuilt = render_utils.build_moment_transcript_artifact(
             base_words, artifact.get("cues") or [],
             source=artifact.get("source"), language=artifact.get("language"),
@@ -2239,7 +3027,10 @@ class PipelineService:
             moment_selection_sha256=artifact.get("moment_selection_sha256"),
             whisper_model_size=artifact.get("whisper_model_size"),
             initial_prompt_used=artifact.get("initial_prompt_used"),
-            corrections=corrections)
+            corrections=corrections, asr=artifact.get("asr"),
+            revisions=artifact.get("revisions"),
+            edited_segment_ids=artifact.get("edited_segment_ids"),
+            glossary_context=artifact.get("glossary_context"))
         return rebuilt
 
     def set_transcript_corrections(self, *, corrections, edited_by: str, slot: int = 1) -> dict:
@@ -2263,7 +3054,14 @@ class PipelineService:
             cleaned.append({"from": source, "to": target})
         if len(cleaned) > 100:
             raise PipelineServiceError("en fazla 100 duzeltme tanimlanabilir")
-        artifact = self._apply_transcript_corrections(loaded["data"], cleaned)
+        previous = transcript_edit.ensure_v2(loaded["data"])
+        artifact = self._apply_transcript_corrections(previous, cleaned)
+        # Recorded like any other edit, so the legacy word-level path shows up in
+        # the same history as the segment editor instead of changing the text
+        # invisibly.
+        artifact = transcript_edit.append_revision(
+            artifact, actor=edited_by, kind="corrections",
+            previous_sha256=transcript_edit.content_sha256(previous))
         relative = self.write_artifact("moment_transcript", artifact, actor=edited_by, slot=slot)
         self.audit.record("artifact.written", actor=edited_by, artifact=relative,
                           detail={"corrections": len(cleaned), "slot": slot})
@@ -2309,6 +3107,7 @@ class PipelineService:
         if hot["problem"]:
             raise ArtifactProblem(hot["problem"])
         render_dir = self.slot_render_dir(slot)
+        frame = self.render_adjustment(slot)
         pipeline_mode = plan["data"]["pipeline_mode"]
 
         if pipeline_mode == "original_audio_subtitles":
@@ -2335,6 +3134,9 @@ class PipelineService:
                 subtitle_whisper_model_size=subtitle_whisper_model_size,
                 subtitle_language=subtitle_language,
                 caption_style=caption_style, caption_theme=caption_theme,
+                frame_zoom=frame["frame_zoom"],
+                frame_focus_x=frame["frame_focus_x"],
+                frame_focus_y=frame["frame_focus_y"],
                 source_video_path_override=str(self.source_path()),
                 progress=tracker,
             )
@@ -2350,6 +3152,9 @@ class PipelineService:
                 self.relative(self.path("selected_script")),
                 self.relative(self.path("selected_voiceover")),
                 render_dir=render_dir, render_mode=render_mode, preview_mode=preview_mode,
+                frame_zoom=frame["frame_zoom"],
+                frame_focus_x=frame["frame_focus_x"],
+                frame_focus_y=frame["frame_focus_y"],
                 source_video_path_override=str(self.source_path()),
                 progress=tracker,
             )

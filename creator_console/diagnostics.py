@@ -103,6 +103,7 @@ class _Fixture:
         self._project = None
         self._video_error = None
         self._render_response = None
+        self._transcript_gate = ""
 
     def render_response(self):
         """The render job envelope, so a failure can report the real reason."""
@@ -216,6 +217,11 @@ class _Fixture:
         if service.load_artifact("moment_selection")["data"] is None:
             service.record_moment_selection(selected_rank=hot["hot_moments"][0]["rank"],
                                              reviewed_by="diagnostics", require_preview=False)
+        # direct_clip_series burns the source's own words in, so render is gated
+        # behind a PRODUCED and APPROVED transcript. The fixture walks that gate
+        # the way a user does instead of bypassing it -- bypassing would make
+        # `render: ready` a claim about a path no user can take.
+        self._transcript_gate = self._approve_transcript(ownership, service)
         self._render_response = self.call(
             "POST", f"/api/projects/{ownership.project_id}/jobs", {
                 "job_type": "render",
@@ -225,6 +231,32 @@ class _Fixture:
                             "caption_style": "active_word_yellow", "caption_theme": "auto"},
                 "run_request_id": "diag-render"})
         return ownership, service
+
+    def _approve_transcript(self, ownership, service) -> str:
+        """Produce + approve the moment transcript. Returns '' when it worked."""
+        if service.load_artifact("moment_transcript")["data"] is None:
+            self.call("POST", f"/api/projects/{ownership.project_id}/jobs", {
+                "job_type": "transcript",
+                "params": {"subtitle_whisper_model_size": "tiny",
+                            "subtitle_language": "auto"}})
+        state = service.approval_state("transcript")
+        if not state.get("present"):
+            return f"transkript uretilemedi: {state.get('reason')}"
+        if state.get("approved") and state.get("valid"):
+            return ""
+        digest = state.get("content_sha256")
+        if not digest:
+            return f"transkript incelenemez: {state.get('blocker') or state.get('reason')}"
+        try:
+            service.approve("transcript", reviewed_sha256=digest,
+                            approved_by="diagnostics")
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            return f"transkript onaylanamadi: {exc}"
+        return ""
+
+    def transcript_gate(self) -> str:
+        """Why the transcript gate could not be satisfied, or ''."""
+        return self._transcript_gate
 
     def cleanup(self):
         try:
@@ -476,6 +508,14 @@ def _check_render(fixture, live_app):
     manifest = service.load_artifact("render_manifest")["data"]
     if not manifest:
         job = ((fixture.render_response() or {}).get("job")) or {}
+        # A transcript gate that was never satisfied is the likelier cause than a
+        # broken renderer, and it names its own reason -- report that first
+        # rather than the generic job error it produces downstream.
+        gate = fixture.transcript_gate()
+        if gate:
+            return _failed("render artefakti uretilmedi",
+                           blocker=f"altyazi onay kapisi: {gate}"[:200],
+                           repair="Altyazi sekmesinde transkripti uret, oku ve onayla")
         return _failed("render artefakti uretilmedi",
                        blocker=(job.get("error") or "is basarisiz")[:200],
                        repair="Render Studio'da hatayi oku ve yeniden calistir")
@@ -594,13 +634,41 @@ def _check_persistence(fixture, live_app):
     return _ready("atomik yazim + restart sonrasi durum ve is gecmisi korunuyor")
 
 
+def _served_bytes(payload) -> bytes:
+    """The bytes a media response would actually put on the wire.
+
+    `api._media` returns a lazily-streamed descriptor (`__file__`) so previews
+    are not loaded into RAM and byte ranges stay possible; older code returned
+    `__raw__` bytes directly. Both are read here, because a check that only
+    understood `__raw__` silently stopped inspecting ANY served content when the
+    API switched -- and a containment check that inspects nothing always passes.
+    """
+    if not isinstance(payload, dict):
+        return b""
+    raw = payload.get("__raw__")
+    if raw:
+        return bytes(raw)
+    target = payload.get("__file__")
+    if not target:
+        return b""
+    try:
+        return Path(target).read_bytes()
+    except OSError:
+        return b""
+
+
 def _check_media_serving(fixture, live_app):
     ownership, service = fixture.project()
     app = fixture.app
     pid = ownership.project_id
     status, payload = fixture.call("GET", f"/api/projects/{pid}/media/project.json")
-    if status != 200 or not payload.get("__raw__"):
+    if status != 200:
         return _failed(f"namespace icindeki dosya sunulamadi: HTTP {status}",
+                       blocker="proje namespace'i icindeki dosya 200 donmedi",
+                       repair="api._media")
+    if not _served_bytes(payload):
+        return _failed("namespace icindeki dosya bos sunuldu",
+                       blocker=f"HTTP 200 ama govde bos: {sorted(payload)}",
                        repair="api._media")
 
     # A canary OUTSIDE the project namespace, with a servable suffix, so a
@@ -612,10 +680,12 @@ def _check_media_serving(fixture, live_app):
     try:
         traversal, body = fixture.call(
             "GET", f"/api/projects/{pid}/media/../../canary.json")
+        # Read INSIDE the try: `__file__` is a path, not bytes, so the content
+        # has to be pulled before the canary is unlinked below.
+        served = _served_bytes(body)
     finally:
         canary.unlink(missing_ok=True)
-    served = body.get("__raw__") if isinstance(body, dict) else b""
-    if canary_marker.encode() in (served or b""):
+    if canary_marker.encode() in served:
         return _failed("yol gezinmesi namespace disindaki dosyayi SUNDU",
                        blocker=f"HTTP {traversal} ile ../../canary.json okundu",
                        repair="storage.resolve namespace containment kontrolu")

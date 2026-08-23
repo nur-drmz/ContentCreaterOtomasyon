@@ -239,6 +239,30 @@ def main() -> int:
     check(not list(storage_root.rglob("output_47")), "unknown-slot-no-directory",
           "output_47 dizini olusmadi")
 
+    # ------------------------------------------- 3b. per-slot caption approval
+    # Each slot burns ITS OWN moment's words in, so each slot needs its own
+    # transcript produced and read. One approval must not cover three Shorts.
+    print()
+    print("--- 3b. Yuva basina altyazi onayi ---")
+    for index in range(1, OUTPUT_COUNT + 1):
+        status, _ = call(api, "POST", f"/api/projects/{pid}/jobs", {
+            "job_type": "transcript",
+            "params": {"slot": index, "subtitle_whisper_model_size": "tiny",
+                        "subtitle_language": "auto"}})
+        state = service.approval_state("transcript", index)
+        check(state["present"] and state.get("content_sha256"),
+              f"slot{index}-transcript-produced", f"HTTP {status}, {state.get('reason')}")
+        service.approve("transcript", reviewed_sha256=state["content_sha256"],
+                        approved_by="verify_batch", slot=index)
+        check(service.approval_state("transcript", index)["valid"],
+              f"slot{index}-transcript-approved",
+              str(service.approval_state("transcript", index).get("reason")))
+
+    tr_paths = {index: service.artifact_relative("moment_transcript", index)
+                for index in range(1, OUTPUT_COUNT + 1)}
+    check(len(set(tr_paths.values())) == OUTPUT_COUNT, "transcript-paths-distinct",
+          str(tr_paths))
+
     # ----------------------------------------------------------- 4. batch board
     print()
     print("--- 4. Batch panosu ve kuyruk ---")
@@ -438,7 +462,8 @@ def main() -> int:
         check(manifest.get("status") != "production_ready",
               f"slot{index}-no-production-ready", str(manifest.get("status")))
     check(source.is_file(), "source-untouched", "orijinal kaynak dosya duruyor")
-    check(PER_SLOT_ARTIFACTS == frozenset({"moment_selection", "render_manifest"}),
+    check(PER_SLOT_ARTIFACTS == frozenset({"moment_selection", "moment_transcript",
+                                            "render_manifest"}),
           "per-slot-artifact-set", str(sorted(PER_SLOT_ARTIFACTS)))
 
     return finish(app, storage_root, staging)

@@ -31,6 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--storage-root", default=None,
                         help=f"varsayilan: ./{DEFAULT_STORAGE_DIR}")
+    parser.add_argument("--archive-root", default=None,
+                        help="proje arsivlerinin tutulacagi harici disk klasoru")
+    parser.add_argument("--source-library-root", default=None,
+                        help="sunucu tarafindan ice aktarilabilen kaynak video klasoru")
+    parser.add_argument("--music-root", default=None,
+                        help="lisansli muzik kutuphanesi klasoru (opsiyonel)")
     parser.add_argument("--user-id", default=DEFAULT_USER_ID)
     parser.add_argument("--workspace-id", default=DEFAULT_WORKSPACE_ID)
     parser.add_argument("--inline-jobs", action="store_true",
@@ -67,6 +73,19 @@ def main(argv=None) -> int:
 
     config = ConsoleConfig(
         storage_root=storage_root,
+        archive_root=(Path(args.archive_root or os.environ["CREATOR_CONSOLE_ARCHIVE_ROOT"])
+                      if (args.archive_root or os.environ.get("CREATOR_CONSOLE_ARCHIVE_ROOT"))
+                      else None),
+        source_library_root=(
+            Path(args.source_library_root
+                 or os.environ["CREATOR_CONSOLE_SOURCE_LIBRARY_ROOT"])
+            if (args.source_library_root
+                or os.environ.get("CREATOR_CONSOLE_SOURCE_LIBRARY_ROOT"))
+            else None),
+        music_root=(
+            Path(args.music_root or os.environ["CREATOR_CONSOLE_MUSIC_ROOT"])
+            if (args.music_root or os.environ.get("CREATOR_CONSOLE_MUSIC_ROOT"))
+            else None),
         user_id=args.user_id,
         workspace_id=args.workspace_id,
         host=args.host,

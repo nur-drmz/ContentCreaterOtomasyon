@@ -177,6 +177,28 @@ h3 { font-size: 14px; margin: 0 0 var(--sp-2); color: var(--c-text-mute); }
 .archive-list { display: grid; gap: var(--sp-4); }
 .archive-card { margin-bottom: 0; }
 .archive-meta { margin-bottom: var(--sp-4); font-size: 13px; }
+.archive-heading { margin-top: var(--sp-6); }
+.storage-policy-card { border-color: var(--c-accent); }
+.storage-policy-flow {
+  display: grid; grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
+  align-items: center; gap: var(--sp-4);
+}
+.storage-policy-node {
+  padding: var(--sp-4); border: 1px solid var(--c-border);
+  border-radius: var(--r-md); background: var(--c-surface-2);
+}
+.storage-policy-arrow { color: var(--c-accent); font-weight: 800; white-space: nowrap; }
+.storage-policy-note { margin-top: var(--sp-3); }
+.longform-estimate {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--sp-3);
+  padding: var(--sp-4); margin: var(--sp-4) 0;
+  border: 1px solid var(--c-accent); border-radius: var(--r-md);
+  background: var(--c-accent-soft);
+}
+@media (max-width: 760px) {
+  .storage-policy-flow { grid-template-columns: 1fr; }
+  .storage-policy-arrow { transform: rotate(90deg); justify-self: center; }
+}
 
 .lifecycle-card > summary,
 .script-editor > summary {
@@ -784,3 +806,23 @@ video { max-width: 100%; }
 @media (max-width: 900px) {
   .correction-row { flex-direction: column; align-items: stretch; }
 }
+
+
+/* Transcript editor. Monospace keeps the caption's real length legible -- a
+   proportional font hides that a line is about to overflow the frame. */
+.transcript-seg-input,
+.transcript-full-input {
+  width: 100%;
+  font-family: var(--font-mono, ui-monospace, Consolas, monospace);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--c-border);
+  background: var(--c-surface-2, var(--c-surface));
+  color: var(--c-text);
+  resize: vertical;
+}
+.transcript-seg-input:focus,
+.transcript-full-input:focus { outline: 2px solid var(--c-accent); }
+.field--invalid { border-color: var(--c-danger); }

@@ -13,8 +13,10 @@ browser receives already-decided booleans and already-formatted reasons.
 """
 from __future__ import annotations
 
+import json
 import os
 import re as _re
+import shutil
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -51,9 +53,9 @@ from .progress import (
     mark_interrupted,
 )
 from .status import build_workflow_map, run_preflight
-from .storage import LocalFilesystemStorage, StorageViolation
+from .storage import LocalFilesystemStorage, StorageViolation, atomic_write_json
 from .env_file import write_env_value
-from .redaction import register_secret
+from .redaction import register_secret, scrub
 
 #: Pre-alpha is single-user. These are REAL ownership values, not placeholders:
 #: swapping them for session-derived ones is the only change authentication needs.
@@ -75,6 +77,22 @@ PLANNED_NOT_IMPLEMENTED = (
 #: How often a running job renews its lease. Must be comfortably shorter than
 #: `jobs.DEFAULT_LEASE_SECONDS` so one missed beat does not expire the lease.
 HEARTBEAT_INTERVAL_SEC = 20.0
+
+
+def _tree_inventory(root: Path) -> dict[str, int]:
+    """Return a deterministic relative-path -> byte-length archive inventory.
+
+    Links are refused: an archive must contain project-owned bytes, never follow
+    an operator-created junction or symlink into an unrelated directory.
+    """
+    root = Path(root)
+    inventory: dict[str, int] = {}
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise StorageViolation("proje arsivlenirken sembolik baglanti kullanilamaz")
+        if path.is_file():
+            inventory[path.relative_to(root).as_posix()] = path.stat().st_size
+    return inventory
 
 
 class _Heartbeat:
@@ -114,6 +132,11 @@ class _Heartbeat:
 @dataclass
 class ConsoleConfig:
     storage_root: Path
+    archive_root: Path | None = None
+    source_library_root: Path | None = None
+    #: Optional licensed music library. Tracks are listed with their
+    #: licence status; none is ever reported as cleared for use.
+    music_root: Path | None = None
     user_id: str = DEFAULT_USER_ID
     workspace_id: str = DEFAULT_WORKSPACE_ID
     host: str = "127.0.0.1"
@@ -174,6 +197,7 @@ class ConsoleApp:
         self.config = config
         self.storage = LocalFilesystemStorage(config.storage_root)
         self.secrets = SecretResolver(config.secret_getter)
+        self._runtime_log_lock = threading.Lock()
         runner_cls = InlineJobRunner if config.inline_jobs else ThreadJobRunner
         self.runner = runner_cls(self._execute_job)
         # A worker process must NOT run startup recovery: it would reclaim jobs
@@ -194,6 +218,7 @@ class ConsoleApp:
             elevenlabs_client_factory=self.config.elevenlabs_client_factory,
             probe_fn=self.config.probe_fn,
             ffmpeg_bin=self.config.ffmpeg_bin, ffprobe_bin=self.config.ffprobe_bin,
+            music_root=self.config.music_root,
         )
 
     def save_local_secret(self, *, kind: str, value: str) -> dict:
@@ -317,6 +342,202 @@ class ConsoleApp:
         recovery_token = self.storage.trash_namespace(ownership)
         return {"deleted": True, "project_id": ownership.project_id,
                 "recoverable": True, "recovery_token": recovery_token}
+
+    def archive_status(self) -> dict:
+        """Public, path-safe summary of the operator-configured archive."""
+        root = self.config.archive_root
+        if root is None:
+            return {"configured": False, "available": False,
+                    "location_name": None, "projects": []}
+        root = Path(root).expanduser()
+        drive = root.drive.rstrip(":")
+        leaf = root.name or "arsiv"
+        location = f"{drive} surucusu / {leaf} / CreatorConsoleArchive" if drive else (
+            f"{leaf} / CreatorConsoleArchive")
+        archive_base = root / "CreatorConsoleArchive" / self.config.workspace_id
+        projects = []
+        available = root.is_dir()
+        if available and archive_base.is_dir():
+            try:
+                candidates = list(archive_base.iterdir())
+            except OSError:
+                candidates = []
+                available = False
+            for candidate in candidates:
+                try:
+                    manifest_path = candidate / "archive_manifest.json"
+                    if not candidate.is_dir() or not manifest_path.is_file():
+                        continue
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                projects.append({
+                    "archive_id": candidate.name,
+                    "project_id": manifest.get("project_id"),
+                    "title": manifest.get("title") or "(okunamadi)",
+                    "source_name": manifest.get("source_name"),
+                    "archived_at": manifest.get("archived_at"),
+                    "archived_by": manifest.get("archived_by"),
+                    "file_count": int(manifest.get("file_count") or 0),
+                    "total_bytes": int(manifest.get("total_bytes") or 0),
+                })
+        projects.sort(key=lambda item: item.get("archived_at") or "", reverse=True)
+        return {"configured": True, "available": available,
+                "location_name": location, "projects": projects}
+
+    def storage_policy_view(self) -> dict:
+        """Path-safe active/archive placement shown in the local UI."""
+        working = Path(self.storage.root)
+        drive = working.drive.rstrip(":")
+        working_name = f"{drive} surucusu / aktif calisma" if drive else "aktif calisma alani"
+        archive = self.archive_status()
+        return {
+            "working_location_name": working_name,
+            "archive_location_name": archive.get("location_name"),
+            "archive_configured": archive.get("configured", False),
+            "archive_available": archive.get("available", False),
+            "policy": "Aktif projeler calisma diskinde; arsivlenen projeler harici diskte tutulur.",
+        }
+
+    def source_library_view(self) -> dict:
+        """Path-safe list of videos the server may import without browser upload."""
+        configured = self.config.source_library_root is not None
+        if not configured:
+            return {"configured": False, "available": False, "videos": []}
+        root = Path(self.config.source_library_root).expanduser()
+        if not root.is_dir():
+            return {"configured": True, "available": False, "videos": []}
+        videos = []
+        try:
+            candidates = list(root.iterdir())
+        except OSError:
+            return {"configured": True, "available": False, "videos": []}
+        for candidate in candidates:
+            try:
+                if (not candidate.is_file()
+                        or candidate.suffix.lower() not in
+                        video_analysis.SUPPORTED_SOURCE_VIDEO_EXTENSIONS):
+                    continue
+                stat = candidate.stat()
+            except OSError:
+                continue
+            videos.append({
+                "name": candidate.name,
+                "size_bytes": int(stat.st_size),
+                "modified_at": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc).isoformat(),
+            })
+        videos.sort(key=lambda item: item["name"].casefold())
+        return {"configured": True, "available": True, "videos": videos}
+
+    def import_source_from_library(self, ownership: Ownership, *, filename: str,
+                                   actor: str = "console") -> dict:
+        """Copy one explicitly selected library video into an idle project."""
+        self._assert_lifecycle_idle(ownership)
+        root_value = self.config.source_library_root
+        if root_value is None:
+            raise PipelineServiceError("kaynak video kutuphanesi yapilandirilmamis")
+        requested = str(filename or "").strip()
+        if not requested or Path(requested).name != requested:
+            raise PipelineServiceError("gecersiz kaynak kutuphanesi dosya adi")
+        root = Path(root_value).expanduser().resolve()
+        source = (root / requested).resolve()
+        if source.parent != root or not source.is_file():
+            raise PipelineServiceError("kaynak kutuphanesinde video bulunamadi")
+        if source.suffix.lower() not in video_analysis.SUPPORTED_SOURCE_VIDEO_EXTENSIONS:
+            raise PipelineServiceError("kaynak kutuphanesi dosya turu desteklenmiyor")
+        service = self.service(ownership)
+        project = service.load_artifact("project", required=True)
+        if ((project.get("data") or {}).get("source")):
+            raise PipelineServiceError(
+                "projede zaten kaynak video var; degistirmek icin yasam dongusu aracini kullan")
+        size = source.stat().st_size
+        if size <= 0:
+            raise PipelineServiceError("kaynak kutuphanesi videosu bos")
+        with source.open("rb") as stream:
+            return service.register_source_video_stream(
+                filename=source.name, stream=stream, content_length=size,
+                registered_by=actor, track=True)
+
+    def archive_project(self, ownership: Ownership, *, confirmation: str,
+                        actor: str = "console") -> dict:
+        """Move one idle project into the configured external archive.
+
+        Same-volume archives are an atomic directory rename (the normal setup
+        on this workstation). Cross-volume archives copy to a staging folder,
+        verify every relative filename and byte length, publish the staged copy,
+        and only then remove the working namespace.
+        """
+        self._assert_lifecycle_idle(ownership)
+        archive_root = self.config.archive_root
+        if archive_root is None:
+            raise PipelineServiceError("proje arsiv konumu yapilandirilmamis")
+        service = self.service(ownership)
+        loaded = service.load_artifact("project", required=True)
+        if loaded["problem"]:
+            raise ArtifactProblem(loaded["problem"])
+        project = loaded["data"] or {}
+        title = str(project.get("title") or "").strip()
+        if str(confirmation or "").strip() != title:
+            raise PipelineServiceError(
+                "projeyi arsivlemek icin proje adini birebir yazmalisin")
+
+        source = self.storage.namespace_root(ownership).resolve()
+        root = Path(archive_root).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        if source == root or source in root.parents:
+            raise StorageViolation("arsiv konumu aktif proje klasorunun icinde olamaz")
+        archive_base = root / "CreatorConsoleArchive" / ownership.workspace_id
+        archive_base.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archive_id = f"{ownership.project_id}__{stamp}"
+        destination = archive_base / archive_id
+        if destination.exists():
+            raise FileExistsError("arsiv hedefi zaten var")
+
+        automation = self.automation(ownership)
+        if automation.view().get("can_cancel"):
+            automation.cancel(actor=actor)
+        service.audit.record("project.archived", actor=actor,
+                             detail={"title": title, "archive_id": archive_id})
+        inventory = _tree_inventory(source)
+        source_record = project.get("source") or {}
+        manifest = {
+            "schema_version": 1,
+            "archive_id": archive_id,
+            "project_id": ownership.project_id,
+            "workspace_id": ownership.workspace_id,
+            "title": title,
+            "source_name": source_record.get("display_name"),
+            "archived_at": datetime.now(timezone.utc).isoformat(),
+            "archived_by": actor,
+            "file_count": len(inventory),
+            "total_bytes": sum(inventory.values()),
+        }
+        atomic_write_json(source / "archive_manifest.json", manifest)
+        inventory = _tree_inventory(source)
+
+        if source.stat().st_dev == archive_base.stat().st_dev:
+            os.replace(source, destination)
+        else:
+            staging = archive_base / f".{archive_id}.partial"
+            if staging.exists():
+                raise FileExistsError("tamamlanmamis arsiv hedefi zaten var")
+            try:
+                shutil.copytree(source, staging)
+                if _tree_inventory(staging) != inventory:
+                    raise OSError("arsiv kopyasi byte envanteri dogrulamasini gecemedi")
+                os.replace(staging, destination)
+                shutil.rmtree(source)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+
+        return {"archived": True, "project_id": ownership.project_id,
+                "archive_id": archive_id,
+                "location_name": self.archive_status()["location_name"],
+                "file_count": len(inventory),
+                "total_bytes": sum(inventory.values())}
 
     def update_script_text(self, ownership: Ownership, *, script_text: str,
                            updated_by: str, notes: str = "") -> dict:
@@ -605,6 +826,29 @@ class ConsoleApp:
         return {"state": "submitted", "next_job_type": job_type,
                 "job": _job_view(record), "message": message}
 
+    def log_runtime(self, event: str, **detail) -> None:
+        """Append one scrubbed, process-safe runtime diagnostic event.
+
+        Audit events explain domain changes inside a project. This log instead
+        explains transport/runtime behaviour (request started, response sent,
+        API error) and therefore lives at the console root. Bodies, query
+        strings and headers are deliberately never accepted by this method.
+        """
+        try:
+            record = {
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "event": str(event)[:120],
+                "detail": scrub(detail, max_len=2000),
+            }
+            target = self.storage.root / "logs" / "runtime_events.jsonl"
+            with self._runtime_log_lock:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                    handle.flush()
+        except Exception:  # noqa: BLE001 - diagnostics must never break a request
+            pass
+
     def log_error(self, error) -> None:
         """Server-side ONLY. The scrubbed detail lands here; the client gets a code.
 
@@ -612,7 +856,15 @@ class ConsoleApp:
         and correlated to the response by `debug_id`.
         """
         try:
-            print(f"[console:error] {error.log_line()}", file=sys.stderr, flush=True)
+            line = error.log_line()
+            print(f"[console:error] {line}", file=sys.stderr, flush=True)
+            self.log_runtime(
+                "api.error",
+                debug_id=getattr(error, "debug_id", None),
+                code=getattr(error, "code", "internal_error"),
+                status=getattr(error, "status", 500),
+                message=line,
+            )
         except Exception:  # noqa: BLE001 - logging must never break a response
             pass
 
@@ -817,6 +1069,9 @@ class ConsoleApp:
                      "single_user": True, "authenticated": False},
             "owner": self.ownership().to_dict(),
             "projects": projects,
+            "archive": self.archive_status(),
+            "storage_policy": self.storage_policy_view(),
+            "source_library": self.source_library_view(),
             "secrets": self.secrets.public_state(),
             "planned_not_implemented": [dict(item) for item in PLANNED_NOT_IMPLEMENTED],
             "preflight": run_preflight(self),
@@ -841,6 +1096,7 @@ class ConsoleApp:
         plan = service.load_artifact("processing_plan")
         hot = service.load_artifact("hot_moments")
         selection = service.load_artifact("moment_selection")
+        long_form = service.load_artifact("long_form_plan")
 
         gates = {}
         for phase in source_strategy.GATED_PHASES:
@@ -898,6 +1154,10 @@ class ConsoleApp:
             "owner": ownership.to_dict(),
             "project": {"data": project["data"], "problem": project["problem"]},
             "project_actor": service.project_actor(),
+            "long_form": {"data": long_form["data"], "problem": long_form["problem"]},
+            "archive": self.archive_status(),
+            "storage_policy": self.storage_policy_view(),
+            "source_library": self.source_library_view(),
             "phase0": {
                 "assessment": assessment["data"], "assessment_problem": assessment["problem"],
                 "plan": plan["data"], "plan_problem": plan["problem"],

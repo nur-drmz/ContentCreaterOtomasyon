@@ -20,7 +20,7 @@ import json
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from creator_console.app import ConsoleApp, ConsoleConfig
 from creator_console.api import ConsoleApi
@@ -92,6 +92,19 @@ async def catch_all(request: Request, path: str):
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
                 "Cache-Control": "no-store",
+            },
+        )
+
+    if isinstance(payload, dict) and "__file__" in payload:
+        return FileResponse(
+            path=payload["__file__"],
+            status_code=status,
+            media_type=payload.get("__content_type__", "application/octet-stream"),
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Cache-Control": "no-store",
+                "Accept-Ranges": "bytes",
             },
         )
 

@@ -27,6 +27,7 @@ from .progress import load_progress
 from .ids import InvalidIdentifier
 from .jobs import JobConflict, JobError, JobNotFound
 from .pipeline_service import (
+    REWIND_LABELS,
     ArtifactProblem,
     PipelineServiceError,
     is_supported_source_video_filename,
@@ -158,6 +159,32 @@ class ConsoleApi:
                 actor=_header(headers, "x-actor") or payload.get("actor") or "console",
             )
 
+        if rest == ["archive"] and method == "POST":
+            payload = _json_body(body)
+            return 200, self.app.archive_project(
+                ownership,
+                confirmation=_required(payload, "confirmation"),
+                actor=_header(headers, "x-actor") or payload.get("actor") or "console",
+            )
+
+        if rest == ["long-form-plan"] and method == "PATCH":
+            payload = _json_body(body)
+            return 200, {"long_form": service.save_long_form_plan(
+                topic=_required(payload, "topic"),
+                content_type=_required(payload, "content_type"),
+                target_duration_min=_required(payload, "target_duration_min"),
+                chapter_count=_required(payload, "chapter_count"),
+                language=_required(payload, "language"),
+                tone=_required(payload, "tone"),
+                audience=payload.get("audience") or "Genel izleyici",
+                angle=payload.get("angle") or "",
+                narration_mode=payload.get("narration_mode") or "undecided",
+                include_subtitles=_truthy(payload.get("include_subtitles", True)),
+                notes=payload.get("notes") or "",
+                updated_by=_header(headers, "x-actor") or payload.get("updated_by")
+                or service.project_actor(),
+            )}
+
         if rest == ["lifecycle"] and method == "POST":
             payload = _json_body(body)
             action = payload.get("action")
@@ -174,6 +201,39 @@ class ConsoleApi:
                     actor=actor)
             raise ApiError("validation_failed", detail=f"yasam dongusu eylemi: {action!r}")
 
+        # Guided revision. GET only DESCRIBES what a revision would archive, so
+        # the confirmation can name the files instead of asking a blind
+        # "are you sure".
+        if rest == ["revision"] and method == "GET":
+            target = _first(query.get("target"))
+            suggestion = service.suggested_revision_stage(_slot(query))
+            return 200, {"revision": {
+                "suggested": suggestion,
+                "plan": service.revision_plan(
+                    target=target or suggestion["stage"], slot=_slot(query)),
+                "stages": [{"key": key, "label": label}
+                           for key, label in REWIND_LABELS.items()],
+                "archive": service.archive_view(),
+            }}
+
+        if rest == ["revision"] and method == "POST":
+            payload = _json_body(body)
+            actor = (_header(headers, "x-actor") or payload.get("actor")
+                     or service.project_actor())
+            return 200, {"revision": service.start_revision(
+                target=_required(payload, "target"),
+                notes=payload.get("notes") or "",
+                actor=actor, slot=_slot(payload)),
+                "archive": service.archive_view()}
+
+        if rest == ["revision", "purge"] and method == "POST":
+            payload = _json_body(body)
+            actor = (_header(headers, "x-actor") or payload.get("actor")
+                     or service.project_actor())
+            return 200, {"archive": service.purge_revision(
+                revision_id=_required(payload, "revision_id"),
+                confirmation=_required(payload, "confirmation"), actor=actor)}
+
         if rest == ["script"] and method == "PATCH":
             payload = _json_body(body)
             artifact = self.app.update_script_text(
@@ -184,6 +244,14 @@ class ConsoleApi:
             )
             return 200, {"script": artifact,
                          "approval": service.approval_state("script")}
+
+        if rest == ["source-library"] and method == "POST":
+            payload = _json_body(body)
+            record = self.app.import_source_from_library(
+                ownership, filename=_required(payload, "filename"),
+                actor=_header(headers, "x-actor") or payload.get("actor")
+                or service.project_actor())
+            return 201, {"project": record}
 
         if rest == ["source"] and method == "POST":
             filename = _header(headers, "x-filename") or _first(query.get("filename")) or "source.mp4"
@@ -284,6 +352,135 @@ class ConsoleApi:
                 slot=slot)
             return 200, {"transcript": service.transcript_view(slot),
                          "corrections": artifact.get("corrections") or []}
+
+        # Segment-wise and whole-transcript edits are one server operation with
+        # two entry shapes, so the textarea cannot bypass a validation the row
+        # editor enforces.
+        if rest == ["transcript", "segments"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.save_transcript_edits(
+                segments=payload.get("segments") or [],
+                edited_by=payload.get("edited_by") or service.project_actor(),
+                slot=_slot(payload))}
+
+        if rest == ["transcript", "full-text"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.save_transcript_edits(
+                full_text=_required(payload, "full_text"),
+                edited_by=payload.get("edited_by") or service.project_actor(),
+                slot=_slot(payload))}
+
+        if rest == ["transcript", "exclusions"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.set_transcript_exclusions(
+                segment_ids=payload.get("segment_ids") or [],
+                excluded=_truthy(payload.get("excluded", True)),
+                actor=payload.get("actor") or service.project_actor(),
+                slot=_slot(payload))}
+
+        if rest == ["transcript", "restore-asr"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"transcript": service.restore_transcript_from_asr(
+                actor=payload.get("actor") or service.project_actor(),
+                slot=_slot(payload))}
+
+        if rest == ["glossary"] and method == "GET":
+            return 200, {"glossary": service.glossary_view()}
+
+        if rest == ["glossary"] and method == "POST":
+            payload = _json_body(body)
+            actor = payload.get("actor") or service.project_actor()
+            if payload.get("accept_term"):
+                return 200, {"glossary": service.accept_glossary_suggestion(
+                    str(payload["accept_term"]), actor=actor)}
+            return 200, {"glossary": service.set_glossary_terms(
+                payload.get("terms") or [], actor=actor)}
+
+        # ---------------------------------------------- Long-form Video Studio
+        # GET only DESCRIBES the workflow; it never starts a stage. Opening the
+        # screen must not spend a provider request.
+        if rest == ["long-form"] and method == "GET":
+            return 200, {"long_form_studio": service.long_form_studio().view()}
+
+        if rest == ["long-form", "control"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "")
+            if action == "start":
+                studio.start(actor=actor)
+            elif action == "pause":
+                studio.pause(actor=actor)
+            elif action == "resume":
+                studio.resume(actor=actor)
+            elif action == "cancel":
+                studio.cancel(actor=actor)
+            elif action == "approve_stage":
+                studio.approve_stage(_required(payload, "stage"), actor=actor)
+            elif action == "retry_billing":
+                studio.retry_billing(actor=actor)
+            else:
+                raise ApiError("validation_failed",
+                               detail=f"uzun video eylemi: {action!r}")
+            return 200, {"long_form_studio": studio.view()}
+
+        if rest == ["long-form", "stage"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            outcome = studio.run_next_stage(actor=actor)
+            return 200, {"ran": outcome, "long_form_studio": studio.view()}
+
+        if rest == ["long-form", "chapter"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            studio.save_chapter_text(
+                int(_required(payload, "index")), _required(payload, "text"),
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"long_form_studio": studio.view()}
+
+        if rest == ["long-form", "tts"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "run")
+            if action == "plan":
+                studio.plan_tts(actor=actor)
+            elif action in ("retry", "regenerate"):
+                studio.run_tts(actor=actor,
+                               only_chunk=_required(payload, "chunk_id"))
+            elif action == "concat":
+                studio.concat_audio(actor=actor)
+            else:
+                studio.run_tts(actor=actor,
+                               max_chunks=int(payload.get("max_chunks") or 0))
+            return 200, {"long_form_studio": studio.view()}
+
+        if rest == ["long-form", "broll"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.long_form_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "")
+            if action == "plan":
+                studio.create_broll_plan(
+                    clip_duration_sec=int(payload.get("clip_duration_sec") or 5),
+                    actor=actor)
+            elif action == "search":
+                studio.search_broll(
+                    _required(payload, "slot_id"),
+                    provider=_required(payload, "provider"),
+                    query=_required(payload, "query"),
+                    per_page=int(payload.get("per_page") or 6), actor=actor)
+            elif action == "select":
+                studio.select_broll(
+                    _required(payload, "slot_id"),
+                    _required(payload, "candidate_id"), actor=actor)
+            elif action == "download":
+                studio.download_broll(_required(payload, "slot_id"), actor=actor)
+            else:
+                raise ApiError("validation_failed",
+                               detail=f"B-roll eylemi: {action!r}")
+            return 200, {"long_form_studio": studio.view()}
 
         if rest == ["outputs"] and method == "GET":
             return 200, {"outputs": service.outputs(), "batch": service.batch_state()}
@@ -597,6 +794,133 @@ class ConsoleApi:
                 run_request_id=_json_body(body).get("run_request_id"))
             return (201 if created else 200), {"job": record, "created": created}
 
+        # GET only DESCRIBES the Turbo workflow. Opening the tab must not spend
+        # an LLM, TTS, stock-provider or render request -- this is a pure read.
+        if rest == ["turbo"] and method == "GET":
+            return 200, {"turbo_studio": service.turbo_studio().view()}
+
+        if rest == ["turbo", "brief"] and method == "POST":
+            payload = _json_body(body)
+            # Presence only. The length/range rules belong to
+            # `turbo.validate_brief` -- duplicating them here would give the
+            # project two sources of truth that silently drift apart, and
+            # would skip the rejection event the studio records.
+            _required(payload, "topic")
+            studio = service.turbo_studio()
+            actor = payload.get("actor") or service.project_actor()
+            result = studio.save_brief(payload, actor=actor)
+            return 200, {"saved": result["invalidated"],
+                         "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "approve"] and method == "POST":
+            payload = _json_body(body)
+            _required(payload, "stage")
+            studio = service.turbo_studio()
+            studio.approve_stage(
+                str(payload.get("stage") or ""),
+                actor=payload.get("actor") or service.project_actor(),
+                note=str(payload.get("note") or ""))
+            return 200, {"turbo_studio": studio.view()}
+
+        # Runs whatever is runnable NOW. It never skips a human gate: if the
+        # next stage is one, this returns the reason and runs nothing.
+        if rest == ["turbo", "stage"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            outcome = studio.run_next_stage(
+                actor=payload.get("actor") or service.project_actor(),
+                max_chunks=int(payload.get("max_chunks") or 0))
+            return 200, {"ran": outcome["ran"], "decision": outcome["decision"],
+                         "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "media"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            actor = payload.get("actor") or service.project_actor()
+            action = str(payload.get("action") or "")
+            # Search, select and download stay three separate operator actions.
+            # Collapsing them would make opening a slot spend a provider request.
+            if action == "plan":
+                studio.run_media_plan(actor=actor)
+            elif action == "search":
+                _required(payload, "slot_id")
+                studio.search_slot(
+                    payload["slot_id"], provider=str(payload.get("provider") or ""),
+                    query=str(payload.get("query") or ""),
+                    per_page=int(payload.get("per_page") or 6), actor=actor)
+            elif action == "select":
+                _required(payload, "slot_id")
+                _required(payload, "candidate_id")
+                studio.select_clip(payload["slot_id"], payload["candidate_id"],
+                                   actor=actor)
+            elif action == "download":
+                _required(payload, "slot_id")
+                studio.download_clip(payload["slot_id"], actor=actor)
+            else:
+                raise ApiError("validation_failed",
+                               detail="materyal eylemi plan, search, select veya "
+                                      "download olmali")
+            return 200, {"turbo_studio": studio.view()}
+
+        if rest == ["turbo", "music"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            studio.choose_music(
+                origin=str(payload.get("origin") or "none"),
+                filename=str(payload.get("filename") or ""),
+                volume=float(payload.get("volume") or 0.18),
+                ducking=bool(payload.get("ducking", True)),
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"turbo_studio": studio.view()}
+
+        if rest == ["turbo", "music", "upload"] and method == "POST":
+            # Streamed like the source-video upload: the extension is checked
+            # before a byte is written and the size cap is enforced twice.
+            filename = unquote(_header(headers, "x-filename")
+                               or _first(query.get("filename")) or "")
+            studio = service.turbo_studio()
+            actor = _header(headers, "x-actor") or service.project_actor()
+            if body_stream is not None:
+                try:
+                    length = int(content_length)
+                except (TypeError, ValueError):
+                    length = 0
+                if length <= 0:
+                    raise ApiError("empty_upload")
+                track = studio.upload_music(
+                    filename=filename, stream=body_stream,
+                    content_length=length, actor=actor)
+            else:
+                if not body:
+                    raise ApiError("empty_upload")
+                track = studio.upload_music(
+                    filename=filename, payload=body,
+                    content_length=len(body), actor=actor)
+            return 201, {"track": track, "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "render"] and method == "POST":
+            payload = _json_body(body)
+            studio = service.turbo_studio()
+            preset = str(payload.get("preset") or "preview")
+            record = studio.render(
+                preset=preset,
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"render": record, "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "revision"] and method == "POST":
+            payload = _json_body(body)
+            _required(payload, "kind")
+            studio = service.turbo_studio()
+            result = studio.apply_revision(
+                str(payload["kind"]), target=str(payload.get("target") or ""),
+                values=payload.get("values") or {},
+                actor=payload.get("actor") or service.project_actor())
+            return 200, {"revision": result, "turbo_studio": studio.view()}
+
+        if rest == ["turbo", "revision-preview"] and method == "GET":
+            kind = _first(query.get("kind")) or ""
+            return 200, {"effect": service.turbo_studio().revision_preview(kind)}
+
         raise ApiError("unknown_route", detail=f"{method} /{'/'.join(parts)}")
 
     # -------------------------------------------------------------- helpers
@@ -611,7 +935,9 @@ class ConsoleApi:
         if target.stat().st_size <= 0:
             raise ApiError("media_empty")
         content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        return 200, {"__raw__": target.read_bytes(), "__content_type__": content_type}
+        # Transport adapters stream this validated path. Returning bytes here
+        # would load every preview into RAM and prevents HTTP Range handling.
+        return 200, {"__file__": target, "__content_type__": content_type}
 
     def _static(self, relative):
         safe = Path(relative.replace("\\", "/"))

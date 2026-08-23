@@ -11,27 +11,54 @@
 
 const api = {
   async request(method, path, { body, headers } = {}) {
-    const options = { method, headers: { ...(headers || {}) } };
+    const requestId = `web-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    const controller = new AbortController();
+    const timeoutMs = 30000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const options = {
+      method,
+      headers: { 'X-Request-ID': requestId, ...(headers || {}) },
+      signal: controller.signal,
+    };
     if (body !== undefined && !(body instanceof ArrayBuffer) && !(body instanceof Blob)) {
       options.headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(body);
     } else if (body !== undefined) {
       options.body = body;
     }
-    const response = await fetch(path, options);
-    const contentType = response.headers.get('content-type') || '';
-    const payload = contentType.includes('application/json') ? await response.json() : null;
-    if (!response.ok) {
-      const error = (payload && payload.error) || {};
-      const failure = new Error(error.message || `HTTP ${response.status}`);
-      failure.hint = error.hint || '';
-      failure.code = error.code || `http_${response.status}`;
-      failure.status = response.status;
-      // Which form fields the server rejected, so the UI can mark them.
-      failure.fields = error.fields || [];
-      throw failure;
+    const started = performance.now();
+    console.info(`[ui] ${requestId} START ${method} ${path}`);
+    try {
+      const response = await fetch(path, options);
+      const contentType = response.headers.get('content-type') || '';
+      const payload = contentType.includes('application/json') ? await response.json() : null;
+      if (!response.ok) {
+        const error = (payload && payload.error) || {};
+        const failure = new Error(error.message || `HTTP ${response.status}`);
+        failure.hint = error.hint || '';
+        failure.code = error.code || `http_${response.status}`;
+        failure.status = response.status;
+        failure.debugId = error.debug_id || requestId;
+        // Which form fields the server rejected, so the UI can mark them.
+        failure.fields = error.fields || [];
+        throw failure;
+      }
+      console.info(`[ui] ${requestId} END ${response.status} ${Math.round(performance.now() - started)}ms`);
+      return payload;
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        const failure = new Error(`Sunucu ${timeoutMs / 1000} saniye icinde yanit vermedi.`);
+        failure.code = 'request_timeout';
+        failure.debugId = requestId;
+        failure.hint = `Sayfayi yenileyip tekrar dene. Debug istegi: ${requestId}`;
+        console.error(`[ui] ${requestId} TIMEOUT ${method} ${path}`);
+        throw failure;
+      }
+      console.error(`[ui] ${requestId} ERROR ${method} ${path}`, error);
+      throw error;
+    } finally {
+      clearTimeout(timeout);
     }
-    return payload;
   },
   get(path) { return this.request('GET', path); },
   post(path, body, headers) { return this.request('POST', path, { body, headers }); },
@@ -130,10 +157,28 @@ const state = {
   alerts: [],
   polling: null,
   autoBusy: false,
+  longFormAutoBusy: false,
   // The LAST diagnostics report, fetched from the server (never recomputed in
   // the browser). Null until the Settings screen asks for it.
   diagnostics: null,
   diagnosticsBusy: false,
+  // Transcript editing drafts. UI-local and kept in state on purpose: the
+  // job poll re-renders every 1.5s and anything typed into a bare DOM node
+  // would be wiped mid-sentence.
+  transcriptDraft: null,
+  longFormStudio: null,
+  turboStudio: null,
+  turboDraft: null,
+  longFormDraft: null,
+  revision: null,
+  revisionStage: null,
+  revisionNotes: '',
+  transcriptFullDraft: null,
+  glossaryDraft: null,
+  // Which (project, slot) each draft above belongs to. A mismatch clears it.
+  transcriptDraftOwner: null,
+  transcriptFullDraftOwner: null,
+  glossaryDraftOwner: null,
   uploadRequest: null,
   uploadProgress: null,
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
@@ -156,6 +201,8 @@ const SCREENS = [
   { key: 'projects',  label: 'Projeler',        needsProject: false },
   { key: 'history',   label: 'Kayitlar',        needsProject: false },
   { key: 'phase0',    label: 'Faz 0 · Strateji', needsProject: true },
+  { key: 'longform',  label: 'Uzun Video',       needsProject: true },
+  { key: 'turbo',     label: 'Turbo Studio',     needsProject: true },
   { key: 'jobs',      label: 'Is akisi',         needsProject: true },
   { key: 'moments',   label: 'Moment Explorer',  needsProject: true },
   { key: 'script',    label: 'Script Studio',    needsProject: true },
@@ -203,7 +250,7 @@ function textareaField(spec) {
   const { id, required = false } = spec;
   const attrs = { id, ...spec.attrs };
   if (required) { attrs['aria-required'] = 'true'; attrs['aria-describedby'] = `${id}-error`; }
-  return field({ ...spec, control: el('textarea', attrs) });
+  return field({ ...spec, control: el('textarea', attrs, spec.value || '') });
 }
 
 function requiredLegend() {
@@ -370,12 +417,30 @@ async function guard(action, successTitle) {
 function screenProjects() {
   const ws = state.workspace;
   const projects = (ws && ws.projects) || [];
+  const storage = (ws && ws.storage_policy) || {};
   return el('div', {},
     el('div', { class: 'page-head' },
       el('div', {},
         el('h1', { text: 'Projeler' }),
-        el('p', { class: 'subtitle', text: 'Her proje kendi izole depolama alanina sahiptir.' })),
+        el('p', { class: 'subtitle',
+          text: 'Aktif projeler hizli calisma diskinde, tamamlananlar G arsivinde tutulur.' })),
     ),
+    el('div', { class: 'card storage-policy-card', 'data-testid': 'storage-policy' },
+      el('div', { class: 'storage-policy-flow' },
+        el('div', { class: 'storage-policy-node' },
+          el('div', { class: 'dim', text: 'AKTIF CALISMA' }),
+          el('strong', { text: storage.working_location_name || 'C surucusu / aktif calisma' }),
+          el('div', { class: 'dim', text: 'Uzerinde calistigin proje burada acilir.' })),
+        el('div', { class: 'storage-policy-arrow', text: 'Arsivle  →' }),
+        el('div', { class: 'storage-policy-node' },
+          el('div', { class: 'dim', text: 'UZUN SURELI SAKLAMA' }),
+          el('strong', { text: storage.archive_location_name || 'G surucusu / Youtube kaynak videolar' }),
+          el('div', { class: 'dim',
+            text: storage.archive_available
+              ? 'Arsiv diski bagli ve kullanima hazir.'
+              : 'Arsiv diski su anda kullanilamiyor.' }))),
+      el('p', { class: 'subtitle storage-policy-note',
+        text: 'Arsivleme kopya birakmaz: proje aktif listeden cikar ve G diskine tasinir.' })),
     el('div', { class: 'card' },
       el('h2', { text: 'Yeni proje' }),
       requiredLegend(),
@@ -449,13 +514,18 @@ async function automationAction(action) {
   if (!state.projectId || state.autoBusy) return null;
   state.autoBusy = true;
   render();
-  const result = await guard(
-    () => api.post(`/api/projects/${state.projectId}/automation`, {
-      action, actor: projectActor(),
-    }));
-  state.autoBusy = false;
-  await refresh();
-  return result;
+  try {
+    return await guard(
+      () => api.post(`/api/projects/${state.projectId}/automation`, {
+        action, actor: projectActor(),
+      }));
+  } finally {
+    // A network timeout or an unexpected refresh failure must never leave the
+    // whole automation toolbar permanently disabled.
+    state.autoBusy = false;
+    render();
+    await refresh();
+  }
 }
 
 
@@ -718,7 +788,9 @@ function projectLifecyclePanel() {
   if (!record.project_id) return null;
   const active = Number(((state.project || {}).job_summary || {}).active || 0);
   const revisions = (state.project && state.project.revisions) || [];
+  const archive = (state.project && state.project.archive) || {};
   const disabled = active > 0;
+  const archiveDisabled = disabled || !archive.configured || !archive.available;
   const runLifecycle = async (action, extra, successTitle) => {
     const result = await guard(() => api.post(
       `/api/projects/${state.projectId}/lifecycle`, {
@@ -737,8 +809,15 @@ function projectLifecyclePanel() {
     el('p', { class: 'subtitle lifecycle-lead',
               text: 'Geri donulen asama ve sonraki ciktilar kaybolmaz; proje icindeki '
                     + 'revizyon arsivine tasinir. Aktif is varken bu islemler kilitlidir.' }),
+    el('p', { class: 'subtitle lifecycle-lead',
+      text: `${((state.project || {}).storage_policy || {}).working_location_name || 'C aktif calisma'} → `
+        + `${archive.location_name || 'G uzun sureli arsiv'}` }),
     disabled ? alertBox('warn', 'Proje su anda calisiyor',
-      `${active} aktif is tamamlanmadan geri donme, sifirlama veya silme yapilamaz.`) : null,
+      `${active} aktif is tamamlanmadan geri donme, arsivleme, sifirlama veya silme yapilamaz.`) : null,
+    archive.configured && !archive.available
+      ? alertBox('warn', 'Arsiv diski kullanilamiyor',
+        'G arsiv klasorunu kullanabilmek icin diskin bagli ve yazilabilir oldugunu kontrol et.')
+      : null,
     requiredLegend(),
     el('div', { class: 'lifecycle-section' },
       el('h3', { text: 'Bir asamaya geri don' }),
@@ -763,13 +842,33 @@ function projectLifecyclePanel() {
         },
       }, 'Bu asamaya geri don')),
     el('div', { class: 'lifecycle-section lifecycle-section--danger' },
-      el('h3', { text: 'Sifirla veya sil' }),
+      el('h3', { text: 'Arsivle, sifirla veya sil' }),
       inputField({ id: 'lifecycle-confirmation', label: 'Proje adi dogrulamasi',
                    required: true,
                    hint: `Devam etmek icin proje adini birebir yaz: ${record.title}`,
                    attrs: { maxlength: 200, autocomplete: 'off',
                             placeholder: record.title || '' } }),
       el('div', { class: 'row' },
+        el('button', {
+          class: 'btn btn--primary', disabled: archiveDisabled,
+          'data-testid': 'lifecycle-archive',
+          title: archive.location_name || 'Arsiv konumu yapilandirilmamis',
+          onclick: async (event) => {
+            const values = destructiveValues();
+            if (!values) return;
+            event.currentTarget.disabled = true;
+            const archived = await guard(() => api.post(
+              `/api/projects/${state.projectId}/archive`, {
+                confirmation: values['lifecycle-confirmation'], actor: projectActor(),
+              }), 'Proje G arsivine tasindi');
+            if (archived) {
+              state.projectId = null; state.project = null; state.selectedMode = null;
+              await goto('history');
+            } else {
+              event.currentTarget.disabled = archiveDisabled;
+            }
+          },
+        }, 'Projeyi G arsivine tasi'),
         el('button', {
           class: 'btn', disabled, 'data-testid': 'lifecycle-reset-keep-source',
           onclick: async (event) => {
@@ -813,6 +912,8 @@ function projectLifecyclePanel() {
 
 function screenHistory() {
   const projects = (state.workspace && state.workspace.projects) || [];
+  const archive = (state.workspace && state.workspace.archive) || {};
+  const archivedProjects = archive.projects || [];
   const projectCards = projects.map(project => {
     const titleId = `history-title-${project.project_id}`;
     const notesId = `history-notes-${project.project_id}`;
@@ -879,8 +980,584 @@ function screenHistory() {
         el('p', { class: 'subtitle',
           text: 'Projeler, kaynaklar ve sonuclar yeniden baslatmadan sonra da burada kalir.' }))),
     projects.length === 0
-      ? el('div', { class: 'card empty', text: 'Henuz kayitli proje yok.' })
-      : el('div', { class: 'archive-list' }, projectCards));
+      ? el('div', { class: 'card empty', text: 'Henuz aktif proje yok.' })
+      : el('div', { class: 'archive-list' }, projectCards),
+    el('div', { class: 'page-head archive-heading' },
+      el('div', {},
+        el('h2', { text: 'G arsivindeki projeler' }),
+        el('p', { class: 'subtitle',
+          text: archive.configured
+            ? `${archive.location_name || 'Harici arsiv'} · aktif calisma listesinden ayridir.`
+            : 'Arsiv konumu henuz yapilandirilmamis.' }))),
+    archivedProjects.length === 0
+      ? el('div', { class: 'card empty',
+          text: archive.available ? 'Henuz arsivlenmis proje yok.' : 'Arsiv diski kullanilamiyor.' })
+      : el('div', { class: 'archive-list' }, archivedProjects.map(item =>
+          el('article', { class: 'card archive-card' },
+            el('div', { class: 'card__head' },
+              el('div', {},
+                el('h3', { text: item.title || '(okunamadi)' }),
+                el('div', { class: 'dim', text: item.source_name || 'Kaynak adi yok' })),
+              badge('completed', 'arsivlendi')),
+            el('div', { class: 'grid grid--3 archive-meta' },
+              el('div', {}, el('div', { class: 'dim', text: 'Arsivlenme' }),
+                el('div', { text: item.archived_at || '-' })),
+              el('div', {}, el('div', { class: 'dim', text: 'Boyut' }),
+                el('div', { text: formatBytes(item.total_bytes) })),
+              el('div', {}, el('div', { class: 'dim', text: 'Dosya' }),
+                el('div', { text: String(item.file_count || 0) })))))));
+}
+
+const LONG_FORM_DEFAULTS = {
+  topic: '', content_type: 'explainer', target_duration_min: 18,
+  chapter_count: 6, language: 'tr-TR', tone: 'documentary',
+  audience: 'Genel izleyici', angle: '', narration_mode: 'undecided',
+  include_subtitles: true, notes: '',
+};
+
+function longFormDraft() {
+  if (!state.longFormDraft || state.longFormDraft.projectId !== state.projectId) {
+    const saved = (((state.project || {}).long_form || {}).data) || {};
+    state.longFormDraft = { ...LONG_FORM_DEFAULTS, ...saved, projectId: state.projectId };
+  }
+  return state.longFormDraft;
+}
+
+function setLongFormDraft(key, value) {
+  const draft = longFormDraft();
+  draft[key] = value;
+  if (key === 'target_duration_min') {
+    const duration = Math.max(15, Math.min(20, Number(value) || 18));
+    const label = document.getElementById('longform-word-range');
+    if (label) label.textContent = `${duration * 130}-${duration * 150} kelime`;
+  }
+}
+
+function longFormSelect(id, label, value, options, onChange, hint = '') {
+  return field({ id, label, required: true, hint,
+    control: el('select', { id, 'aria-required': 'true',
+      onchange: event => onChange(event.currentTarget.value) },
+    options.map(([optionValue, optionLabel]) => el('option', {
+      value: optionValue, selected: value === optionValue,
+    }, optionLabel))) });
+}
+
+function screenLongForm() {
+  const section = (state.project && state.project.long_form) || {};
+  const draft = longFormDraft();
+  const duration = Math.max(15, Math.min(20, Number(draft.target_duration_min) || 18));
+  const saved = section.data;
+  const update = key => event => setLongFormDraft(key, event.currentTarget.value);
+  const rules = [
+    { id: 'longform-topic', label: 'Video konusu', required: true },
+    { id: 'longform-content-type', label: 'Video turu', required: true },
+    { id: 'longform-duration', label: 'Hedef sure', required: true,
+      number: true, min: 15, max: 20 },
+    { id: 'longform-chapters', label: 'Bolum sayisi', required: true,
+      number: true, min: 5, max: 7 },
+    { id: 'longform-language', label: 'Video dili', required: true },
+    { id: 'longform-tone', label: 'Anlatim tonu', required: true },
+    { id: 'longform-audience', label: 'Hedef kitle' },
+    { id: 'longform-angle', label: 'Anlatim acisi' },
+    { id: 'longform-narration', label: 'Seslendirme tercihi', required: true },
+    { id: 'longform-notes', label: 'Plan notlari' },
+  ];
+  return el('div', { 'data-testid': 'longform-screen' },
+    el('div', { class: 'page-head' },
+      el('div', {},
+        el('h1', { text: 'Uzun Video Planlama' }),
+        el('p', { class: 'subtitle',
+          text: '15-20 dakikalik teori, genel anlatim ve karsilastirma videolari icin brief.' })),
+      saved ? badge('review_required', 'plan kayitli') : badge('planned', 'yeni plan')),
+    alertBox('info', 'Yalnizca planlama',
+      'Bu sekme model cagrisi, script uretimi, seslendirme veya render baslatmaz. '
+      + 'Kaydedilen brief daha sonra outline ve bolum uretiminin girdisi olacak.'),
+    section.problem ? alertBox('danger', 'Plan okunamadi', section.problem) : null,
+    el('div', { class: 'card' },
+      el('h2', { text: 'Icerik briefi' }),
+      requiredLegend(),
+      inputField({ id: 'longform-topic', label: 'Video konusu', required: true,
+        hint: 'Ornek: House of the Dragon evreninde ejderha biniciligi nasil calisir?',
+        attrs: { value: draft.topic, maxlength: 300, 'data-testid': 'longform-topic',
+          oninput: update('topic') } }),
+      el('div', { class: 'grid grid--2' },
+        longFormSelect('longform-content-type', 'Video turu', draft.content_type, [
+          ['explainer', 'Genel anlatim'], ['theory', 'Teori / yorum'],
+          ['comparison', 'Karsilastirma / analiz'],
+        ], value => setLongFormDraft('content_type', value)),
+        longFormSelect('longform-language', 'Video dili', draft.language, [
+          ['tr-TR', 'Turkce'], ['en-US', 'English'],
+        ], value => setLongFormDraft('language', value))),
+      textareaField({ id: 'longform-angle', label: 'Anlatim acisi',
+        hint: 'Videonun ana iddiasi, sorusu veya izleyiciye verecegi bakis acisi.',
+        value: draft.angle,
+        attrs: { maxlength: 1000, 'data-testid': 'longform-angle',
+          oninput: update('angle') } }),
+      el('div', { class: 'grid grid--3' },
+        inputField({ id: 'longform-duration', label: 'Hedef sure (dakika)', required: true,
+          type: 'number', attrs: { value: duration, min: 15, max: 20,
+            'data-testid': 'longform-duration', oninput: update('target_duration_min') } }),
+        inputField({ id: 'longform-chapters', label: 'Bolum sayisi', required: true,
+          type: 'number', attrs: { value: draft.chapter_count, min: 5, max: 7,
+            'data-testid': 'longform-chapters', oninput: update('chapter_count') } }),
+        longFormSelect('longform-tone', 'Anlatim tonu', draft.tone, [
+          ['documentary', 'Belgesel'], ['cinematic', 'Sinematik'],
+          ['conversational', 'Sohbet'], ['analytical', 'Analitik'],
+        ], value => setLongFormDraft('tone', value))),
+      inputField({ id: 'longform-audience', label: 'Hedef kitle',
+        attrs: { value: draft.audience, maxlength: 300,
+          'data-testid': 'longform-audience', oninput: update('audience') } }),
+      longFormSelect('longform-narration', 'Seslendirme tercihi', draft.narration_mode, [
+        ['undecided', 'Daha sonra karar ver'], ['tts', 'TTS anlatim'],
+        ['own_voice', 'Kendi sesim'],
+      ], value => setLongFormDraft('narration_mode', value)),
+      el('label', { class: 'check-row' },
+        el('input', { id: 'longform-subtitles', type: 'checkbox',
+          checked: draft.include_subtitles !== false,
+          onchange: event => setLongFormDraft('include_subtitles', event.currentTarget.checked) }),
+        el('span', { text: 'Tam video altyazisi planla' })),
+      textareaField({ id: 'longform-notes', label: 'Plan notlari',
+        value: draft.notes,
+        attrs: { maxlength: 3000, 'data-testid': 'longform-notes',
+          oninput: update('notes') } }),
+      el('div', { class: 'longform-estimate' },
+        el('div', {}, el('span', { class: 'dim', text: 'Tahmini script: ' }),
+          el('strong', { id: 'longform-word-range', text: `${duration * 130}-${duration * 150} kelime` })),
+        el('div', { class: 'dim',
+          text: 'Hook + giris + 5-7 ana bolum + sonuc/CTA yapisi hedeflenir.' })),
+      el('button', { class: 'btn btn--primary', 'data-testid': 'longform-save',
+        onclick: async event => {
+          const values = validateFields(rules);
+          if (!values) return;
+          const button = event.currentTarget;
+          button.disabled = true;
+          const result = await guard(() => api.request(
+            'PATCH', `/api/projects/${state.projectId}/long-form-plan`, { body: {
+              topic: values['longform-topic'],
+              content_type: values['longform-content-type'],
+              target_duration_min: values['longform-duration'],
+              chapter_count: values['longform-chapters'],
+              language: values['longform-language'], tone: values['longform-tone'],
+              audience: values['longform-audience'] || 'Genel izleyici',
+              angle: values['longform-angle'] || '',
+              narration_mode: values['longform-narration'],
+              include_subtitles: document.getElementById('longform-subtitles').checked,
+              notes: values['longform-notes'] || '', updated_by: projectActor(),
+            } }), 'Uzun video plani kaydedildi');
+          if (result) {
+            state.longFormDraft = { ...result.long_form, projectId: state.projectId };
+            await refresh();
+          } else {
+            button.disabled = false;
+          }
+        } }, saved ? 'Plani guncelle' : 'Plani kaydet')),
+    saved ? el('div', { class: 'card' },
+      el('h2', { text: 'Kayit durumu' }),
+      el('div', { class: 'grid grid--3' },
+        el('div', { class: 'tech-cell' }, el('div', { class: 'tech-cell__label', text: 'Durum' }),
+          el('div', { class: 'tech-cell__value', text: 'Taslak' })),
+        el('div', { class: 'tech-cell' }, el('div', { class: 'tech-cell__label', text: 'Son guncelleme' }),
+          el('div', { class: 'tech-cell__value', text: saved.updated_at || '-' })),
+        el('div', { class: 'tech-cell' }, el('div', { class: 'tech-cell__label', text: 'Uretim' }),
+          el('div', { class: 'tech-cell__value', text: 'Baslatilmadi' })))) : null,
+    longFormStudioPanel());
+}
+
+/* Uzun Video Studio: uretim paneli.
+ *
+ * The planning brief above stays exactly as it was. Everything here is the
+ * PRODUCTION half: what a run would cost, which stage is next, and the two
+ * things a long run actually needs from a UI -- visible progress and an
+ * actionable reason when it stops.
+ *
+ * Rules this panel follows:
+ *   1. Opening the tab spends nothing. Estimates and stage state are reads.
+ *   2. Every long action shows the stage, the unit in flight and the elapsed
+ *      time, so the screen is never a frozen button.
+ *   3. A failure shows a sanitized reason plus the one control that fixes it
+ *      (retry this chunk, regenerate this chunk, approve this gate). */
+function longFormStudioPanel() {
+  const studio = state.longFormStudio;
+  if (!studio || !studio.available) return null;
+  const progress = studio.progress || {};
+  const estimates = studio.estimates || {};
+  const readiness = studio.readiness || {};
+  return el('div', {},
+    longFormEstimatePanel(estimates, readiness),
+    longFormControlPanel(progress),
+    longFormStagePanel(progress),
+    longFormScriptPanel(studio),
+    longFormBrollPanel(studio.broll || {}, studio.chapters || []),
+    longFormChunkPanel(studio.tts || {}),
+    longFormEventPanel(studio.events || [], studio.quota || {}));
+}
+
+function longFormEstimatePanel(estimates, readiness) {
+  const calls = estimates.api_calls || {};
+  const capacity = readiness.tts_capacity || {};
+  return el('div', { class: 'card', 'data-testid': 'lf-estimates' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Uretim tahmini' }),
+      badge(readiness.ready ? 'completed' : 'missing',
+            readiness.ready ? 'saglayici hazir' : 'saglayici eksik')),
+    el('div', { class: 'grid grid--2' },
+      techCell('Kelime hedefi', `${(estimates.word_range || {}).minimum}-${(estimates.word_range || {}).maximum}`),
+      techCell('TTS parcasi (tahmini)', String(estimates.tts_chunk_estimate || '-')),
+      techCell('API istegi (tahmini)', String(calls.total || '-')),
+      techCell('En-boy orani', estimates.aspect_ratio || '16:9')),
+    calls.total ? el('div', { class: 'dim', 'data-testid': 'lf-call-breakdown',
+      text: `Arastirma ${calls.research} + outline ${calls.outline} + bolum `
+            + `${calls.chapters} + tutarlilik ${calls.consistency} + TTS `
+            + `${calls.tts_chunks}. ${calls.note || ''}` }) : null,
+    (readiness.blockers || []).map(text => alertBox('danger', 'Baslatilamaz', text)),
+    (readiness.warnings || []).map(text => alertBox('warn', 'Kota uyarisi', text)),
+    capacity.needed ? el('div', { class: 'dim', 'data-testid': 'lf-capacity',
+      text: `Gunluk TTS kapasitesi ${capacity.daily_request_capacity} istek, `
+            + `dakikalik ${capacity.per_minute_request_capacity} istek `
+            + `(sinirlayan: ${capacity.binding_limit}).` }) : null);
+}
+
+function longFormControlPanel(progress) {
+  const busy = progress.status === 'running';
+  const next = progress.next || {};
+  const send = async (body, successTitle) => {
+    const result = await guard(() => api.post(
+      `/api/projects/${state.projectId}/long-form/control`, body), successTitle);
+    if (result) state.longFormStudio = result.long_form_studio;
+    await refresh();
+  };
+  return el('div', { class: 'card', 'data-testid': 'lf-controls' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Uretim kontrolu' }),
+      badge(progress.cancelled ? 'failed' : (progress.paused ? 'queued' : progress.status),
+            progress.cancelled ? 'iptal' : (progress.paused ? 'duraklatildi' : progress.status))),
+    el('div', { class: 'dim', 'data-testid': 'lf-next',
+      text: next.reason || '' }),
+    next.billing_blocked
+      ? alertBox('danger', 'Billing/kota ayari gerekiyor',
+          'Google AI Studio planini, faturalandirmayi ve proje kotasini kontrol et. '
+          + 'Bu engel zamanlayiciyla tekrar denenmez.')
+      : null,
+    el('div', { class: 'row' },
+      el('button', { class: 'btn btn--primary', 'data-testid': 'lf-start',
+        onclick: (e) => withButton(e, () => send({ action: 'start' }, 'Uretim baslatildi')) },
+        'Uretimi baslat'),
+      el('button', { class: 'btn btn--sm', 'data-testid': 'lf-run-stage',
+        disabled: Boolean(next.blocked),
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/stage`, {}),
+            'Asama calisti');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, 'Sonraki asamayi calistir'),
+      next.billing_blocked
+        ? el('button', { class: 'btn btn--primary', 'data-testid': 'lf-retry-billing',
+            onclick: (e) => withButton(e, () => send(
+              { action: 'retry_billing' },
+              'Billing engeli kaldirildi; asama yeniden denenebilir')) },
+            'Billing duzeltildi - yeniden denemeyi ac')
+        : null,
+      progress.paused
+        ? el('button', { class: 'btn btn--sm', 'data-testid': 'lf-resume',
+            onclick: (e) => withButton(e, () => send({ action: 'resume' }, 'Devam')) },
+            'Devam et')
+        : el('button', { class: 'btn btn--sm', 'data-testid': 'lf-pause',
+            onclick: (e) => withButton(e, () => send({ action: 'pause' }, 'Duraklatildi')) },
+            'Duraklat'),
+      el('button', { class: 'btn btn--sm btn--danger', 'data-testid': 'lf-cancel',
+        onclick: (e) => withButton(e, () => send({ action: 'cancel' }, 'Iptal edildi')) },
+        'Iptal et')));
+}
+
+function longFormStagePanel(progress) {
+  const stages = progress.stages || [];
+  return el('div', { class: 'card', 'data-testid': 'lf-stages' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Asamalar' }),
+      badge('planned', `${progress.completed_count || 0}/${progress.total_count || 12}`)),
+    el('div', { class: 'stack' }, stages.map(stage => el('div', {
+      class: 'spread', 'data-testid': `lf-stage-${stage.key}` },
+      el('span', {}, badge(_lfStageBadge(stage.state), stage.state), ' ', stage.label),
+      el('span', { class: 'dim',
+        text: (stage.attempts ? `deneme ${stage.attempts}` : '')
+              + (stage.detail ? ` - ${stage.detail}` : '') }),
+      stage.error
+        ? el('span', { class: 'transcript-nomatch', 'data-testid': `lf-error-${stage.key}`,
+                       text: stage.error })
+        : null,
+      (!stage.automatic && stage.state !== 'completed')
+        ? el('button', { class: 'btn btn--sm', 'data-testid': `lf-approve-${stage.key}`,
+            onclick: (e) => withButton(e, async () => {
+              const result = await guard(() => api.post(
+                `/api/projects/${state.projectId}/long-form/control`,
+                { action: 'approve_stage', stage: stage.key }), 'Asama onaylandi');
+              if (result) state.longFormStudio = result.long_form_studio;
+              await refresh();
+            }) }, 'Onayla')
+        : null))));
+}
+
+function _lfStageBadge(stateName) {
+  return { completed: 'completed', failed: 'failed', running: 'running',
+           review_required: 'review_required', queued: 'queued',
+           waiting_rate_limit: 'queued', waiting_daily_quota: 'queued',
+           blocked_billing: 'failed',
+           cancelled: 'failed' }[stateName] || 'missing';
+}
+
+async function longFormResumeTick() {
+  if (state.longFormAutoBusy || state.screen !== 'longform' || !state.projectId) return;
+  state.longFormAutoBusy = true;
+  try {
+    const result = await api.post(
+      `/api/projects/${state.projectId}/long-form/stage`, {});
+    if (result) state.longFormStudio = result.long_form_studio;
+  } catch (error) {
+    pushAlert('danger', 'Uzun video devam edemedi', error.message, error.hint);
+  } finally {
+    state.longFormAutoBusy = false;
+  }
+  await refresh();
+}
+
+function longFormScriptPanel(studio) {
+  const chapters = studio.chapters || [];
+  const summary = studio.chapters_summary || {};
+  const research = studio.research;
+  const consistency = studio.consistency;
+  if (!chapters.length && !research) return null;
+  if (!state.longFormDraft) state.longFormDraft = {};
+  const draft = state.longFormDraft;
+  return el('div', { class: 'card', 'data-testid': 'lf-script' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Script' }),
+      badge(chapters.length ? 'review_required' : 'missing',
+            `${summary.total_word_count || 0} kelime`)),
+    research ? el('div', { class: 'dim', 'data-testid': 'lf-research',
+      text: `Arastirma: ${(research.facts || []).length} kaynakli olgu, `
+            + `${(research.interpretations || []).length} yorum. Tez: `
+            + `${research.thesis || '-'}` }) : null,
+    consistency ? el('div', { class: 'dim', 'data-testid': 'lf-consistency',
+      text: `Tutarlilik: ${consistency.issue_count} bulgu `
+            + `(${consistency.high_severity_count} yuksek). ${consistency.overall || ''}` })
+      : null,
+    el('div', { class: 'stack' }, chapters.map(chapter => el('div', {
+      class: 'moment-card', 'data-testid': `lf-chapter-${chapter.index}` },
+      el('div', { class: 'spread' },
+        el('strong', { text: `${chapter.index}. ${chapter.title || ''}` }),
+        el('span', { class: 'dim',
+          text: `${chapter.word_count}/${chapter.target_words} kelime - `
+                + `~${Math.round((chapter.duration_estimate || {}).expected_sec || 0)} sn`
+                + (chapter.within_target ? '' : ' - hedef disi')
+                + (chapter.edited_by_human ? ' - elle duzenlendi' : '') })),
+      el('textarea', {
+        class: 'transcript-full-input', rows: 4, spellcheck: 'false',
+        'data-testid': `lf-chapter-input-${chapter.index}`,
+        oninput: (e) => { draft[chapter.index] = e.currentTarget.value; },
+      }, draft[chapter.index] !== undefined ? draft[chapter.index] : (chapter.text || '')),
+      el('button', { class: 'btn btn--sm', 'data-testid': `lf-chapter-save-${chapter.index}`,
+        onclick: (e) => withButton(e, async () => {
+          const node = document.querySelector(`[data-testid=lf-chapter-input-${chapter.index}]`);
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/chapter`,
+            { index: chapter.index, text: node ? node.value : '' }),
+            'Bolum kaydedildi');
+          if (result) { state.longFormStudio = result.long_form_studio; delete draft[chapter.index]; }
+          await refresh();
+        }) }, 'Bolumu kaydet')))),
+    studio.full_script
+      ? el('details', {}, el('summary', { text: 'Tum script' }),
+          el('pre', { class: 'pre', 'data-testid': 'lf-full-script',
+                      text: studio.full_script }))
+      : null);
+}
+
+function longFormChunkPanel(tts) {
+  const chunks = tts.chunks || [];
+  const readiness = tts.readiness || {};
+  const combined = tts.combined;
+  if (!chunks.length) return null;
+  return el('div', { class: 'card', 'data-testid': 'lf-chunks' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'TTS parcalari' }),
+      badge(readiness.ready ? 'completed' : 'review_required',
+            `${readiness.completed_count || 0}/${readiness.chunk_count || 0}`)),
+    el('p', { class: 'dim', text: tts.approval_policy || '' }),
+    el('div', { class: 'stack' }, chunks.map(chunk => el('div', {
+      class: 'spread', 'data-testid': `lf-chunk-${chunk.id}` },
+      el('span', {}, badge(_lfStageBadge(chunk.status === 'pending' ? 'queued' : chunk.status),
+                           chunk.status), ` ${chunk.sequence}. ${chunk.chapter_id}`),
+      el('span', { class: 'dim',
+        text: `${chunk.word_count} kelime`
+              + (chunk.duration_sec ? ` - ${chunk.duration_sec}s` : '')
+              + (chunk.attempts ? ` - deneme ${chunk.attempts}` : '') }),
+      chunk.error
+        ? el('span', { class: 'transcript-nomatch', 'data-testid': `lf-chunk-error-${chunk.id}`,
+                       text: `${chunk.error_kind || ''}: ${chunk.error}` })
+        : null,
+      chunk.wait_reason
+        ? el('span', { class: 'dim', 'data-testid': `lf-chunk-wait-${chunk.id}`,
+            text: `${chunk.wait_reason} - devam: `
+                  + `${chunk.resume_at ? new Date(chunk.resume_at).toLocaleString() : '-'}` })
+        : null,
+      chunk.status === 'completed'
+        ? el('audio', { controls: true, preload: 'none',
+            'data-testid': `lf-chunk-audio-${chunk.id}`,
+            src: `/api/projects/${state.projectId}/media/results/long_form/tts/`
+                 + encodeURIComponent(chunk.media_name || '') })
+        : null,
+      el('button', { class: 'btn btn--sm', 'data-testid': `lf-chunk-retry-${chunk.id}`,
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/tts`,
+            { action: 'retry', chunk_id: chunk.id }), 'Parca yeniden denendi');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, chunk.status === 'completed' ? 'Yeniden uret' : 'Tekrar dene')))),
+    el('div', { class: 'row' },
+      el('button', { class: 'btn btn--primary', 'data-testid': 'lf-tts-run',
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/tts`, { action: 'run' }),
+            'Eksik parcalar uretildi');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, 'Eksik parcalari uret'),
+      el('button', { class: 'btn btn--sm', 'data-testid': 'lf-tts-concat',
+        disabled: !readiness.ready,
+        onclick: (e) => withButton(e, async () => {
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/long-form/tts`, { action: 'concat' }),
+            'Ses birlestirildi');
+          if (result) state.longFormStudio = result.long_form_studio;
+          await refresh();
+        }) }, 'Parcalari birlestir')),
+    combined ? el('div', { class: 'stack', 'data-testid': 'lf-combined' },
+      el('div', { class: 'dim',
+        text: `Birlesik anlatim: ${combined.duration_sec}s `
+              + `(${(combined.duration_check || {}).measured_min} dk), `
+              + `${combined.chunk_count} parca` }),
+      (combined.duration_check && !combined.duration_check.within_target)
+        ? alertBox('warn', 'Sure hedef disinda', combined.duration_check.reason)
+        : null) : null);
+}
+
+function longFormBrollPanel(broll, chapters) {
+  if (!chapters.length) return null;
+  const providers = broll.providers || [];
+  const configured = providers.filter(item => item.configured);
+  const slots = broll.slots || [];
+  const post = async (body, title) => {
+    const result = await guard(() => api.post(
+      `/api/projects/${state.projectId}/long-form/broll`, body), title);
+    if (result) state.longFormStudio = result.long_form_studio;
+    await refresh();
+  };
+  if (!broll.available) {
+    return el('div', { class: 'card', 'data-testid': 'lf-broll' },
+      el('div', { class: 'card__head' },
+        el('h2', { text: 'B-roll materyal plani' }),
+        badge('planned', 'MoneyPrinterTurbo uyarlamasi')),
+      el('p', { class: 'dim', text:
+        'Bolum sirasina gore duzenlenebilir arama slotlari olusturur. Bu adim API cagrisi yapmaz.' }),
+      inputField({ id: 'lf-broll-duration', label: 'Klip degistirme suresi (sn)',
+        type: 'number', attrs: { value: 5, min: 2, max: 12,
+          'data-testid': 'lf-broll-duration' } }),
+      el('button', { class: 'btn btn--primary', 'data-testid': 'lf-broll-plan',
+        onclick: (e) => withButton(e, () => post({ action: 'plan',
+          clip_duration_sec: Number(document.getElementById('lf-broll-duration').value || 5),
+        }, 'B-roll plani olusturuldu')) }, 'B-roll plani olustur'));
+  }
+  return el('div', { class: 'card', 'data-testid': 'lf-broll' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'B-roll materyal plani' }),
+      badge(broll.downloaded_count === broll.slot_count ? 'completed' : 'review_required',
+        `${broll.downloaded_count || 0}/${broll.slot_count || 0} indirildi`)),
+    el('p', { class: 'dim', text:
+      `${broll.aspect_ratio || '16:9'} - klip degisimi ${broll.clip_duration_sec || 5} sn. `
+      + `${broll.policy || ''}` }),
+    broll.stale ? alertBox('danger', 'B-roll plani guncel degil',
+      'Bolum scripti plan olusturulduktan sonra degisti. Eski secimleri kullanmadan plani yeniden olustur.') : null,
+    broll.stale ? el('button', { class: 'btn btn--primary',
+      'data-testid': 'lf-broll-rebuild',
+      onclick: (e) => withButton(e, () => post({ action: 'plan',
+        clip_duration_sec: broll.clip_duration_sec || 5,
+      }, 'B-roll plani guncellendi')) }, 'Plani yeni scriptle olustur') : null,
+    configured.length
+      ? alertBox('info', 'Stok saglayicisi hazir',
+          configured.map(item => item.label).join(', ')
+          + '. Her arama yalnizca Arama dugmesine basildiginda bir API istegi yapar.')
+      : alertBox('warn', 'Stok API anahtari eksik',
+          '.env.local icine PEXELS_API_KEY veya PIXABAY_API_KEY ekle. Planlama ve yerel materyal kullanimi yine calisir.'),
+    el('div', { class: 'stack' }, slots.map(slot => {
+      const selected = slot.selected;
+      const providerId = `lf-broll-provider-${slot.id}`;
+      const queryId = `lf-broll-query-${slot.id}`;
+      return el('div', { class: 'moment-card', 'data-testid': `lf-broll-slot-${slot.id}` },
+        el('div', { class: 'spread' },
+          el('strong', { text: `${slot.sequence}. Bolum ${slot.chapter_index}: ${slot.chapter_title}` }),
+          badge(_lfStageBadge(slot.status === 'downloaded' ? 'completed' : 'review_required'),
+            slot.status || 'planned')),
+        el('div', { class: 'dim', text: slot.script_excerpt || '' }),
+        el('div', { class: 'grid grid--2' },
+          longFormSelect(providerId, 'Saglayici', slot.provider || (configured[0] || {}).id || 'pexels',
+            providers.map(item => [item.id, `${item.label}${item.configured ? '' : ' (anahtar yok)'}`]),
+            () => {}),
+          inputField({ id: queryId, label: 'Arama metni', attrs: {
+            value: slot.query || '', maxlength: 180,
+            'data-testid': queryId } })),
+        el('button', { class: 'btn btn--sm', 'data-testid': `lf-broll-search-${slot.id}`,
+          disabled: broll.stale,
+          onclick: (e) => withButton(e, () => post({
+            action: 'search', slot_id: slot.id,
+            provider: document.getElementById(providerId).value,
+            query: document.getElementById(queryId).value, per_page: 6,
+          }, 'Stok video adaylari getirildi')) }, '6 aday ara'),
+        (slot.candidates || []).length ? el('div', { class: 'stack' },
+          slot.candidates.map((candidate, index) => el('div', {
+            class: 'spread', 'data-testid': `lf-broll-candidate-${slot.id}-${index}` },
+            el('span', {},
+              el('strong', { text: candidate.attribution || candidate.id }),
+              el('span', { class: 'dim', text:
+                ` - ${candidate.width}x${candidate.height} - ${candidate.duration_sec || '?'} sn` })),
+            candidate.source_page ? el('a', { href: candidate.source_page,
+              target: '_blank', rel: 'noopener noreferrer', text: 'Kaynak sayfasi' }) : null,
+            el('button', { class: 'btn btn--sm',
+              disabled: broll.stale || (selected && selected.id === candidate.id),
+              onclick: (e) => withButton(e, () => post({ action: 'select',
+                slot_id: slot.id, candidate_id: candidate.id,
+              }, 'B-roll adayi secildi')) },
+              selected && selected.id === candidate.id ? 'Secili' : 'Sec')))) : null,
+        selected ? el('div', { class: 'row' },
+          el('span', { class: 'dim', text:
+            `Secili: ${selected.attribution || selected.id}` }),
+          slot.download
+            ? badge('completed', `${slot.download.local_file} - ${formatBytes(slot.download.bytes)}`)
+            : el('button', { class: 'btn btn--primary',
+                disabled: broll.stale,
+                'data-testid': `lf-broll-download-${slot.id}`,
+                onclick: (e) => withButton(e, () => post({ action: 'download',
+                  slot_id: slot.id }, 'Secili B-roll proje deposuna indirildi')) },
+                'Secili videoyu indir')) : null);
+    })),
+    el('p', { class: 'dim', text: broll.source_credit_note || '' }));
+}
+
+function longFormEventPanel(events, quota) {
+  if (!events.length) return null;
+  return el('div', { class: 'card', 'data-testid': 'lf-events' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Olaylar' }),
+      badge('planned', `${quota.request_total || 0} istek (tahmini)`)),
+    el('div', { class: 'stack' }, events.slice(-12).reverse().map(event => el('div', {
+      class: 'spread', 'data-testid': `lf-event-${event.event}` },
+      el('span', { class: 'mono', text: event.event }),
+      el('span', { class: 'dim', text: String(event.at || '').slice(11, 19) }),
+      el('span', { class: 'dim',
+        text: [event.chunk_id, event.chapter_index != null ? `bolum ${event.chapter_index}` : '',
+               event.latency_sec != null ? `${event.latency_sec}s` : '',
+               event.error_kind || ''].filter(Boolean).join(' - ') })))));
 }
 
 function parseMomentRanks(value) {
@@ -1083,6 +1760,8 @@ function screenPhase0() {
     ? `${supportedExtensions.join(',')},video/*`
     : 'video/*';
   const uploading = state.uploadProgress;
+  const sourceLibrary = view.source_library || {};
+  const libraryVideos = sourceLibrary.videos || [];
 
   const uploadCard = el('div', { class: 'card' },
     el('h2', { text: '1 · Kaynak video' }),
@@ -1093,6 +1772,32 @@ function screenPhase0() {
           el('div', { class: 'dim', text: `${(source.size_bytes / 1048576).toFixed(1)} MB · parmak izi ${String(source.fingerprint_sha256).slice(0, 16)}…` }))
       : el('div', { class: 'stack' },
           el('p', { class: 'muted', text: 'Bu projede henuz kaynak video yok.' }),
+          sourceLibrary.configured
+            ? (sourceLibrary.available && libraryVideos.length
+              ? el('div', { class: 'stack', 'data-testid': 'source-library-panel' },
+                  el('strong', { text: 'Drive / kaynak kutuphanesinden al' }),
+                  el('select', { id: 'source-library-file',
+                    'data-testid': 'source-library-file' },
+                    libraryVideos.map(video => el('option', { value: video.name },
+                      `${video.name} (${formatBytes(video.size_bytes)})`))),
+                  el('button', { class: 'btn btn--primary',
+                    'data-testid': 'source-library-import',
+                    onclick: (event) => withButton(event, async () => {
+                      const input = document.getElementById('source-library-file');
+                      const result = await guard(() => api.post(
+                        `/api/projects/${state.projectId}/source-library`,
+                        { filename: input ? input.value : '', actor: projectActor() }),
+                        'Kaynak video kutuphaneden projeye alindi');
+                      if (result) await refresh();
+                    }) }, 'Secili videoyu projeye al'),
+                  el('div', { class: 'dim',
+                    text: 'Aktarim sunucu tarafinda yapilir; video tarayici veya Colab proxy uzerinden gecmez.' }))
+              : alertBox('warn', 'Kaynak kutuphanesi bos veya erisilemiyor',
+                  'Videoyu Drive/YouTubeAutomation/source_videos klasorune ekleyip Yenileye basin.'))
+            : null,
+          sourceLibrary.configured && libraryVideos.length
+            ? el('div', { class: 'dim', text: 'Veya bu cihazdan yeni bir video yukle:' })
+            : null,
           uploading ? null : el('input', {
             type: 'file', id: 'source-file', accept: sourceAccept,
             'data-testid': 'source-file',
@@ -1450,13 +2155,18 @@ function screenMoments() {
       class: 'btn btn--primary', 'data-testid': 'save-moment-selection',
       disabled: selectedRank === null || !gate.allowed,
       onclick: async (event) => {
-        event.currentTarget.disabled = true;
-        await guard(() => api.post(`/api/projects/${state.projectId}/moment-selection`, {
-          selected_rank: selectedRank,
-          reviewed_by: projectActor(),
-          require_preview: false,
-        }), 'Moment secimi kaydedildi');
-        await refresh();
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          await guard(() => api.post(`/api/projects/${state.projectId}/moment-selection`, {
+            selected_rank: selectedRank,
+            reviewed_by: projectActor(),
+            require_preview: false,
+          }), 'Moment secimi kaydedildi');
+        } finally {
+          button.disabled = false;
+          await refresh();
+        }
       },
     }, 'Bu adayi kaydet'),
     selection && !staleSelection
@@ -1851,9 +2561,98 @@ function phaseRunCard(jobType, title, description, params, extraFields) {
  * Corrections are word-level on purpose -- they keep the alignment timings that
  * drive the yellow active-word highlight, which free-text editing would destroy.
  */
+/* Segment timestamps read as a clock, not a float: "0:07 - 0:11" is a place in
+ * the clip, "7.24" is a number. */
+function formatClock(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return '-';
+  const total = Math.max(0, Math.round(value));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/* Altyazi inceleme ve duzeltme.
+ *
+ * The screen used to show counts and nothing else, so a misheard proper noun
+ * could not be seen -- let alone fixed -- before it was burned into the video.
+ * Now the whole transcript is here, one editable row per caption line, with the
+ * words the recogniser was unsure about marked so the eye lands on them.
+ *
+ * Two rules this file has to respect:
+ *   1. Drafts live in `state`, not in the DOM. The job poll re-renders every
+ *      1.5s and anything typed straight into an input would vanish.
+ *   2. "Save" and "Approve" stay separate buttons. Saving changes the content
+ *      and therefore DROPS the approval; merging them would approve text the
+ *      reviewer had not read in its saved form. */
+/* Drafts belong to ONE project and ONE output slot. Segment ids repeat across
+ * projects (`seg_0001` exists in every transcript), so an unsaved draft that
+ * outlived a project switch would appear under the new project's identical ids
+ * and a Save would write the OTHER project's words into this transcript. The
+ * owner key is re-checked on every read, exactly as `longFormDraft` does. */
+function draftOwner(slot) {
+  return `${state.projectId || ''}::${slot === undefined || slot === null ? '' : slot}`;
+}
+
+function transcriptDraft(t) {
+  const owner = draftOwner(t && t.slot);
+  if (!state.transcriptDraft || state.transcriptDraftOwner !== owner) {
+    state.transcriptDraft = {};
+    state.transcriptDraftOwner = owner;
+  }
+  return state.transcriptDraft;
+}
+
+function transcriptFullDraftValue(t) {
+  const owner = draftOwner(t && t.slot);
+  if (state.transcriptFullDraftOwner !== owner) {
+    state.transcriptFullDraft = null;
+    state.transcriptFullDraftOwner = owner;
+  }
+  return state.transcriptFullDraft;
+}
+
+function setTranscriptFullDraft(t, value) {
+  state.transcriptFullDraftOwner = draftOwner(t && t.slot);
+  state.transcriptFullDraft = value;
+}
+
+function glossaryDraftValue() {
+  const owner = draftOwner(null);
+  if (state.glossaryDraftOwner !== owner) {
+    state.glossaryDraft = null;
+    state.glossaryDraftOwner = owner;
+  }
+  return state.glossaryDraft;
+}
+
+function setGlossaryDraft(value) {
+  state.glossaryDraftOwner = draftOwner(null);
+  state.glossaryDraft = value;
+}
+
+function transcriptDirty(t) {
+  const draft = transcriptDraft(t);
+  return (t.segments || []).some(seg => draft[seg.id] !== undefined
+                                        && draft[seg.id] !== seg.text);
+}
+
+/* Buttons must come back even when the request fails or times out: the API
+ * client aborts at 30s, and a permanently disabled Save is indistinguishable
+ * from a frozen app. */
+async function withButton(event, action) {
+  const button = event.currentTarget;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Kaydediliyor...';
+  try {
+    return await action();
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
 function screenTranscript() {
   const t = state.project.transcript || {};
-  const corrections = (t.corrections || []).slice();
   return el('div', {},
     el('div', { class: 'page-head' }, el('div', {},
       el('h1', { text: 'Altyazi (orijinal ses)' }),
@@ -1876,83 +2675,309 @@ function screenTranscript() {
                  'Altyazi uretilemez. Altyazili bir Short istiyorsan Moment '
                  + 'Explorer\'da konusma iceren bir aday sec.')
       : null,
-    t.available && t.has_speech
-      ? el('div', { class: 'card' },
-          el('div', { class: 'card__head' },
-            el('h2', { text: 'Altyazi metni' }),
-            badge(t.status === 'approved' ? 'approved' : 'review_required', t.status)),
-          el('div', { class: 'dim' },
-            `${t.word_count} kelime - ${t.cue_count} satir - dil ${t.language || '?'} - `
-            + `${t.whisper_model_size} - ortalama guven `
-            + `${t.average_word_probability != null ? t.average_word_probability : '?'}`),
-          t.low_confidence_count
-            ? el('div', { class: 'dim', 'data-testid': 'low-confidence-note',
-                text: `${t.low_confidence_count} kelime dusuk guvenli (asagida isaretli). `
-                      + 'Ozel isimler genelde burada yanlis cikar.' })
-            : null,
-          // The caption as it will read, with unsure words marked so the eye
-          // lands on exactly the words that need checking.
-          el('div', { class: 'transcript-text', 'data-testid': 'transcript-text' },
-            (t.words || []).map(w => el('span', {
-              class: 'transcript-word'
-                     + (w.low_confidence ? ' transcript-word--unsure' : '')
-                     + (w.corrected ? ' transcript-word--fixed' : ''),
-              title: `${w.start_sec}s - guven ${w.probability}`,
-            }, `${w.text} `))),
-          el('div', { class: 'dim mono', 'data-testid': 'transcript-plain',
-                      text: t.text || '' }))
-      : null,
-    t.available && t.has_speech ? transcriptCorrectionsPanel(corrections) : null,
+    glossaryPanel(t.glossary || {}, t.suggestions || []),
+    t.available && t.has_speech ? transcriptSummaryCard(t) : null,
+    t.available && t.has_speech ? transcriptSegmentsPanel(t) : null,
+    t.available && t.has_speech ? transcriptFullTextPanel(t) : null,
+    t.available && t.has_speech ? transcriptHistoryPanel(t) : null,
     t.available && t.has_speech
       ? el('div', { class: 'card' }, el('h2', { text: 'Altyazi onayi' }),
           el('p', { class: 'dim',
-                    text: 'Onaylanmadan render acilmaz. Duzeltme eklersen onay duser.' }),
+                    text: 'Onaylanmadan render acilmaz. Metni degistirirsen onay '
+                          + 'duser ve yeniden onaylaman gerekir.' }),
+          transcriptDirty(t)
+            ? alertBox('warn', 'Kaydedilmemis degisiklik var',
+                       'Once "Degisiklikleri kaydet" de. Onay kaydedilmis metne '
+                       + 'baglanir, ekranda yazdigina degil.')
+            : null,
           approvalPanel('transcript', 'Altyaziyi onayla'))
       : null);
 }
 
-function transcriptCorrectionsPanel(corrections) {
-  const rows = corrections.length ? corrections : [{ from: '', to: '', count: null }];
-  return el('div', { class: 'card', 'data-testid': 'transcript-corrections' },
-    el('h2', { text: 'Kelime duzeltmeleri' }),
+function transcriptSummaryCard(t) {
+  const ctx = t.glossary_context || {};
+  return el('div', { class: 'card' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Ozet' }),
+      badge(t.status === 'approved' ? 'approved' : 'review_required', t.status)),
+    el('div', { class: 'dim' },
+      `${t.word_count} kelime - ${t.cue_count} satir - dil ${t.language || '?'} - `
+      + `${t.whisper_model_size} - ortalama guven `
+      + `${t.average_word_probability != null ? t.average_word_probability : '?'}`),
+    t.low_confidence_count
+      ? el('div', { class: 'dim', 'data-testid': 'low-confidence-note',
+          text: `${t.low_confidence_count} kelime dusuk guvenli (asagida isaretli). `
+                + 'Ozel isimler genelde burada yanlis cikar.' })
+      : null,
+    t.excluded_cue_count
+      ? el('div', { class: 'dim', 'data-testid': 'excluded-caption-note',
+          text: `${t.excluded_cue_count} satir transkriptte korunuyor ancak videoda `
+                + 'altyazi olarak gosterilmeyecek.' })
+      : null,
+    ctx.term_count
+      ? el('div', { class: 'dim', 'data-testid': 'glossary-context-note',
+          text: `Bu transkript ${ctx.term_count} sozluk terimi baglam olarak `
+                + 'verilerek uretildi.' })
+      : null,
+    (ctx.terms_dropped || []).length
+      ? alertBox('warn', 'Bazi terimler modele verilemedi',
+                 `Uzunluk siniri nedeniyle ${ctx.terms_dropped.length} terim `
+                 + 'disarida kaldi, yani bu transkripti etkilemediler: '
+                 + ctx.terms_dropped.join(', '))
+      : null);
+}
+
+function transcriptSegmentsPanel(t) {
+  const draft = transcriptDraft(t);
+  const segments = t.segments || [];
+  const limits = t.limits || {};
+  return el('div', { class: 'card', 'data-testid': 'transcript-segments' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Transkript' }),
+      badge(transcriptDirty(t) ? 'review_required' : 'completed',
+            transcriptDirty(t) ? 'kaydedilmedi' : `${segments.length} segment`)),
     el('p', { class: 'dim',
-      text: 'Yanlis duyulan kelimeyi dogrusuyla degistir (ornek: Renira -> Rhaenyra). '
-            + 'Zaman damgalari korunur, aktif-kelime vurgusu bozulmaz.' }),
-    el('div', { class: 'stack', id: 'corrections-rows' },
-      rows.map((row, index) => el('div', { class: 'correction-row' },
-        el('input', { type: 'text', id: `corr-from-${index}`,
-                      value: row.from || '', placeholder: 'yanlis duyulan',
-                      maxlength: 80 }),
-        el('span', { class: 'dim', text: '->' }),
-        el('input', { type: 'text', id: `corr-to-${index}`,
-                      value: row.to || '', placeholder: 'dogrusu', maxlength: 80 }),
-        row.count != null
-          ? el('span', { class: row.count ? 'dim' : 'transcript-nomatch',
-              'data-testid': `corr-count-${index}`,
-              text: row.count ? `${row.count} yerde` : 'eslesme yok' })
-          : null))),
+      text: 'Her satir ekranda bir anda gorunen altyazidir. Metni duzenleyebilirsin; '
+            + 'zaman damgalari ve kelime zamanlamalari korunur.' }),
+    el('div', { class: 'stack' }, segments.map(seg => {
+      const value = draft[seg.id] !== undefined ? draft[seg.id] : seg.text;
+      const tooLong = value.length > (limits.max_segment_chars || 220);
+      const empty = !value.trim();
+      return el('div', { class: 'moment-card', 'data-testid': `seg-${seg.id}` },
+        el('div', { class: 'spread' },
+          el('span', { class: 'dim mono', 'data-testid': `seg-time-${seg.id}`,
+                       text: `${formatClock(seg.start_sec)} - ${formatClock(seg.end_sec)}` }),
+          el('span', { class: 'dim',
+            'data-testid': `seg-conf-${seg.id}`,
+            text: `guven ${seg.average_probability != null ? seg.average_probability : '-'}`
+                  + (seg.low_confidence_count ? ` - ${seg.low_confidence_count} dusuk` : '')
+                  + (seg.retimed ? ' - yeniden zamanlandi' : '')
+                  + (seg.edited ? ' - elle duzenlendi' : '') })),
+        seg.excluded_from_subtitles
+          ? alertBox('info', 'Videoda gosterilmeyecek',
+                     'Metin ve zamanlama kayitli; bu satir altyazi renderindan dislandi.')
+          : null,
+        // The unsure words are shown as marked text ABOVE the editor rather than
+        // inside it: highlighting inside a textarea would mean a rich editor,
+        // and a rich editor is how invisible markup ends up in a caption.
+        seg.low_confidence_words && seg.low_confidence_words.length
+          ? el('div', { class: 'dim', 'data-testid': `seg-low-${seg.id}` },
+              'Dusuk guvenli: ',
+              seg.low_confidence_words.map(w => el('span', {
+                class: 'transcript-word transcript-word--unsure',
+                title: `guven ${w.probability}`,
+              }, `${w.text} `)))
+          : null,
+        el('textarea', {
+          class: 'transcript-seg-input' + (empty || tooLong ? ' field--invalid' : ''),
+          'data-testid': `seg-input-${seg.id}`, rows: 2, spellcheck: 'false',
+          oninput: (event) => {
+            state.transcriptDraft[seg.id] = event.currentTarget.value;
+            const box = event.currentTarget;
+            const note = document.getElementById(`seg-msg-${seg.id}`);
+            if (note) {
+              note.textContent = validateSegmentValue(box.value, limits);
+            }
+          },
+        }, value),
+        el('div', { class: 'field__error', id: `seg-msg-${seg.id}`,
+                    'data-testid': `seg-msg-${seg.id}`, role: 'alert',
+                    text: validateSegmentValue(value, limits) }),
+        el('button', {
+          class: 'btn btn--sm', 'data-testid': `seg-exclude-${seg.id}`,
+          onclick: (event) => withButton(event, async () => {
+            const result = await guard(() => api.post(
+              `/api/projects/${state.projectId}/transcript/exclusions`, {
+                segment_ids: [seg.id], excluded: !seg.excluded_from_subtitles,
+                slot: t.slot,
+              }), seg.excluded_from_subtitles
+                ? 'Satir yeniden altyaziya alindi'
+                : 'Satir altyazidan cikarildi');
+            if (result) {
+              state.transcriptDraft = {};
+              state.project.transcript = result.transcript;
+            }
+            await refresh();
+          }),
+        }, seg.excluded_from_subtitles
+          ? 'Altyazida yeniden goster'
+          : 'Sarki / muzik: altyazida gosterme'));
+    })),
     el('div', { class: 'row' },
-      el('button', { class: 'btn btn--sm', 'data-testid': 'corr-add',
-        onclick: () => {
-          state.transcriptRows = (state.transcriptRows || rows.length) + 1;
-          render();
-        } }, 'Satir ekle'),
-      el('button', { class: 'btn btn--primary', 'data-testid': 'corr-save',
-        onclick: async (event) => {
-          event.currentTarget.disabled = true;
-          const total = state.transcriptRows || rows.length;
-          const payload = [];
-          for (let i = 0; i < total; i += 1) {
-            const from = (document.getElementById(`corr-from-${i}`) || {}).value || '';
-            const to = (document.getElementById(`corr-to-${i}`) || {}).value || '';
-            if (from.trim() && to.trim()) payload.push({ from: from.trim(), to: to.trim() });
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'transcript-save',
+        onclick: (event) => withButton(event, async () => {
+          const payload = (t.segments || [])
+            .filter(seg => draft[seg.id] !== undefined && draft[seg.id] !== seg.text)
+            .map(seg => ({ id: seg.id, text: draft[seg.id] }));
+          if (!payload.length) {
+            pushAlert('info', 'Degisiklik yok', 'Kaydedilecek bir duzenleme bulunamadi.');
+            return;
           }
-          await guard(() => api.post(
-            `/api/projects/${state.projectId}/transcript/corrections`,
-            { corrections: payload }));
-          state.transcriptRows = null;
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/transcript/segments`,
+            { segments: payload, slot: t.slot }), 'Transkript kaydedildi');
+          if (result) {
+            state.transcriptDraft = {};
+            state.project.transcript = result.transcript;
+          }
           await refresh();
-        } }, 'Duzeltmeleri uygula')));
+        }),
+      }, 'Degisiklikleri kaydet'),
+      el('button', {
+        class: 'btn btn--sm', 'data-testid': 'transcript-discard',
+        onclick: () => { state.transcriptDraft = {}; render(); },
+      }, 'Duzenlemeleri geri al'),
+      t.asr_available
+        ? el('button', {
+            class: 'btn btn--sm', 'data-testid': 'transcript-restore-asr',
+            onclick: (event) => withButton(event, async () => {
+              const result = await guard(() => api.post(
+                `/api/projects/${state.projectId}/transcript/restore-asr`,
+                { slot: t.slot }), 'Ham ASR ciktisi geri yuklendi');
+              if (result) {
+                state.transcriptDraft = {};
+                state.project.transcript = result.transcript;
+              }
+              await refresh();
+            }),
+          }, 'Ham ASR ciktisina don')
+        : null));
+}
+
+function validateSegmentValue(value, limits) {
+  const max = limits.max_segment_chars || 220;
+  if (!String(value || '').trim()) return 'Altyazi metni bos olamaz.';
+  if (String(value).length > max) {
+    return `Satir cok uzun (${String(value).length}/${max}); dikey videoda tasar.`;
+  }
+  return '';
+}
+
+function transcriptFullTextPanel(t) {
+  const draftValue = transcriptFullDraftValue(t);
+  const current = draftValue !== null && draftValue !== undefined
+    ? draftValue : (t.full_text || '');
+  return el('div', { class: 'card', 'data-testid': 'transcript-full' },
+    el('h2', { text: 'Tum metni birden duzenle' }),
+    el('p', { class: 'dim',
+      text: 'Her satir bir segmenttir. Satir EKLEYIP CIKARAMAZSIN: zaman damgalari '
+            + 'satirlara bagli. Satir sayisi degisirse kayit reddedilir.' }),
+    el('textarea', {
+      class: 'transcript-full-input', 'data-testid': 'transcript-full-input',
+      rows: Math.min(20, Math.max(4, (t.segments || []).length + 1)),
+      spellcheck: 'false',
+      oninput: (event) => { setTranscriptFullDraft(t, event.currentTarget.value); },
+    }, current),
+    el('div', { class: 'row' },
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'transcript-full-save',
+        onclick: (event) => withButton(event, async () => {
+          const node = document.getElementById('transcript-full-input')
+                       || document.querySelector('[data-testid=transcript-full-input]');
+          const text = node ? node.value : current;
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/transcript/full-text`,
+            { full_text: text, slot: t.slot }), 'Transkript kaydedildi');
+          if (result) {
+            state.transcriptFullDraft = null;
+            state.transcriptDraft = {};
+            state.project.transcript = result.transcript;
+          }
+          await refresh();
+        }),
+      }, 'Tum metni kaydet'),
+      el('button', {
+        class: 'btn btn--sm', 'data-testid': 'transcript-full-reset',
+        onclick: () => { state.transcriptFullDraft = null; render(); },
+      }, 'Sifirla')));
+}
+
+function transcriptHistoryPanel(t) {
+  const revisions = t.revisions || [];
+  return el('div', { class: 'card', 'data-testid': 'transcript-history' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Revizyon gecmisi' }),
+      badge(revisions.length ? 'completed' : 'missing', `revizyon ${t.revision || 0}`)),
+    t.asr_reconstructed
+      ? alertBox('warn', 'Ham ASR ciktisi yeniden kurgulandi',
+                 'Bu proje revizyon takibi eklenmeden once uretilmis. Saklanan '
+                 + '"ham" metin, diskte bulunan en eski hali -- modelin ne '
+                 + 'soyledigi degil.')
+      : null,
+    revisions.length === 0
+      ? el('div', { class: 'empty', 'data-testid': 'transcript-history-empty',
+                    text: 'Henuz elle duzenleme yapilmadi.' })
+      : el('div', { class: 'stack' }, revisions.slice().reverse().map(rev =>
+          el('div', { class: 'spread', 'data-testid': `rev-${rev.revision}` },
+            el('span', { text: `#${rev.revision} ${rev.kind}` }),
+            el('span', { class: 'dim',
+                         text: `${rev.actor} - ${String(rev.at).slice(0, 19)}` }),
+            el('span', { class: 'dim mono',
+                         text: (rev.changed_segment_ids || []).join(', ') || '-' }),
+            el('span', { class: 'dim mono', text: rev.content_sha256_16 || '' })))));
+}
+
+function glossaryPanel(glossary, suggestions) {
+  const terms = (glossary.terms || []).map(entry => entry.term);
+  const draftValue = glossaryDraftValue();
+  const current = draftValue !== null && draftValue !== undefined
+    ? draftValue : terms.join('\n');
+  return el('div', { class: 'card', 'data-testid': 'glossary' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Terimler / Ozel isimler' }),
+      badge(terms.length ? 'completed' : 'missing', `${terms.length} terim`)),
+    el('p', { class: 'dim', text: glossary.asr_hint || '' }),
+    el('textarea', {
+      class: 'transcript-full-input', 'data-testid': 'glossary-input', rows: 5,
+      spellcheck: 'false', placeholder: 'Her satira bir terim: Rhaena',
+      oninput: (event) => { setGlossaryDraft(event.currentTarget.value); },
+    }, current),
+    el('div', { class: 'row' },
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'glossary-save',
+        onclick: (event) => withButton(event, async () => {
+          const node = document.querySelector('[data-testid=glossary-input]');
+          const lines = String(node ? node.value : current)
+            .split('\n').map(line => line.trim()).filter(Boolean);
+          const result = await guard(() => api.post(
+            `/api/projects/${state.projectId}/glossary`, { terms: lines }),
+            'Sozluk kaydedildi');
+          if (result) state.glossaryDraft = null;
+          await refresh();
+        }),
+      }, 'Sozlugu kaydet')),
+    (suggestions || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'glossary-suggestions' },
+          el('h3', { text: 'Transkriptte bulunan eslesmeler' }),
+          el('p', { class: 'dim',
+            text: 'Bunlar OTOMATIK uygulanmaz. "kesin" olanlar sadece buyuk/kucuk '
+                  + 'harf veya noktalama farki; "oneri" olanlar benzerlige dayanir.' }),
+          suggestions.map((s, index) => el('div', {
+            class: 'spread', 'data-testid': `glossary-suggestion-${index}` },
+            el('span', {}, el('span', { class: 'mono', text: s.from }), ' -> ',
+                            el('strong', { text: s.to })),
+            badge(s.kind === 'certain' ? 'completed' : 'review_required',
+                  `${s.kind} ${s.score}`))))
+      : null,
+    (glossary.suggestions || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'glossary-term-suggestions' },
+          el('h3', { text: 'Duzeltmelerinden ogrenilenler' }),
+          glossary.suggestions.map((item, index) => el('div', {
+            class: 'spread', 'data-testid': `glossary-learn-${index}` },
+            el('span', {}, el('strong', { text: item.term }),
+                           el('span', { class: 'dim', text: ` - ${item.reason || ''}` })),
+            el('button', {
+              class: 'btn btn--sm', 'data-testid': `glossary-accept-${index}`,
+              onclick: (event) => withButton(event, async () => {
+                await guard(() => api.post(
+                  `/api/projects/${state.projectId}/glossary`,
+                  { accept_term: item.term }), 'Terim sozluge eklendi');
+                state.glossaryDraft = null;
+                await refresh();
+              }),
+            }, 'Sozluge ekle'))))
+      : null);
 }
 
 function planSubtitleModel() {
@@ -2474,6 +3499,11 @@ function renderTechnicalSummary(tech) {
                  tech.subtitle_warning
                  || 'Secilen momentte konusma tespit edilmedi.')
       : null,
+    tech.excluded_subtitle_cues
+      ? alertBox('info', 'Sarki / muzik altyazisi gizlendi',
+                 `${tech.excluded_subtitle_cues} satir insan karariyla renderdan cikarildi.`,
+                 'Metin transkript gecmisinde korunuyor ve Altyazi sekmesinden geri acilabilir.')
+      : null,
     el('div', { class: 'tech-grid', 'data-testid': 'render-technical' },
       techCell('Sure', tech.duration_sec ? `${Number(tech.duration_sec).toFixed(2)} sn` : null),
       techCell('Cozunurluk', tech.resolution + (tech.vertical ? ' (9:16)' : ' (DIKEY DEGIL)')),
@@ -2487,6 +3517,9 @@ function renderTechnicalSummary(tech) {
       techCell('Aktif kelime', tech.dynamic_word_highlight ? 'dinamik vurgu acik' : 'duz altyazi'),
       techCell('Caption tema/font', `${tech.caption_theme || '-'} / ${tech.caption_font || '-'}`),
       techCell('Render modu', tech.render_mode),
+      techCell('Kadraj zoom', tech.frame_zoom ? `${Number(tech.frame_zoom).toFixed(2)}x` : '1.00x'),
+      techCell('Kadraj odagi', tech.frame_focus_x != null && tech.frame_focus_y != null
+        ? `${Number(tech.frame_focus_x).toFixed(2)}, ${Number(tech.frame_focus_y).toFixed(2)}` : '-'),
       techCell('Kalite', tech.preview_mode ? 'preview' : 'uretim'),
       techCell('artifact_status', tech.status)),
     el('div', { class: 'dim', style: 'margin-top:12px',
@@ -2501,7 +3534,158 @@ function renderReviewChecklist() {
 }
 
 function renderRevisionPanel() {
-  return reviewRevisionPanel('render');
+  // The note panel records WHY; the studio below acts on it by moving the
+  // invalidated stage out of the way. Kept adjacent so the two are
+  // obviously one workflow rather than two competing buttons.
+  return el('div', {}, reviewRevisionPanel('render'), revisionStudioPanel());
+}
+
+/* Revizyon istasyonu.
+ *
+ * Requesting a revision used to be a NOTE: it changed nothing, so the rejected
+ * clip, transcript and video stayed exactly where the next run would pick them
+ * up again. Starting a revision here MOVES the invalidated stage into the
+ * archive and hands the project back for a rerun.
+ *
+ * Two rules:
+ *   1. Nothing is deleted. The old attempt goes to `revisions/<id>/` and can be
+ *      recovered; permanent deletion is a separate, explicitly confirmed action.
+ *   2. The confirmation names the files. "Emin misin?" that cannot say what it
+ *      is about to move is not consent. */
+function revisionStudioPanel() {
+  const r = state.revision;
+  if (!r) return null;
+  const suggested = r.suggested || {};
+  const chosen = state.revisionStage || suggested.stage;
+  const plan = r.plan || {};
+  const planMatches = plan.target === chosen;
+  return el('div', { class: 'card', 'data-testid': 'revision-studio' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Revizyon: yeniden uretime gec' }),
+      badge(plan.nothing_to_move ? 'missing' : 'review_required',
+            plan.nothing_to_move ? 'tasinacak cikti yok'
+                                 : `${plan.file_count || 0} dosya`)),
+    el('p', { class: 'dim',
+      text: 'Revizyon baslatildiginda gecersizlesen asama ve sonrasi arsive '
+            + 'TASINIR (silinmez), boylece sonraki koşu eski ciktiyi yeniden '
+            + 'kullanamaz.' }),
+    (suggested.reasons || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'revision-suggestion' },
+          el('div', { class: 'dim', text: 'Isaretlenmemis inceleme maddelerinden:' }),
+          suggested.reasons.map(reason => el('div', { class: 'dim mono', text: reason })),
+          el('div', { class: 'dim', text: suggested.note || '' }))
+      : el('div', { class: 'dim', 'data-testid': 'revision-suggestion',
+                    text: suggested.note || '' }),
+    field({ id: 'revision-stage', label: 'Nereden yeniden baslansin',
+      hint: 'Sistem oneriyor, kararı sen veriyorsun. Daha erken bir asama daha '
+            + 'cok ciktiyi arsive tasir.',
+      control: el('select', {
+        id: 'revision-stage', 'data-testid': 'revision-stage',
+        onchange: async (event) => {
+          state.revisionStage = event.currentTarget.value;
+          await refreshRevision();
+          render();
+        },
+      }, (r.stages || []).map(stage => el('option', {
+        value: stage.key, selected: stage.key === chosen,
+      }, stage.label))) }),
+    textareaField({ id: 'revision-why', label: 'Neden (kayda gecer)',
+      hint: 'Serbest metin yorumlanmaz; hangi asamanin yeniden calisacagini '
+            + 'yukaridaki secim belirler.',
+      attrs: { rows: 2, 'data-testid': 'revision-why',
+               oninput: (event) => { state.revisionNotes = event.currentTarget.value; } } }),
+    plan.suggested_render_adjustment
+      ? alertBox('info', 'Kadraj komutu algilandi',
+          `${Number(plan.suggested_render_adjustment.frame_zoom).toFixed(2)}x zoom; `
+          + `odak ${Number(plan.suggested_render_adjustment.frame_focus_x).toFixed(2)}, `
+          + `${Number(plan.suggested_render_adjustment.frame_focus_y).toFixed(2)}.`,
+          'Revizyonu baslatinca bu ayar yeni rendera uygulanacak ve manifestte kaydedilecek.')
+      : (chosen === 'render'
+          ? alertBox('warn', 'Notta uygulanabilir kadraj komutu yok',
+              'Otomatik yorumlanan komutlar: biraz yakinlas, yakinlastir, uzaklastir, '
+              + 'sola/saga/yukari/asagi odakla.',
+              'Belirsiz bir not videoyu sessizce degistirmez.')
+          : null),
+    // The list is the consent: it says exactly what leaves.
+    planMatches && (plan.moves || []).length
+      ? el('div', { class: 'stack', 'data-testid': 'revision-moves' },
+          el('h3', { text: 'Arsive tasinacaklar' }),
+          plan.moves.map(move => el('div', { class: 'spread',
+                                             'data-testid': `revision-move-${move.path}` },
+            el('span', { class: 'mono', text: move.path }),
+            el('span', { class: 'dim', text: move.kind === 'dir'
+              ? `${move.file_count} dosya` : 'dosya' }),
+            el('span', { class: 'dim',
+                         text: `${(move.size_bytes / 1024).toFixed(0)} KB` }))),
+          el('div', { class: 'dim', text: `Hedef: ${plan.destination} (geri alinabilir)` }))
+      : el('div', { class: 'empty', 'data-testid': 'revision-moves-empty',
+                    text: plan.nothing_to_move
+                      ? 'Bu asamada tasinacak cikti yok.'
+                      : 'Asamayi sec, tasinacak dosyalar burada listelenecek.' }),
+    el('button', {
+      class: 'btn btn--danger', 'data-testid': 'revision-start',
+      disabled: Boolean(plan.nothing_to_move) || !planMatches,
+      onclick: (event) => withButton(event, async () => {
+        const result = await guard(() => api.post(
+          `/api/projects/${state.projectId}/revision`,
+          { target: chosen, notes: state.revisionNotes || '' }),
+          'Revizyon baslatildi; eski ciktilar arsive tasindi');
+        if (result) {
+          state.revisionNotes = '';
+          state.revision = null;
+        }
+        await refresh();
+      }),
+    }, 'Revizyonu baslat'),
+    revisionArchivePanel(r.archive || {}));
+}
+
+function revisionArchivePanel(archive) {
+  const items = archive.revisions || [];
+  return el('div', { class: 'stack', 'data-testid': 'revision-archive',
+                     style: 'margin-top:14px' },
+    el('h3', { text: `Arsiv (${archive.count || 0})` }),
+    el('p', { class: 'dim', text: archive.hint || '' }),
+    items.length === 0
+      ? el('div', { class: 'empty', 'data-testid': 'revision-archive-empty',
+                    text: 'Henuz arsivlenmis bir deneme yok.' })
+      : el('div', { class: 'stack' }, items.map(item => el('div', {
+          class: 'moment-card', 'data-testid': `archive-${item.revision_id}` },
+        el('div', { class: 'spread' },
+          el('span', { class: 'mono', text: item.revision_id }),
+          el('span', { class: 'dim',
+                       text: `${item.action}${item.target ? ' / ' + item.target : ''}` }),
+          el('span', { class: 'dim',
+                       text: String(item.created_at || '').slice(0, 19) })),
+        el('div', { class: 'dim mono',
+                    text: (item.moved_paths || []).join(', ') || '-' }),
+        el('div', { class: 'row' },
+          inputField({ id: `purge-${item.revision_id}`,
+                       label: 'Kalici silmek icin kimligi yaz',
+                       attrs: { placeholder: item.revision_id,
+                                'data-testid': `purge-input-${item.revision_id}` } }),
+          el('button', {
+            class: 'btn btn--sm btn--danger',
+            'data-testid': `purge-${item.revision_id}`,
+            onclick: (event) => withButton(event, async () => {
+              const node = document.getElementById(`purge-${item.revision_id}`);
+              await guard(() => api.post(
+                `/api/projects/${state.projectId}/revision/purge`,
+                { revision_id: item.revision_id,
+                  confirmation: node ? node.value : '' }),
+                'Arsivlenmis revizyon kalici olarak silindi');
+              state.revision = null;
+              await refresh();
+            }),
+          }, 'Kalici sil'))))));
+}
+
+async function refreshRevision() {
+  if (!state.projectId) return;
+  const stage = state.revisionStage ? `?target=${encodeURIComponent(state.revisionStage)}` : '';
+  const result = await api.get(
+    `/api/projects/${state.projectId}/revision${stage}`).catch(() => null);
+  state.revision = result ? result.revision : null;
 }
 
 function screenRender() {
@@ -2746,8 +3930,583 @@ function screenSettings() {
       el('div', { class: 'stack' }, plannedRows)));
 }
 
+/* ----------------------------------------------------------- Turbo Studio */
+/* Fourteen stages layered over the existing script, TTS, stock-media, timeline
+   and render services. Every control a phase has not yet wired is stated as
+   not-yet-connected rather than rendered as a button that does nothing -- a
+   dead control is worse than an absent one, because it invites a click and
+   teaches the operator not to trust the screen. */
+
+const TURBO_STAGE_BADGE = {
+  completed: 'completed', failed: 'failed', running: 'running',
+  queued: 'queued', not_started: 'planned', review_required: 'review_required',
+  waiting_rate_limit: 'queued', waiting_daily_quota: 'queued',
+  blocked_billing: 'failed', cancelled: 'failed',
+};
+
+function turboDraft() {
+  if (state.turboDraft) return state.turboDraft;
+  const studio = state.turboStudio || {};
+  const base = studio.brief || studio.brief_defaults || {};
+  state.turboDraft = {
+    topic: base.topic || '',
+    content_type: base.content_type || 'explainer',
+    duration_sec: base.duration_sec || 60,
+    aspect_ratio: base.aspect_ratio || '9:16',
+    fps: base.fps || 30,
+    clip_duration_sec: base.clip_duration_sec || 5,
+    fit_mode: base.fit_mode || 'crop',
+    transition: base.transition || 'none',
+    transition_sec: base.transition_sec || 0.4,
+    ordering: base.ordering || 'sequential',
+    seed_input: base.seed_input || '',
+    notes: base.notes || '',
+  };
+  return state.turboDraft;
+}
+
+function setTurboDraft(key, value) {
+  turboDraft()[key] = value;
+}
+
+function turboSelect(id, label, key, options, hint = '') {
+  const draft = turboDraft();
+  return field({ id, label, required: true, hint,
+    control: el('select', { id, 'data-testid': id, 'aria-required': 'true',
+      onchange: event => setTurboDraft(key, event.currentTarget.value) },
+    options.map(([value, text]) => el('option', {
+      value, selected: String(draft[key]) === String(value),
+    }, text))) });
+}
+
+function turboBriefCard() {
+  const studio = state.turboStudio;
+  const draft = turboDraft();
+  const limits = studio.limits || {};
+  const options = studio.options || {};
+  const update = key => event => setTurboDraft(key, event.currentTarget.value);
+
+  const save = el('button', {
+    class: 'btn btn--primary', type: 'button', 'data-testid': 'turbo-save-brief',
+    onclick: async () => {
+      const result = await guard(() => api.post(
+        `/api/projects/${state.projectId}/turbo/brief`, {
+          ...draft,
+          duration_sec: Number(draft.duration_sec),
+          clip_duration_sec: Number(draft.clip_duration_sec),
+          fps: Number(draft.fps),
+          transition_sec: Number(draft.transition_sec),
+        }), 'Brief kaydedildi');
+      if (result) {
+        state.turboStudio = result.turbo_studio;
+        state.turboDraft = null;
+        if (result.saved) {
+          pushAlert('warning', 'Brief degisti',
+            'Ciktiyi etkileyen bir alan degisti; script ve sonrasindaki '
+            + 'asamalar sifirlandi. Onceki ciktilar silinmedi.');
+        }
+        render();
+      }
+    },
+  }, 'Brief kaydet');
+
+  return el('div', { class: 'card' },
+    el('h2', { text: 'Brief' }),
+    requiredLegend(),
+    inputField({ id: 'turbo-topic', label: 'Konu', required: true,
+      hint: 'En az 8 karakter. Ornek: Roma imparatorlugunun cokus nedenleri.',
+      attrs: { value: draft.topic, maxlength: 200, 'data-testid': 'turbo-topic',
+        oninput: update('topic') } }),
+    el('div', { class: 'grid grid--2' },
+      turboSelect('turbo-content-type', 'Icerik turu', 'content_type',
+        (options.content_types || []).map(value => [value, value])),
+      turboSelect('turbo-aspect', 'En-boy orani', 'aspect_ratio',
+        (options.aspect_ratios || []).map(item => [item.value, item.label]))),
+    el('div', { class: 'grid grid--3' },
+      inputField({ id: 'turbo-duration', label: 'Sure (saniye)', required: true,
+        type: 'number',
+        hint: `${limits.min_duration_sec || 15}-${limits.max_duration_sec || 1800} sn`,
+        attrs: { value: draft.duration_sec, min: limits.min_duration_sec,
+          max: limits.max_duration_sec, 'data-testid': 'turbo-duration',
+          oninput: update('duration_sec') } }),
+      inputField({ id: 'turbo-clip-duration', label: 'Klip suresi (sn)',
+        required: true, type: 'number',
+        hint: `en fazla ${limits.max_clips || 240} klip`,
+        attrs: { value: draft.clip_duration_sec, min: limits.min_clip_sec,
+          max: limits.max_clip_sec, step: '0.5',
+          'data-testid': 'turbo-clip-duration',
+          oninput: update('clip_duration_sec') } }),
+      turboSelect('turbo-fps', 'fps', 'fps',
+        (options.fps_choices || [30]).map(value => [value, String(value)]))),
+    el('div', { class: 'grid grid--3' },
+      turboSelect('turbo-fit-mode', 'Kadraj', 'fit_mode', [
+        ['crop', 'Kirp (kenarlar kesilir)'],
+        ['fit', 'Sigdir (bulanik arka plan)'],
+      ]),
+      turboSelect('turbo-transition', 'Gecis', 'transition', [
+        ['none', 'Gecis yok'], ['fade', 'Karartmali gecis'],
+      ], 'Karartmali gecis toplam sureyi degistirmez.'),
+      turboSelect('turbo-ordering', 'Siralama', 'ordering', [
+        ['sequential', 'Script sirasi'], ['seeded_random', 'Seed ile rastgele'],
+      ])),
+    inputField({ id: 'turbo-seed', label: 'Seed (istege bagli)',
+      hint: 'Ayni seed ayni klip sirasini uretir; bos birakilirsa script sirasi kullanilir.',
+      attrs: { value: draft.seed_input, maxlength: 80,
+        'data-testid': 'turbo-seed', oninput: update('seed_input') } }),
+    el('div', { class: 'actions' }, save));
+}
+
+function turboEstimateCard() {
+  const estimates = ((state.turboStudio.brief || {}).estimates) || null;
+  if (!estimates) return null;
+  return el('div', { class: 'card', 'data-testid': 'turbo-estimates' },
+    el('h2', { text: 'Harcama oncesi tahmin' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Tahmini kelime', estimates.narration_words),
+      techCell('Klip sayisi', estimates.clip_count),
+      techCell('TTS parcasi', estimates.tts_chunks_estimate)),
+    alertBox('info', 'Bunlar tahmindir', estimates.note));
+}
+
+/* One place that posts to a Turbo route and folds the fresh view back in, so
+   every control behaves identically and none of them can forget to refresh. */
+async function turboPost(path, body, successTitle) {
+  const result = await guard(
+    () => api.post(`/api/projects/${state.projectId}/turbo${path}`, body || {}),
+    successTitle);
+  if (result && result.turbo_studio) {
+    state.turboStudio = result.turbo_studio;
+    render();
+  }
+  return result;
+}
+
+function turboButton(label, testid, handler, { primary = false,
+                                               disabled = false,
+                                               reason = '' } = {}) {
+  // A control that cannot be used is shown DISABLED WITH ITS REASON rather than
+  // hidden: hiding it makes the workflow look broken, and enabling it makes the
+  // click look broken.
+  const button = el('button', {
+    class: `btn${primary ? ' btn--primary' : ''}`, type: 'button',
+    'data-testid': testid, disabled: disabled || undefined,
+    title: disabled ? reason : '',
+    onclick: disabled ? undefined : handler,
+  }, label);
+  if (!disabled) return button;
+  return el('span', { class: 'row' }, button,
+    el('span', { class: 'muted', text: reason }));
+}
+
+function turboStagesCard() {
+  const studio = state.turboStudio;
+  const progress = studio.progress || {};
+  const next = progress.next || {};
+  const stages = progress.stages || [];
+  const completed = new Set(stages.filter(s => s.state === 'completed')
+    .map(s => s.key));
+
+  const rows = stages.map((stage, index) => {
+    const earlierDone = stages.slice(0, index)
+      .every(s => s.state === 'completed');
+    const controls = el('div', { class: 'row' });
+    if (!stage.automatic && stage.state !== 'completed'
+        && stage.key !== 'final_render' && stage.key !== 'archive') {
+      controls.appendChild(turboButton(
+        'Onayla', `turbo-approve-${stage.key}`,
+        () => turboPost('/approve', { stage: stage.key },
+          `${stage.label} onaylandi`),
+        { disabled: !earlierDone,
+          reason: 'onceki asamalar tamamlanmadi' }));
+    }
+    controls.appendChild(badge(TURBO_STAGE_BADGE[stage.state] || 'missing',
+      stage.state));
+    return el('div', { class: 'row', 'data-testid': `turbo-stage-${stage.key}` },
+      el('div', {},
+        el('strong', { text: `${index + 1}. ${stage.label}` }),
+        el('div', { class: 'muted',
+          text: stage.automatic ? 'otomatik calisir' : 'insan karari gerekir' }),
+        stage.detail ? el('div', { class: 'muted', text: stage.detail }) : null,
+        stage.error ? el('div', { class: 'muted', text: stage.error }) : null,
+        stage.resume_at
+          ? el('div', { class: 'muted',
+            text: `kota beklemesi, devam: ${stage.resume_at}` })
+          : null),
+      controls);
+  });
+
+  const runnable = !next.blocked && next.stage;
+  const actions = el('div', { class: 'actions' },
+    turboButton('Siradaki asamayi calistir', 'turbo-run-stage',
+      () => turboPost('/stage', {}, 'Asama calistirildi'),
+      { primary: true, disabled: !runnable,
+        reason: next.reason || 'calistirilabilir asama yok' }));
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-stages' },
+    el('h2', { text: `Asamalar (${progress.completed_count || 0}/${progress.total_count || 14})` }),
+    el('div', { class: 'stack' }, rows),
+    next.reason
+      ? alertBox(next.blocked ? 'warning' : 'info', 'Siradaki', next.reason)
+      : null,
+    actions);
+}
+
+function turboScriptCard() {
+  const script = state.turboStudio.script;
+  if (!script) return null;
+  return el('div', { class: 'card', 'data-testid': 'turbo-script' },
+    el('h2', { text: 'Script ve sahne plani' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Kelime', script.word_count),
+      techCell('Sahne', script.beat_count),
+      techCell('Model', script.model)),
+    script.beat_coverage !== undefined && script.beat_coverage < 0.9
+      ? alertBox('warning', 'Sahne-anlatim uyumu', script.coverage_note)
+      : null,
+    el('div', { class: 'stack' },
+      (script.beats || []).map(beat => el('div', { class: 'row' },
+        el('div', {},
+          el('strong', { text: `${beat.index}. ${beat.search_query}` }),
+          el('div', { class: 'muted', text: beat.text }))))));
+}
+
+function turboNarrationCard() {
+  const narration = state.turboStudio.narration;
+  if (!narration) return null;
+  const summary = narration.summary || {};
+  const combined = narration.combined;
+  return el('div', { class: 'card', 'data-testid': 'turbo-narration' },
+    el('h2', { text: 'Anlatim' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Parca', `${summary.completed_count || 0}/${summary.chunk_count || 0}`),
+      techCell('Birlesik sure', combined ? `${combined.duration_sec} sn` : '-'),
+      techCell('Brief hedefinden sapma',
+        combined && combined.drift_sec !== null && combined.drift_sec !== undefined
+          ? `${combined.drift_sec} sn` : '-')),
+    el('div', { class: 'stack' },
+      (narration.chunks || []).map(chunk => el('div', { class: 'row' },
+        el('span', { text: `${chunk.sequence}. parca (${chunk.word_count || 0} kelime)` }),
+        el('div', { class: 'row' },
+          chunk.resume_at
+            ? el('span', { class: 'muted', text: `devam: ${chunk.resume_at}` })
+            : null,
+          badge(chunk.status === 'completed' ? 'completed'
+            : (chunk.status === 'failed' ? 'failed' : 'queued'),
+          chunk.status))))));
+}
+
+function turboMediaCard() {
+  const media = state.turboStudio.media;
+  if (!media) {
+    return el('div', { class: 'card', 'data-testid': 'turbo-media' },
+      el('h2', { text: 'Stok materyal' }),
+      alertBox('info', 'Slotlar henuz olusturulmadi',
+        'Script uretildikten sonra "Siradaki asamayi calistir" klip slotlarini olusturur. '
+        + 'Slot olusturmak hicbir saglayici istegi yapmaz.'));
+  }
+  const readiness = media.readiness || {};
+  const rows = (media.slots || []).map(slot => {
+    const controls = el('div', { class: 'row' });
+    media.providers.forEach(provider => {
+      controls.appendChild(turboButton(
+        `${provider} ara`, `turbo-search-${slot.id}-${provider}`,
+        () => turboPost('/media',
+          { action: 'search', slot_id: slot.id, provider },
+          `${provider} aramasi tamamlandi`),
+        { disabled: readiness.stale,
+          reason: 'script degisti; once slotlari yenileyin' }));
+    });
+    if (slot.selected_id && !slot.downloaded) {
+      controls.appendChild(turboButton(
+        'Indir', `turbo-download-${slot.id}`,
+        () => turboPost('/media', { action: 'download', slot_id: slot.id },
+          'Klip indirildi'),
+        { primary: true, disabled: readiness.stale,
+          reason: 'script degisti; once slotlari yenileyin' }));
+    }
+
+    const candidates = el('div', { class: 'stack' },
+      (slot.candidates || []).map(candidate => el('div', { class: 'row' },
+        el('div', {},
+          el('span', { text: `${candidate.provider} · ${candidate.width}x${candidate.height} · ${candidate.duration_sec}sn` }),
+          el('div', { class: 'muted', text: candidate.attribution || '' }),
+          candidate.source_page
+            ? el('a', { href: candidate.source_page, target: '_blank',
+              rel: 'noopener noreferrer', text: 'kaynak sayfasi' })
+            : null),
+        candidate.id === slot.selected_id
+          ? badge('completed', 'secili')
+          : turboButton('Sec', `turbo-select-${slot.id}-${candidate.id}`,
+            () => turboPost('/media',
+              { action: 'select', slot_id: slot.id, candidate_id: candidate.id },
+              'Aday secildi'),
+            { disabled: readiness.stale,
+              reason: 'script degisti; once slotlari yenileyin' }))));
+
+    return el('div', { class: 'stack', 'data-testid': `turbo-slot-${slot.id}` },
+      el('div', { class: 'row' },
+        el('div', {},
+          el('strong', { text: `${slot.sequence}. ${slot.query}` }),
+          el('div', { class: 'muted', text: slot.excerpt || '' })),
+        el('div', { class: 'row' },
+          badge(slot.downloaded ? 'completed'
+            : (slot.selected_id ? 'review_required' : 'planned'),
+          slot.downloaded ? 'indirildi'
+            : (slot.selected_id ? 'secildi' : 'bekliyor')),
+          controls)),
+      candidates);
+  });
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-media' },
+    el('h2', { text: `Stok materyal (${readiness.downloaded_count || 0}/${readiness.slot_count || 0} indirildi)` }),
+    alertBox('info', 'Arama, secim ve indirme ayri eylemlerdir',
+      media.policy || ''),
+    readiness.stale
+      ? alertBox('warning', 'Plan bayat',
+        'Script degisti. Arama, secim ve indirme, slot listesi yenilenene kadar kilitli.')
+      : null,
+    el('div', { class: 'row' },
+      turboButton('Slotlari yenile', 'turbo-media-plan',
+        () => turboPost('/media', { action: 'plan' }, 'Slotlar yenilendi'),
+        { reason: '' })),
+    el('div', { class: 'stack' }, rows));
+}
+
+function turboMusicCard() {
+  const music = state.turboStudio.music || {};
+  const chosen = music.chosen;
+  const library = music.library || { tracks: [] };
+  const tracks = [...(library.tracks || []), ...(music.uploaded || [])];
+
+  const rows = tracks.map(track => el('div', {
+    class: 'row', 'data-testid': `turbo-music-${track.filename}`,
+  },
+  el('div', {},
+    el('strong', { text: track.display_name }),
+    el('div', { class: 'muted', text: track.license.label })),
+  el('div', { class: 'row' },
+    badge(track.license.status === 'verified' ? 'completed' : 'review_required',
+      track.license.status),
+    turboButton('Sec', `turbo-music-pick-${track.filename}`,
+      () => turboPost('/music',
+        { origin: track.origin, filename: track.filename },
+        'Muzik secildi')))));
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-music' },
+    el('h2', { text: 'Muzik' }),
+    alertBox('warning', 'Telif iddiasi yapilmaz',
+      music.policy
+      || 'Bu proje hicbir parcayi telifsiz olarak nitelemez. Lisans kaydi eksik '
+         + 'olan parcalar isaretlenir; kullanmadan once siz dogrulayin.'),
+    chosen
+      ? el('div', { class: 'row' },
+        el('span', { text: chosen.present
+          ? `Secili: ${chosen.display_name}` : 'Muzik yok (acik karar)' }),
+        chosen.present
+          ? badge(chosen.license && chosen.license.status === 'verified'
+            ? 'completed' : 'review_required',
+          (chosen.license || {}).status || 'bilinmiyor')
+          : null)
+      : null,
+    !library.configured
+      ? alertBox('info', 'Kutuphane tanimli degil',
+        'CREATOR_CONSOLE_MUSIC_ROOT ayarlayin veya muziksiz devam edin.')
+      : null,
+    el('div', { class: 'stack' }, rows),
+    el('div', { class: 'actions' },
+      turboButton('Muziksiz devam et', 'turbo-music-none',
+        () => turboPost('/music', { origin: 'none' }, 'Muziksiz devam')),
+      (() => {
+        // The second music source: a file the operator owns. Streamed with the
+        // filename in a header, like the source-video upload, so the extension
+        // is checked before a byte is written.
+        const picker = el('input', {
+          type: 'file', accept: '.mp3,.wav,.m4a,.aac,.ogg,.flac',
+          'data-testid': 'turbo-music-upload',
+          onchange: async (event) => {
+            const file = event.currentTarget.files[0];
+            if (!file) return;
+            await guard(async () => {
+              const response = await fetch(
+                `/api/projects/${state.projectId}/turbo/music/upload`,
+                { method: 'POST', body: file,
+                  headers: { 'X-Filename': encodeURIComponent(file.name) } });
+              const payload = await response.json();
+              if (!response.ok) throw new Error((payload.error || {}).message
+                || 'Muzik yuklenemedi');
+              state.turboStudio = payload.turbo_studio;
+              render();
+            }, 'Muzik yuklendi');
+          },
+        });
+        return field({ id: 'turbo-music-upload-field',
+          label: 'Kendi muzigini yukle',
+          hint: 'Lisans kaydi icin yaninda <dosya>.license.json arayin; yoksa '
+            + 'parca "lisans dogrulanmadi" olarak isaretlenir.',
+          control: picker });
+      })()));
+}
+
+function turboTimelineCard() {
+  const line = state.turboStudio.timeline;
+  if (!line) return null;
+  return el('div', { class: 'card', 'data-testid': 'turbo-timeline' },
+    el('h2', { text: 'Zaman cizelgesi' }),
+    el('div', { class: 'grid grid--3' },
+      techCell('Klip', line.clip_count),
+      techCell('Sure', `${line.duration_sec} sn`),
+      techCell('Tekrar kullanilan', line.reuse_count)),
+    line.reuse_count
+      ? alertBox('warning', 'Klipler tekrar kullanildi',
+        `${line.reuse_count} yuva ayni kaynaktan tekrar dolduruldu. Daha fazla `
+        + 'klip indirirseniz tekrar azalir.')
+      : null,
+    el('div', { class: 'stack' },
+      (line.clips || []).map(clip => el('div', {
+        class: 'row', 'data-testid': `turbo-clip-${clip.clip_id}`,
+      },
+      el('div', {},
+        el('span', { text: `${clip.clip_id}  ${clip.start}-${clip.end} sn` }),
+        el('div', { class: 'muted', text: clip.attribution || '' })),
+      el('div', { class: 'row' },
+        clip.reuse_index ? badge('review_required', `tekrar ${clip.reuse_index}`) : null,
+        turboButton('Kirp', `turbo-frame-crop-${clip.clip_id}`,
+          () => turboPost('/revision',
+            { kind: 'frame', target: clip.clip_id, values: { mode: 'crop' } },
+            'Kadraj guncellendi')),
+        turboButton('Sigdir', `turbo-frame-fit-${clip.clip_id}`,
+          () => turboPost('/revision',
+            { kind: 'frame', target: clip.clip_id, values: { mode: 'fit' } },
+            'Kadraj guncellendi')))))),
+    line.attribution_lines && line.attribution_lines.length
+      ? el('div', {},
+        el('h3', { text: 'Atif' }),
+        el('ul', {}, line.attribution_lines.map(t => el('li', { text: t }))))
+      : null);
+}
+
+function turboRenderCard() {
+  const studio = state.turboStudio;
+  const renders = studio.renders || {};
+  const stages = (studio.progress || {}).stages || [];
+  const stageState = key => (stages.find(s => s.key === key) || {}).state;
+  const timelineReady = stageState('timeline') === 'completed';
+  const previewDone = stageState('preview_render') === 'completed';
+
+  const panel = (preset, label) => {
+    const record = renders[preset];
+    return el('div', { class: 'stack', 'data-testid': `turbo-render-${preset}` },
+      el('div', { class: 'row' },
+        el('strong', { text: label }),
+        record ? badge(record.stale ? 'review_required' : 'completed',
+          record.stale ? 'zaman cizelgesi degisti' : 'hazir')
+          : badge('planned', 'uretilmedi')),
+      record
+        ? el('video', {
+          class: 'preview', controls: true, preload: 'metadata',
+          'data-testid': `turbo-player-${preset}`,
+          src: `/api/projects/${state.projectId}/media/${record.relative_path}`,
+        })
+        : null,
+      record && record.stale
+        ? alertBox('warning', 'Bu video guncel degil',
+          'Zaman cizelgesi bu render uretildikten sonra degisti. Izlediginiz '
+          + 'kayit artik projedeki kurgu degil; yeniden render alin.')
+        : null,
+      record && record.music_license && record.music_license !== 'verified'
+        ? alertBox('warning', 'Muzik lisansi dogrulanmadi',
+          'Bu videoda lisans kaydi tamamlanmamis bir parca var.')
+        : null);
+  };
+
+  return el('div', { class: 'card', 'data-testid': 'turbo-renders' },
+    el('h2', { text: 'Render' }),
+    panel('preview', 'Onizleme (yarim olcek, hizli)'),
+    panel('final', 'Final (tam 1080p)'),
+    el('div', { class: 'actions' },
+      turboButton('Onizleme uret', 'turbo-render-preview-btn',
+        () => turboPost('/render', { preset: 'preview' }, 'Onizleme uretildi'),
+        { primary: true, disabled: !timelineReady,
+          reason: 'once zaman cizelgesini olusturun' }),
+      turboButton('Final uret', 'turbo-render-final-btn',
+        () => turboPost('/render', { preset: 'final' }, 'Final uretildi'),
+        { disabled: !previewDone,
+          reason: 'once onizlemeyi uretip izleyin' })),
+    alertBox('info', 'Onizleme ve final ayridir',
+      'Onizlemeyi onaylamak finali onaylamaz. Final render dakikalar surer ve '
+      + 'yalnizca siz istediginizde baslar.'));
+}
+
+function turboRevisionCard() {
+  const kinds = state.turboStudio.revision_kinds || [];
+  return el('div', { class: 'card', 'data-testid': 'turbo-revisions' },
+    el('h2', { text: 'Revizyon turleri ve maliyeti' }),
+    el('div', { class: 'stack' },
+      kinds.map(item => el('div', { class: 'row' },
+        el('span', { text: item.label }),
+        badge(item.manifest_only ? 'completed' : 'review_required',
+          item.manifest_only ? 'yalnizca render yenilenir'
+            : 'yukari-akis yeniden calisir')))),
+    alertBox('info', 'Hicbir sey silinmez',
+      'Bir revizyon uygulandiginda eski cikti arsive tasinir, uzerine yazilmaz.'));
+}
+
+function turboArchiveCard() {
+  const archive = state.turboStudio.archive;
+  if (!archive) return null;
+  const mb = (archive.total_bytes / (1024 * 1024)).toFixed(1);
+  const clipMb = (archive.clip_bytes / (1024 * 1024)).toFixed(1);
+  return el('div', { class: 'card', 'data-testid': 'turbo-archive' },
+    el('h2', { text: 'Arsiv' }),
+    el('div', { class: 'grid grid--2' },
+      techCell('Toplam boyut', `${mb} MB`),
+      techCell('Bunun klipleri', `${clipMb} MB`)),
+    // Stated before the operator commits: a Turbo project carries every
+    // downloaded clip, and that is not obvious from the rest of the screen.
+    alertBox(archive.ready ? 'info' : 'warning',
+      archive.ready ? 'Arsivlemeye hazir' : 'Henuz hazir degil',
+      archive.ready ? archive.control : archive.reason));
+}
+
+function screenTurbo() {
+  const studio = state.turboStudio;
+  if (!studio) {
+    return el('div', { 'data-testid': 'turbo-screen' },
+      el('div', { class: 'page-head' }, el('h1', { text: 'Turbo Studio' })),
+      alertBox('info', 'Yukleniyor',
+        'Turbo is akisi okunuyor. Bu sekmeyi acmak hicbir saglayici istegi yapmaz.'));
+  }
+  const progress = studio.progress || {};
+  return el('div', { 'data-testid': 'turbo-screen' },
+    el('div', { class: 'page-head' },
+      el('div', {},
+        el('h1', { text: 'Turbo Studio' }),
+        el('p', { class: 'subtitle',
+          text: 'Brief girdisinden stok goruntulu, seslendirilmis ve altyazili '
+            + 'videoya kadar 14 asamali akis.' })),
+      studio.started ? badge('review_required', progress.status || 'hazir')
+        : badge('planned', 'brief bekliyor')),
+    alertBox('info', 'Bu sekmeyi acmak hicbir sey harcamaz',
+      'Gorunum yalnizca diskteki artefaktlari okur. Model, seslendirme, stok '
+      + 'materyal ve render istekleri yalnizca acikca bir eylem baslattiginizda '
+      + 'yapilir.'),
+    turboBriefCard(),
+    turboEstimateCard(),
+    turboStagesCard(),
+    turboScriptCard(),
+    turboNarrationCard(),
+    turboMediaCard(),
+    turboMusicCard(),
+    turboTimelineCard(),
+    turboRenderCard(),
+    turboRevisionCard(),
+    turboArchiveCard());
+}
+
 const RENDERERS = {
   projects: screenProjects, history: screenHistory, phase0: screenPhase0,
+  longform: screenLongForm,
+  turbo: screenTurbo,
   jobs: screenJobs, moments: screenMoments,
   script: screenScript, voice: screenVoice, render: screenRender, outputs: screenOutputs,
   settings: screenSettings,
@@ -2831,6 +4590,24 @@ async function refresh() {
     const cached = await api.get('/api/diagnostics').catch(() => null);
     if (cached) state.diagnostics = cached.diagnostics;
   }
+  // Only on the render screen: describing a revision is a read, but it
+  // still walks the project tree and no other screen shows it.
+  if (state.screen === 'render' && state.projectId && !state.revision) {
+    await refreshRevision();
+  }
+  // Describing the workflow is a read; it never spends a request.
+  if (state.screen === 'longform' && state.projectId) {
+    const lf = await api.get(
+      `/api/projects/${state.projectId}/long-form`).catch(() => null);
+    state.longFormStudio = lf ? lf.long_form_studio : null;
+  }
+  // Same contract for Turbo: opening the tab reads. It never spends an LLM,
+  // TTS, stock-provider, download or render request.
+  if (state.screen === 'turbo' && state.projectId) {
+    const tb = await api.get(
+      `/api/projects/${state.projectId}/turbo`).catch(() => null);
+    state.turboStudio = tb ? tb.turbo_studio : null;
+  }
   if (state.projectId) {
     try {
       state.project = await api.get(`/api/projects/${state.projectId}`);
@@ -2850,6 +4627,15 @@ async function refresh() {
     // The SERVER says the flow is running, so keep ticking it. Browser memory
     // is not the source of truth any more: a refresh resumes this loop.
     state.polling = setTimeout(() => automationAction('tick'), 1500);
+  } else {
+    const lfNext = (((state.longFormStudio || {}).progress || {}).next || {});
+    if (state.screen === 'longform' && lfNext.waiting && lfNext.resume_at) {
+      // The server owns the persisted wait. The browser only wakes it at the
+      // advertised time; reopening the tab reconstructs this timer from disk.
+      const dueMs = Date.parse(lfNext.resume_at) - Date.now();
+      const delayMs = Math.max(500, Math.min(2147000000, dueMs + 250));
+      state.polling = setTimeout(longFormResumeTick, delayMs);
+    }
   }
   render();
 }
@@ -2867,7 +4653,10 @@ async function goto(screen) {
 }
 
 async function openProject(projectId, screen = 'phase0') {
-  if (state.projectId !== projectId) state.selectedMode = null;
+  if (state.projectId !== projectId) {
+    state.selectedMode = null;
+    state.longFormDraft = null;
+  }
   state.projectId = projectId;
   await goto(screen);
 }

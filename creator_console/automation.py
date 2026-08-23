@@ -65,11 +65,14 @@ ADVANCEABLE = (STATE_RUNNING,)
 
 #: Human gates. Automation stops here, always, by design.
 HUMAN_GATES = ("plan_selection", "moment_selection", "script_approval",
-               "voiceover_approval", "render_approval")
+               "voiceover_approval", "transcript_approval", "render_approval")
 
-#: Machine phases automation is allowed to submit on its own.
+#: Machine phases automation is allowed to submit on its own. `transcript` is a
+#: machine phase because recognition is local and calls no provider; the READING
+#: of that text is a human gate (`transcript_approval`), exactly as a narrated
+#: script is machine-generated but human-approved.
 MACHINE_PHASES = ("source_assessment", "video_analysis", "script_generation",
-                  "tts", "render")
+                  "tts", "transcript", "render")
 
 MAX_PHASE_ATTEMPTS = 1
 MAX_NO_PROGRESS_TICKS = 3
@@ -395,6 +398,34 @@ class AutomationEngine:
                 return {"kind": "gate", "blocker": "voiceover_approval",
                         "message": "Voice Studio'da sesi DINLE ve hash ile onayla. "
                                    "Otomatik akis onay veremez."}
+
+        else:
+            # direct_clip_series burns the source's OWN words in, so the caption
+            # text is as much a human decision as a narrated script -- and
+            # `run_render` refuses without an approved transcript. Without this
+            # branch automation walked straight at render, was refused, and the
+            # flow died on `phase_attempt_limit` instead of asking the human to
+            # read the captions.
+            transcript = service.load_artifact("moment_transcript")
+            transcript_state = approvals.get("transcript") or {}
+            if transcript["problem"]:
+                return {"kind": "gate", "blocker": "transcript",
+                        "message": transcript["problem"]}
+            if not transcript["data"]:
+                return {"kind": "job", "phase": "transcript",
+                        "params": {"subtitle_whisper_model_size": "small",
+                                    "subtitle_language": "auto"},
+                        "message": "Altyazi transkripti baslatildi."}
+            if transcript["data"].get("status") in ("failed", "insufficient_data"):
+                return {"kind": "gate", "blocker": "transcript",
+                        "message": ("Transkript kullanilabilir bir metin uretmedi "
+                                    f"(status={transcript['data'].get('status')}). "
+                                    "Altyazi sekmesinden elle yeniden calistir.")}
+            if not transcript_state.get("effective_valid"):
+                return {"kind": "gate", "blocker": "transcript_approval",
+                        "message": "Altyazi sekmesinde metni OKU, yanlis duyulan "
+                                   "kelimeleri duzelt ve onayla. Otomatik akis "
+                                   "onay veremez."}
 
         render = service.load_artifact("render_manifest")
         render_state = approvals.get("render") or {}

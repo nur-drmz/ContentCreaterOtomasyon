@@ -204,45 +204,84 @@ def escape_path_for_filter(path) -> str:
     return text
 
 
-def build_vertical_filtergraph(mode: str, width: int, height: int, blur_sigma: int = 20) -> str:
-    """Returns an ffmpeg filtergraph fragment (no leading/trailing brackets on the
-    overall chain) that reframes [0:v] into a vertical WxH output labeled [framed].
-    mode: 'center_crop' or 'blurred_background'.
+def build_vertical_filtergraph(mode: str, width: int, height: int, blur_sigma: int = 20,
+                               zoom_scale: float = 1.0, focus_x: float = 0.5,
+                               focus_y: float = 0.5, *, in_label: str = "0:v",
+                               out_label: str = "framed",
+                               label_suffix: str = "") -> str:
+    """Reframe one video stream into a WxH output. mode: 'center_crop' or
+    'blurred_background'.
+
+    Returns a COMPLETE statement, not a splice-able fragment: it names its own
+    input and output labels. With the defaults it names `[0:v]` and `[framed]`,
+    which is what every existing caller expects and what this function has
+    always produced -- byte for byte.
+
+    `in_label`, `out_label` and `label_suffix` exist because concatenating N
+    clips in one graph needs N copies of this chain, and every label in it has
+    to be unique. `blurred_background` emits FIVE labels, not one, so a caller
+    that only renamed the input and output would still collide on `bg_src`,
+    `fg_src`, `bg` and `fg`. `label_suffix` is appended to all four.
     """
+    zoom = min(2.0, max(1.0, float(zoom_scale or 1.0)))
+    anchor_x = min(1.0, max(0.0, float(focus_x)))
+    anchor_y = min(1.0, max(0.0, float(focus_y)))
+    zoom_filter = (
+        f",scale=trunc(iw*{zoom:.4f}/2)*2:trunc(ih*{zoom:.4f}/2)*2"
+        if zoom > 1.0001 else ""
+    )
+    crop = f"crop={width}:{height}:(iw-ow)*{anchor_x:.4f}:(ih-oh)*{anchor_y:.4f}"
+    sfx = label_suffix
     if mode == 'center_crop':
         return (
-            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}[framed]"
+            f"[{in_label}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"{zoom_filter.lstrip(',') + ',' if zoom_filter else ''}{crop}[{out_label}]"
         )
     if mode == 'blurred_background':
+        # Both dimensions are bound. `scale=W:-2:decrease` only constrains the
+        # width, which is harmless for a portrait target (the width is the
+        # binding edge anyway) but overflows a landscape or square one: a
+        # portrait source scaled to width 1920 becomes 3413 tall inside a 1080
+        # frame. ffmpeg does not error on that -- it silently overlays an
+        # oversized foreground at a negative offset, which is the worst kind of
+        # failure because the render still "succeeds".
         return (
-            f"[0:v]split=2[bg_src][fg_src];"
-            f"[bg_src]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},gblur=sigma={blur_sigma}[bg];"
-            f"[fg_src]scale={width}:-2:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[framed]"
+            f"[{in_label}]split=2[bg_src{sfx}][fg_src{sfx}];"
+            f"[bg_src{sfx}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},gblur=sigma={blur_sigma}[bg{sfx}];"
+            f"[fg_src{sfx}]scale={width}:{height}:force_original_aspect_ratio=decrease"
+            f"{zoom_filter}[fg{sfx}];"
+            f"[bg{sfx}][fg{sfx}]overlay=(W-w)*{anchor_x:.4f}:(H-h)*{anchor_y:.4f}"
+            f"[{out_label}]"
         )
     raise ValueError(f"bilinmeyen render mode: {mode!r} (beklenen: center_crop, blurred_background)")
 
 
 def build_audio_filtergraph(has_original_audio: bool, ducking_enabled: bool,
-                             duck_ratio: float, base_volume: float, narration_volume: float) -> str:
-    """Returns an ffmpeg filtergraph fragment mixing [0:a] (original clip audio,
-    only referenced if has_original_audio) with [1:a] (narration) into [aout]."""
+                             duck_ratio: float, base_volume: float,
+                             narration_volume: float, *, bed_label: str = "0:a",
+                             narration_label: str = "1:a",
+                             out_label: str = "aout") -> str:
+    """Mix a bed (original clip audio or music) with narration into one output.
+
+    The bed is referenced only when `has_original_audio`. Labels default to
+    `[0:a]`, `[1:a]` and `[aout]`, so existing callers get byte-identical
+    output; a timeline whose narration is input N passes its own.
+    """
     if not has_original_audio:
-        return f"[1:a]volume={narration_volume}[aout]"
+        return f"[{narration_label}]volume={narration_volume}[{out_label}]"
     if ducking_enabled:
         return (
-            f"[0:a]volume={base_volume}[bgvol];"
-            f"[1:a]volume={narration_volume}[narvol];"
+            f"[{bed_label}]volume={base_volume}[bgvol];"
+            f"[{narration_label}]volume={narration_volume}[narvol];"
             f"[narvol]asplit=2[narside][narmix];"
             f"[bgvol][narside]sidechaincompress=threshold=0.05:ratio={duck_ratio}:attack=5:release=300[ducked];"
-            f"[ducked][narmix]amix=inputs=2:duration=longest:dropout_transition=200[aout]"
+            f"[ducked][narmix]amix=inputs=2:duration=longest:dropout_transition=200[{out_label}]"
         )
     return (
-        f"[0:a]volume={base_volume}[bgvol];"
-        f"[1:a]volume={narration_volume}[narvol];"
-        f"[bgvol][narvol]amix=inputs=2:duration=longest:dropout_transition=200[aout]"
+        f"[{bed_label}]volume={base_volume}[bgvol];"
+        f"[{narration_label}]volume={narration_volume}[narvol];"
+        f"[bgvol][narvol]amix=inputs=2:duration=longest:dropout_transition=200[{out_label}]"
     )
 
 
@@ -529,7 +568,7 @@ def write_srt(cues: list[dict], path) -> None:
 
 def transcribe_for_subtitles(narration_audio_path, fallback_text: str = '', max_chars_per_cue: int = 42,
                               whisper_model_size: str = 'small', language: str | None = None,
-                              initial_prompt: str = ''):
+                              initial_prompt: str = '', hotwords: str = ''):
     """Transcribes narration_audio_path with faster-whisper (word-timestamp
     aligned) to build subtitle cues. On any failure (missing dependency,
     corrupt audio, etc.) falls back to splitting fallback_text into
@@ -543,6 +582,10 @@ def transcribe_for_subtitles(narration_audio_path, fallback_text: str = '', max_
             str(narration_audio_path), word_timestamps=True, vad_filter=True,
             condition_on_previous_text=False, language=language, beam_size=5,
             initial_prompt=(initial_prompt or None),
+            # Project glossary. Passed as `hotwords` rather than folded into
+            # initial_prompt because a name can occur anywhere in the clip and
+            # hotwords are re-injected per window; initial_prompt is not.
+            hotwords=(hotwords or None),
         )
         segments = [{'start': s.start, 'end': s.end, 'text': s.text} for s in segments_iter]
         if not segments:
@@ -647,10 +690,27 @@ def apply_transcript_corrections(words: list, cues: list, corrections) -> tuple:
     return corrected_words, corrected_cues, applied
 
 
+def _transcript_digest(artifact):
+    """The approval-gate digest of a transcript, or None.
+
+    Imported lazily and failure-tolerant: a render must not die because a
+    transcript happened to have no approvable content.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    try:
+        from . import approval as _approval
+        return _approval.content_hash_for('transcript', artifact)
+    except Exception:  # noqa: BLE001 - bookkeeping, never load-bearing
+        return None
+
+
 def build_moment_transcript_artifact(words: list, cues: list, *, source: str,
                                       language, moment_rank, moment_selection_sha256,
                                       whisper_model_size: str, initial_prompt_used: bool,
-                                      corrections=None) -> dict:
+                                      corrections=None, asr=None, revisions=None,
+                                      edited_segment_ids=None,
+                                      glossary_context=None) -> dict:
     """The reviewable transcript of ONE moment's original audio.
 
     Deliberately NOT called a script: no model wrote this text. It is what the
@@ -659,18 +719,41 @@ def build_moment_transcript_artifact(words: list, cues: list, *, source: str,
     """
     corrected_words, corrected_cues, applied = apply_transcript_corrections(
         words, cues, corrections)
-    probabilities = [float(w.get('probability') or 0.0) for w in (words or [])]
+    # A word a human typed carries `probability: None` -- there is no recogniser
+    # confidence to average or to doubt. Coercing None to 0.0 both dragged the
+    # average down and marked the corrected word low-confidence, so hand-fixing
+    # a name made the transcript look WORSE. None is excluded from both.
+    probabilities = [float(w.get('probability')) for w in (words or [])
+                     if isinstance(w.get('probability'), (int, float))
+                     and not isinstance(w.get('probability'), bool)]
     low_confidence = [
         {'text': w.get('text'), 'start_sec': w.get('start'),
          'probability': w.get('probability')}
         for w in (words or [])
-        if float(w.get('probability') or 0.0) < LOW_CONFIDENCE_WORD_THRESHOLD
+        if isinstance(w.get('probability'), (int, float))
+        and not isinstance(w.get('probability'), bool)
+        and float(w.get('probability')) < LOW_CONFIDENCE_WORD_THRESHOLD
     ]
     text = ' '.join(str(w.get('text', '')) for w in corrected_words).strip()
     if not text:
         text = ' '.join(str(c.get('text', '')) for c in corrected_cues).strip()
+    # The recogniser's own output, captured ONCE and never rewritten. Callers
+    # pass the previous artifact's `asr` through on every rebuild so a manual
+    # edit can be compared against -- and reverted to -- what was actually heard.
+    raw = asr if isinstance(asr, dict) else {
+        'words': [dict(w) for w in (words or [])],
+        'cues': [dict(c) for c in (cues or [])],
+        'text': ' '.join(str(w.get('text', '')) for w in (words or [])).strip()
+                or ' '.join(str(c.get('text', '')) for c in (cues or [])).strip(),
+        'language': language,
+        'whisper_model_size': whisper_model_size,
+        'source': source,
+        'captured_at': datetime.now(timezone.utc).isoformat(),
+        'reconstructed': False,
+    }
+    history = list(revisions or [])
     return {
-        'schema_version': 1,
+        'schema_version': 2,
         'artifact_type': 'moment_transcript',
         # Never auto-approved: a transcript exists to be read before it is burned
         # into a video.
@@ -696,6 +779,16 @@ def build_moment_transcript_artifact(words: list, cues: list, *, source: str,
         'words': corrected_words,
         'cues': corrected_cues,
         'text': text,
+        'asr': raw,
+        'revisions': history,
+        'revision': (history[-1]['revision'] if history else 0),
+        'edited_segment_ids': sorted(set(edited_segment_ids or [])),
+        # What was actually handed to the recogniser, so a transcript can be
+        # explained later: which terms biased it, and which were dropped for
+        # length and therefore did NOT.
+        'glossary_context': glossary_context or {
+            'term_count': 0, 'terms_used': [], 'terms_dropped': [],
+        },
         'human_approval': {'approved': False, 'approved_by': None, 'approved_at': None,
                            'notes': None, 'approved_content_sha256': None},
     }
@@ -705,7 +798,7 @@ def transcribe_for_dynamic_captions(audio_path, fallback_text: str = '',
                                     max_chars_per_cue: int = 42,
                                     whisper_model_size: str = 'small',
                                     language: str | None = None,
-                                    initial_prompt: str = ''):
+                                    initial_prompt: str = '', hotwords: str = ''):
     """Return word timestamps plus ordinary cues for dynamic caption rendering.
 
     The word list drives active-word highlighting. Ordinary cues are returned
@@ -719,6 +812,10 @@ def transcribe_for_dynamic_captions(audio_path, fallback_text: str = '',
             str(audio_path), word_timestamps=True, vad_filter=True,
             condition_on_previous_text=False, language=language, beam_size=5,
             initial_prompt=(initial_prompt or None),
+            # Project glossary. Passed as `hotwords` rather than folded into
+            # initial_prompt because a name can occur anywhere in the clip and
+            # hotwords are re-injected per window; initial_prompt is not.
+            hotwords=(hotwords or None),
         )
         segments = []
         words = []
@@ -747,7 +844,7 @@ def transcribe_for_dynamic_captions(audio_path, fallback_text: str = '',
         cues, source = transcribe_for_subtitles(
             audio_path, fallback_text, max_chars_per_cue,
             whisper_model_size=whisper_model_size,
-            language=language, initial_prompt=initial_prompt,
+            language=language, initial_prompt=initial_prompt, hotwords=hotwords,
         )
         return [], cues, source
 
@@ -952,7 +1049,7 @@ def run_moment_transcription(
         hot_moments_data: dict, moment_selection: dict, runtime_dir,
         subtitle_whisper_model_size: str = 'small', subtitle_language: str = 'auto',
         subtitle_max_chars_per_cue: int = 42, caption_theme: str = 'auto',
-        source_video_path_override: str = '', progress=None) -> dict:
+        source_video_path_override: str = '', glossary=None, progress=None) -> dict:
     """Transcribe the SELECTED moment's original audio for human review.
 
     This is the step that makes `direct_clip_series` reviewable. Until now the
@@ -1015,11 +1112,19 @@ def run_moment_transcription(
     ], progress=report, total_duration_sec=seek_duration)
 
     report.stage('whisper', f'faster-whisper-{subtitle_whisper_model_size} calisiyor')
+    # Glossary terms go in BEFORE recognition. Correcting the output afterwards
+    # can only repair what the model already got wrong; biasing the decoder is
+    # what stops the proper noun coming out wrong in the first place.
+    from . import glossary as glossary_module
+    context = glossary_module.asr_context(glossary, style_prompt=transcription_prompt)
+    if context['term_count']:
+        report.note(f"{context['term_count']} sozluk terimi modele baglam olarak verildi")
     words, cues, source = transcribe_for_dynamic_captions(
         clip_path, (selected_moment.get('transcript') or '').strip(),
         subtitle_max_chars_per_cue,
         whisper_model_size=subtitle_whisper_model_size,
-        language=resolved_language, initial_prompt=transcription_prompt)
+        language=resolved_language, initial_prompt=transcription_prompt,
+        hotwords=context['hotwords'] or '')
 
     report.stage('write', 'Transkript yaziliyor')
     artifact = build_moment_transcript_artifact(
@@ -1027,7 +1132,11 @@ def run_moment_transcription(
         moment_rank=selected_rank,
         moment_selection_sha256=video_analysis.hot_moments_content_sha256(moment_selection),
         whisper_model_size=subtitle_whisper_model_size,
-        initial_prompt_used=bool(transcription_prompt))
+        initial_prompt_used=bool(transcription_prompt),
+        glossary_context={'term_count': context['term_count'],
+                          'terms_used': context['terms_used'],
+                          'terms_dropped': context['terms_dropped'],
+                          'hotwords_supported': True})
     try:
         clip_path.unlink(missing_ok=True)
     except OSError:
@@ -1054,7 +1163,9 @@ def run_original_audio_subtitle_pipeline(
         caption_base_color_ass: str | None = None,
         caption_max_words: int | None = None, caption_max_chars: int | None = None,
         caption_margin_v: int | None = None, moment_transcript: dict | None = None,
-        source_video_path_override: str = '', progress=None) -> dict:
+        source_video_path_override: str = '', frame_zoom: float = 1.0,
+        frame_focus_x: float = 0.5, frame_focus_y: float = 0.5,
+        progress=None) -> dict:
     """Render the selected source moment with its ORIGINAL audio and subtitles.
 
     This is the canonical main-pipeline path for ordinary dialogue clips. It
@@ -1159,12 +1270,24 @@ def run_original_audio_subtitle_pipeline(
     # and re-transcribing here would silently throw those corrections away --
     # and pay for a second Whisper pass to do it.
     approved_transcript = moment_transcript if _transcript_usable(moment_transcript) else None
+    excluded_cue_count = 0
+    excluded_word_count = 0
     if approved_transcript:
-        words = list(approved_transcript.get('words') or [])
-        cues = list(approved_transcript.get('cues') or [])
+        all_words = list(approved_transcript.get('words') or [])
+        all_cues = list(approved_transcript.get('cues') or [])
+        excluded_word_count = sum(
+            bool(word.get('excluded_from_subtitles')) for word in all_words)
+        excluded_cue_count = sum(
+            bool(cue.get('excluded_from_subtitles')) for cue in all_cues)
+        words = [word for word in all_words
+                 if not word.get('excluded_from_subtitles')]
+        cues = [cue for cue in all_cues
+                if not cue.get('excluded_from_subtitles')]
         subtitle_source = (f"approved-transcript:{approved_transcript.get('source') or 'unknown'}")
         report.note(f"Onayli transkript kullaniliyor ({len(words)} kelime, "
                     f"{len(approved_transcript.get('corrections') or [])} duzeltme)")
+        if excluded_cue_count:
+            report.note(f"{excluded_cue_count} satir insan karariyla altyazidan cikarildi")
     else:
         words, cues, subtitle_source = transcribe_for_dynamic_captions(
             base_clip_path, fallback_text, subtitle_max_chars_per_cue,
@@ -1172,14 +1295,15 @@ def run_original_audio_subtitle_pipeline(
             language=resolved_subtitle_language,
             initial_prompt=transcription_prompt,
         )
-    if not cues:
+    all_subtitles_suppressed = bool(excluded_cue_count and not cues)
+    if not cues and not all_subtitles_suppressed:
         raise RuntimeError('Orijinal sesten altyazi cue uretilemedi.')
     # Zero transcribed words means this moment carries no speech. The pipeline
     # still renders it -- a wordless action beat is a valid Short -- but the
     # manifest, the panel and the review checklist must all say so, because the
     # promise of this mode is "original audio PLUS timed subtitles" and only half
     # of that was delivered.
-    no_speech_detected = not words and not fallback_text
+    no_speech_detected = not words and not fallback_text and not all_subtitles_suppressed
     subtitle_warning = None
     if no_speech_detected:
         subtitle_warning = (
@@ -1195,10 +1319,16 @@ def run_original_audio_subtitle_pipeline(
                           if not no_speech_detected
                           else 'konusma yok - altyazi uretilmedi'))
 
-    vertical_graph = build_vertical_filtergraph(render_mode, render_width, render_height)
+    vertical_graph = build_vertical_filtergraph(
+        render_mode, render_width, render_height, zoom_scale=frame_zoom,
+        focus_x=frame_focus_x, focus_y=frame_focus_y)
     subtitles_ass_path = render_dir / 'subtitles_dynamic.ass'
     dynamic_caption_meta = None
-    if caption_style == 'active_word_yellow' and words:
+    if all_subtitles_suppressed:
+        subtitle_graph = "[framed]null[vout]"
+        subtitle_format = 'none'
+        dynamic_word_highlight = False
+    elif caption_style == 'active_word_yellow' and words:
         dynamic_caption_meta = write_active_word_ass(
             words, subtitles_ass_path,
             play_res_x=target_width, play_res_y=target_height,
@@ -1279,10 +1409,13 @@ def run_original_audio_subtitle_pipeline(
     return {
         'status': final_status,
         'status_reason': (
-            ('orijinal ses korundu ancak bu momentte KONUSMA YOK; Short altyazisiz '
-             'uretildi, insan incelemesi bekleniyor'
-             if no_speech_detected else
-             'orijinal ses korundu ve altyazilar videoya gomuldu; insan incelemesi bekleniyor')
+            ('orijinal ses korundu; tum altyazi satirlari insan karariyla gizlendi, '
+             'insan incelemesi bekleniyor'
+             if all_subtitles_suppressed else
+             ('orijinal ses korundu ancak bu momentte KONUSMA YOK; Short altyazisiz '
+              'uretildi, insan incelemesi bekleniyor'
+              if no_speech_detected else
+              'orijinal ses korundu ve altyazilar videoya gomuldu; insan incelemesi bekleniyor'))
             if render_validation['passed'] else
             'orijinal-ses altyazi renderi teknik dogrulamadan gecemedi'
         ),
@@ -1301,6 +1434,9 @@ def run_original_audio_subtitle_pipeline(
         'config': {
             'pipeline_mode': 'original_audio_subtitles',
             'render_mode': render_mode,
+            'frame_zoom': float(frame_zoom),
+            'frame_focus_x': float(frame_focus_x),
+            'frame_focus_y': float(frame_focus_y),
             'preview_mode': preview_mode,
             'target_width': target_width,
             'target_height': target_height,
@@ -1334,8 +1470,20 @@ def run_original_audio_subtitle_pipeline(
         },
         'subtitles': {
             'source': subtitle_source,
+            # WHICH transcript revision this video was built from. Without it a
+            # render approved before a caption edit still looks valid: editing
+            # the transcript CLEARS its approval rather than invalidating it, so
+            # the approval chain sees no stale upstream approval to complain
+            # about and the render silently keeps its own.
+            'transcript_content_sha256': (
+                (moment_transcript or {}).get('content_sha256_at_render')
+                or _transcript_digest(moment_transcript)),
+            'transcript_revision': (moment_transcript or {}).get('revision'),
             'cue_count': len(cues),
             'word_count': len(words),
+            'excluded_cue_count': excluded_cue_count,
+            'excluded_word_count': excluded_word_count,
+            'all_subtitles_suppressed': all_subtitles_suppressed,
             'srt_path': str(subtitles_srt_path),
             'ass_path': str(subtitles_ass_path) if subtitles_ass_path.is_file() else None,
             'format_used_for_render': subtitle_format,
@@ -1380,7 +1528,8 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
                          original_audio_base_volume: float = 0.35, narration_volume: float = 1.0,
                          duck_ratio: float = 8, subtitle_fontsize: int = 20, subtitle_margin_v: int = 90,
                          subtitle_max_chars_per_cue: int = 42, source_video_path_override: str = '',
-                         progress=None) -> dict:
+                         frame_zoom: float = 1.0, frame_focus_x: float = 0.5,
+                         frame_focus_y: float = 0.5, progress=None) -> dict:
     """High-level, single-run render entry point shared by
     06_render_pipeline.ipynb and 00_youtube_automation_master.ipynb: extracts
     the selected moment's source clip, generates subtitles from the real
@@ -1480,7 +1629,9 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
     report.count(len(cues), len(cues), unit='altyazi',
                  message=f'{len(cues)} altyazi satiri ({subtitle_source})')
 
-    vertical_graph = build_vertical_filtergraph(render_mode, render_width, render_height)
+    vertical_graph = build_vertical_filtergraph(
+        render_mode, render_width, render_height, zoom_scale=frame_zoom,
+        focus_x=frame_focus_x, focus_y=frame_focus_y)
     subs_path_escaped = escape_path_for_filter(subtitles_srt_path)
     subs_style = (
         f'FontSize={subtitle_fontsize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,'
@@ -1567,6 +1718,8 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
         },
         'config': {
             'render_mode': render_mode, 'preview_mode': preview_mode,
+            'frame_zoom': float(frame_zoom), 'frame_focus_x': float(frame_focus_x),
+            'frame_focus_y': float(frame_focus_y),
             'target_width': target_width, 'target_height': target_height,
             'render_width': render_width, 'render_height': render_height,
             'ducking_enabled': ducking_enabled,

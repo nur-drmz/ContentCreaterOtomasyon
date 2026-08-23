@@ -191,6 +191,20 @@ def main() -> int:
         "notes": "IZOLE TEST SECIMI", "require_preview": False})
     check(status == 201, "moment-selection", f"rank={moments[0]['rank']}")
 
+    # --- 5b. caption transcript (render gate) --------------------------------
+    # direct_clip_series burns the source's own words in, so render stays shut
+    # until a human has read them. Walk the gate; do not bypass it.
+    status, _ = call(api, "POST", f"/api/projects/{pid}/jobs", {
+        "job_type": "transcript",
+        "params": {"subtitle_whisper_model_size": "tiny", "subtitle_language": "auto"}})
+    _tr = service.approval_state("transcript")
+    check(bool(_tr.get("content_sha256")), "transcript-produced",
+          f"HTTP {status}, {_tr.get('reason')}")
+    service.approve("transcript", reviewed_sha256=_tr["content_sha256"],
+                    approved_by="verify_real_preview")
+    check(service.approval_state("transcript")["valid"], "transcript-approved",
+          str(service.approval_state("transcript").get("reason")))
+
     # --- 6. real render -----------------------------------------------------
     t0 = time.time()
     status, payload = call(api, "POST", f"/api/projects/{pid}/jobs", {

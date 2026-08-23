@@ -128,6 +128,8 @@ try:
         SCREENS = {
             "projects": "Projeler",
             "phase0": "Faz 0",
+            "longform": "Uzun Video Planlama",
+            "turbo": "Turbo Studio",
             "jobs": "Is akisi",
             "moments": "Moment Explorer",
             "script": "Script Studio",
@@ -526,11 +528,11 @@ try:
               "workflow:no-duplicate-indicator", "eski ilerleme gostergesi hala duruyor")
 
         steps = page.locator(".wf-step")
-        check(steps.count() == 9, "workflow:nine-steps", f"{steps.count()} adim")
+        check(steps.count() == 10, "workflow:ten-steps", f"{steps.count()} adim")
         labels = page.eval_on_selector_all(
             ".wf-step__label", "n => n.map(e => e.textContent)")
         check(labels == ["Kaynak", "Degerlendirme", "Plan", "Analiz", "Moment",
-                          "Script", "Ses", "Render", "Inceleme"],
+                          "Altyazi", "Script", "Ses", "Render", "Inceleme"],
               "workflow:labels-in-order", str(labels))
 
         count_label = page.locator("[data-testid=workflow-count]")
@@ -621,8 +623,9 @@ try:
               f"script={dcs.get('step-script')} voice={dcs.get('step-voice')}")
         check(page.locator("[data-testid=step-skip-script]").count() == 1,
               "workflow:skip-explained-in-ui", "atlandi etiketi yok")
-        check("7" in page.locator("[data-testid=workflow-count]").inner_text(),
-              "workflow:dcs-counts-seven",
+        # direct_clip_series keeps Altyazi and drops Script + Ses: 10 - 2 = 8.
+        check("8" in page.locator("[data-testid=workflow-count]").inner_text(),
+              "workflow:dcs-counts-eight",
               page.locator("[data-testid=workflow-count]").inner_text())
         check(page.locator("[data-testid=workflow-mode]").inner_text().strip()
               == "direct_clip_series", "workflow:dcs-mode-badge",
@@ -740,7 +743,7 @@ try:
                 ".map(e => e.getBoundingClientRect().right))")
             check(widest <= MOBILE["width"] + 1, "workflow:mobile-steps-fit",
                   f"en sag kenar={widest}px / {MOBILE['width']}px")
-            check(mp.locator(".wf-step").count() == 9, "workflow:mobile-all-steps",
+            check(mp.locator(".wf-step").count() == 10, "workflow:mobile-all-steps",
                   f"{mp.locator('.wf-step').count()} adim")
         # Navigation still works by tap.
         mp.locator("[data-testid=step-render]").click()
@@ -815,8 +818,19 @@ try:
         check(jump.count() == 1, "diag:jump-button", "sekmeye git dugmesi yok")
         jump.click()
         page.wait_for_timeout(700)
-        check("Script Studio" in page.inner_text("#screen"), "diag:jump-navigates",
-              "yanlis sekmeye goturdu")
+        # The `script` tab has TWO faces, chosen by the approved plan: a narrated
+        # project sees Script Studio, a clip series sees the Altyazi editor
+        # (`screenScript` delegates to `screenTranscript`). The jump is correct
+        # when it lands on that tab, whichever face the plan selected -- pinning
+        # the narrated heading made a correct jump look like a wrong one.
+        _screen_text = page.inner_text("#screen")
+        _landed = ("Script Studio" if "Script Studio" in _screen_text
+                   else "Altyazi" if "Altyazi (orijinal ses)" in _screen_text else "")
+        # Report the matched heading, never the raw screen text: the page holds
+        # non-cp1254 glyphs and this console encodes stdout in cp1254, so
+        # echoing it turned a passing check into a UnicodeEncodeError crash.
+        check(bool(_landed), "diag:jump-navigates",
+              f"yanlis sekmeye goturdu (baslik bulunamadi)")
 
         # The report survives a reload, because it lives on the server.
         goto(page, _BASE, "settings", _PID)
@@ -844,6 +858,20 @@ try:
                 rr_service.record_moment_selection(
                     selected_rank=hot["hot_moments"][0]["rank"],
                     reviewed_by="browser-test", require_preview=False)
+        # The render gate needs a produced AND approved transcript in this mode.
+        if rr_service.load_artifact("moment_transcript")["data"] is None:
+            _app.submit_job(_app.ownership(_PID), "transcript", params={
+                "subtitle_whisper_model_size": "tiny", "subtitle_language": "auto"},
+                run_request_id="browser-transcript")
+            deadline = time.time() + 240
+            while time.time() < deadline:
+                if rr_service.load_artifact("moment_transcript")["data"] is not None:
+                    break
+                time.sleep(1.0)
+        _rr_tr = rr_service.approval_state("transcript")
+        if _rr_tr.get("content_sha256") and not _rr_tr.get("valid"):
+            rr_service.approve("transcript", reviewed_sha256=_rr_tr["content_sha256"],
+                               approved_by="browser-test")
         if rr_service.load_artifact("render_manifest")["data"] is None:
             _app.submit_job(_app.ownership(_PID), "render", params={
                 "render_mode": "blurred_background", "preview_mode": True,

@@ -32,6 +32,8 @@ CONSOLE_SECRET_KINDS = {
     "azure_speech_key": "Opsiyonel Azure Neural TTS yedegi",
     "azure_speech_region": "Opsiyonel Azure Neural TTS yedegi",
     "tmdb": "Opsiyonel film/dizi trend metadata zenginlestirmesi",
+    "pexels": "Long-form icin insan onayli Pexels stok video aramasi",
+    "pixabay": "Long-form icin insan onayli Pixabay stok video aramasi",
     "huggingface": "Opsiyonel Hugging Face model indirme kimlik dogrulamasi",
     "github": "GitHub private repo/LFS senkron kimligi (otomatik veri senkronu henuz kapali)",
 }
@@ -42,6 +44,8 @@ CONSOLE_SECRET_ALIASES = {
     "anthropic": ("ANTHROPIC_API_KEY",),
     "elevenlabs": ("ELEVENLABS_API_KEY",),
     "tmdb": ("TMDB_API_KEY",),
+    "pexels": ("PEXELS_API_KEY",),
+    "pixabay": ("PIXABAY_API_KEY",),
     "huggingface": ("HF_TOKEN",),
     "github": ("GITHUB_TOKEN",),
 }
