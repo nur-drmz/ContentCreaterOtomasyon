@@ -327,4 +327,4 @@ Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive
 - 2026-08-23 — `main` `origin`e push edildi (`a53b751`); MoneyPrinter/Turbo fark
   kapatma oturumu başladı. Edge-TTS (kimliksiz fallback), ses hızı normalizasyonu
   ve WAV chunk yürütme hatası çözüldü (`914f133`). ASS aktif-kelime vurgusu
-  Turbo'ya bağlandı (henüz commitlenmedi/test edilmedi).
+  Turbo'ya bağlandı; aynı gün doğrulanıp commitlendi (`5a0f25f`).
