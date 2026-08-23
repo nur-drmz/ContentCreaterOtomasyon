@@ -2160,6 +2160,31 @@ def pcm_to_wav_bytes(pcm: bytes, sample_rate=TTS_SAMPLE_RATE, channels=TTS_CHANN
     return header + pcm
 
 
+def _riff_chunk_size(data: bytes, chunk_id: bytes) -> int:
+    """Size of a named RIFF chunk, found by WALKING the chunk list.
+
+    WHY NOT A FIXED OFFSET
+    ----------------------
+    A canonical 44-byte header puts `data` at offset 36, and reading its size
+    from bytes 40-44 works. But that is only one legal layout: encoders are
+    free to insert `LIST`/`INFO` chunks before `data`, and ffmpeg does. Reading
+    the fixed offset then measures the WRONG chunk and reports a duration
+    hundreds of times too small -- silently, because the file is otherwise
+    valid and plays fine. Walking the list is the only correct reading.
+    """
+    offset = 12
+    while offset + 8 <= len(data):
+        current = data[offset:offset + 4]
+        size = struct.unpack("<I", data[offset + 4:offset + 8])[0]
+        if current == chunk_id:
+            # Clamp to what is actually on disk: a truncated file must report
+            # the bytes it has, not the size its header claims.
+            return min(size, max(0, len(data) - (offset + 8)))
+        # Chunks are word-aligned, so an odd size carries one pad byte.
+        offset += 8 + size + (size & 1)
+    return 0
+
+
 def validate_audio_file(path, *, min_bytes=1024, expected_sample_rate=TTS_SAMPLE_RATE) -> dict:
     """Container/codec/size/duration/non-emptiness check for a produced WAV.
 
@@ -2182,7 +2207,7 @@ def validate_audio_file(path, *, min_bytes=1024, expected_sample_rate=TTS_SAMPLE
     if len(data) >= 44 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
         checks["container_wav"] = True
         audio_format, channels, sample_rate, _, _, bits = struct.unpack("<HHIIHH", data[20:36])
-        data_size = struct.unpack("<I", data[40:44])[0]
+        data_size = _riff_chunk_size(data, b"data")
         details.update({"sample_rate": sample_rate, "channels": channels,
                         "bits_per_sample": bits})
         checks["codec_pcm_s16le"] = (audio_format == 1 and bits == 16)

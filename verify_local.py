@@ -1059,11 +1059,12 @@ for _nb_path in sorted(NOTEBOOK_DIR.glob("*.ipynb")):
         raise AssertionError(f"{_nb_path.name}: dahili payload hucresi UI'da katlanmamis")
     # UI-friendliness guard, not a correctness one: the cell is already collapsed
     # (cellView=form + source_hidden) and every payload is zlib+Base85 compressed
-    # and hash-verified. The budget is sized for the master notebook's 10 embedded
-    # modules (~374 KB of source -> ~133 KB encoded + ~15% line wrapping); raise it
-    # deliberately when a new canonical module is added, never to hide a
-    # compression regression.
-    if len("".join(_payload_cell.get("source", []))) > 200_000:
+    # and hash-verified. Sized for the master notebook's 11 embedded modules
+    # (~476 KB of source -> ~169 KB encoded, ~36%, + ~19% loader/line-wrap
+    # overhead = ~202 KB). Raise it deliberately when a module is added or grows,
+    # never to hide a compression regression: if the encoded:source ratio climbs
+    # well above ~40%, compression broke and the budget is not the problem.
+    if len("".join(_payload_cell.get("source", []))) > 220_000:
         raise AssertionError(f"{_nb_path.name}: sikistirilmis bootstrap hucresi hala asiri buyuk")
     for _module_name, _entry in sorted(_payloads.items()):
         _recorded = _entry["sha256"]
@@ -1204,6 +1205,10 @@ _REQUIRED_ENTRY_POINTS = {
         "resolve_provider_credentials", "describe_provider_states",
         "call_groq_text", "call_cloudflare_text", "call_cloudflare_embeddings",
         "call_azure_tts", "run_cross_provider_text_fallback", "CROSS_PROVIDER_ROUTES",
+        # Edge is the only credential-free narration path: if the embedded
+        # payload drops it, Colab loses TTS the moment the Gemini quota is spent.
+        "call_edge_tts", "run_cross_provider_tts_fallback",
+        "normalize_speech_rate", "EDGE_TURKISH_VOICES",
     ],
     # Phase 0: without this module the master notebook cannot gate ANY downstream
     # phase, so single-file Colab must carry it too.
@@ -3864,13 +3869,95 @@ if (_emb_fallback.get("status") != "ok" or
         not str(_emb_fallback.get("vector_space", "")).startswith("cloudflare:")):
     raise AssertionError("[ga] embedding fallback vektor uzayi kimligini kaydetmedi")
 
+# Edge is disabled here so this stays the AZURE assertion it was written to be.
 _tts_fallback = _pa.run_cross_provider_tts_fallback(
     "5 < 7 & guvenli", _GA_TMP / "azure-fallback.wav",
-    secret_getter=_pa_secrets.get, transport=_pa_transport)
+    secret_getter=_pa_secrets.get, transport=_pa_transport, allow_edge=False)
 if _tts_fallback.get("status") != "review_required":
     raise AssertionError("[ga] Azure TTS fallback review_required olmali")
 print("  [ga:cross-provider-adapters] kimlik yokken atlar, sahte transport ile calisir, "
       "runtime semasini dogrular, deneme limitine uyar, yerel whisper birincil kalir")
+
+# --- Edge TTS: the credential-free route step ------------------------------
+# Every call below injects `synth`. Nothing here may contact Microsoft: a test
+# that quietly reached a live endpoint would be indistinguishable from a real
+# provider call, which this suite promises never to make.
+_edge_mp3 = subprocess.run(
+    [ru.resolve_ffmpeg_binaries()[0], "-hide_banner", "-loglevel", "error",
+     "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-f", "mp3", "pipe:1"],
+    capture_output=True, check=True).stdout
+if not _edge_mp3:
+    raise AssertionError("[ga] Edge testi icin sahte MPEG uretilemedi")
+
+_edge_calls = []
+
+
+def _edge_synth(text, *, voice, rate, volume, pitch):
+    _edge_calls.append({"text": text, "voice": voice, "rate": rate,
+                        "volume": volume, "pitch": pitch})
+    return _edge_mp3, [{"text": "merhaba", "start": 0.0, "end": 0.42}]
+
+
+_edge = _pa.call_edge_tts("merhaba dunya", _GA_TMP / "edge.wav",
+                          rate=1.1, synth=_edge_synth)
+if not _edge["ok"] or _edge["status"] != "review_required":
+    raise AssertionError(f"[ga] Edge TTS sahte synth ile calismadi: {_edge.get('error')}")
+if _edge["inherits_previous_approval"] is not False:
+    raise AssertionError("[ga] Edge TTS ciktisi onay devralmamali")
+if _edge["requires_credential"] is not False:
+    raise AssertionError("[ga] Edge TTS kimlik bilgisi gerektirmedigini bildirmeli")
+# A multiplier must reach the provider as Edge's wire format, not as "1.1".
+if _edge_calls[0]["rate"] != "+10%":
+    raise AssertionError(f"[ga] konusma hizi carpani cevrilmedi: {_edge_calls[0]['rate']}")
+if not _edge["word_boundaries"]:
+    raise AssertionError("[ga] Edge kelime zamanlamalari kaybedildi")
+# The written file must satisfy the SAME audio contract as the Gemini path,
+# otherwise concat would refuse to join a mixed-provider narration.
+_edge_validation = _ga.validate_audio_file(_GA_TMP / "edge.wav")
+if not _edge_validation["passed"]:
+    raise AssertionError(f"[ga] Edge WAV kontrati: {_edge_validation['reason']}")
+if _edge_validation["details"]["duration_sec"] < 0.9:
+    raise AssertionError(
+        f"[ga] Edge WAV suresi yanlis olculdu: {_edge_validation['details']['duration_sec']}")
+
+# Speech-rate translation, including the refusals.
+if (_pa.normalize_speech_rate(None), _pa.normalize_speech_rate(0.9),
+        _pa.normalize_speech_rate("+25%")) != ("+0%", "-10%", "+25%"):
+    raise AssertionError("[ga] konusma hizi normalizasyonu hatali")
+for _bad_rate in (3.0, 0.1, "25", "fast", "+500%", True):
+    try:
+        _pa.normalize_speech_rate(_bad_rate)
+    except ValueError:
+        continue
+    raise AssertionError(f"[ga] gecersiz konusma hizi kabul edildi: {_bad_rate!r}")
+
+# A malformed voice id and empty text are refusals, not silent successes.
+if _pa.call_edge_tts("x", _GA_TMP / "bad-edge.wav", voice="Ahmet",
+                     synth=_edge_synth)["ok"]:
+    raise AssertionError("[ga] bicimsiz Edge ses kimligi kabul edildi")
+if _pa.call_edge_tts("   ", _GA_TMP / "empty-edge.wav", synth=_edge_synth)["ok"]:
+    raise AssertionError("[ga] bos metinle Edge TTS calisti")
+# An empty response must fail rather than write a zero-length narration.
+if _pa.call_edge_tts("x", _GA_TMP / "silent-edge.wav",
+                     synth=lambda *a, **k: (b"", []))["ok"]:
+    raise AssertionError("[ga] Edge bos ses dondurdugunde basarili sayildi")
+
+# Edge leads the TTS route, ahead of the keyed provider.
+_tts_route = [entry[0] for entry in _pa.CROSS_PROVIDER_ROUTES["tts"]]
+if _tts_route[:2] != ["google", "edge_tts"] or "azure_speech" not in _tts_route:
+    raise AssertionError(f"[ga] TTS rotasi beklenen sirada degil: {_tts_route}")
+
+# With NO credential at all, the fallback still produces narration through Edge
+# -- that is the whole point of adding it.
+_edge_first = _pa.run_cross_provider_tts_fallback(
+    "kota bitti ama anlatim surmeli", _GA_TMP / "edge-fallback.wav",
+    secret_getter=lambda name: None, transport=_pa_transport,
+    edge_synth=_edge_synth)
+if _edge_first.get("provider") != "edge_tts" or _edge_first.get("status") != "review_required":
+    raise AssertionError("[ga] kimlik yokken Edge fallback anlatim uretmedi")
+print("  [ga:edge-tts] kimlik gerektirmiyor, hiz carpani wire bicimine ceviriliyor, "
+      "kelime zamanlamalari korunuyor, WAV kontrati Gemini yoluyla ayni, "
+      "gecersiz ses/bos metin/bos ses reddediliyor (gercek Microsoft cagrisi YOK)")
 
 # --- Notebooks must contain no hardcoded Gemini model / client -------------
 for _nb_path in sorted((PROJECT_ROOT / "experiments" / "colab").glob("*.ipynb")):
