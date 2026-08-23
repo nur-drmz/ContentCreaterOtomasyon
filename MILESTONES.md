@@ -282,13 +282,18 @@ Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları ar�
 
 ## 7. Bir sonraki çalışma oturumu
 
-1. `main`i uzak depoya push et (merge yerelde tamam; push kullanıcı onayı bekliyor).
-2. Creator Console'da >1 saat gerçek kaynakla final kalite planı oluştur.
-3. Tam kaynak taraması çalıştır; üç ayrı momenti üç slota seç.
-4. Her slot transcript'ini ayrı incele/onayla ve batch renderı çalıştır.
-5. Üç Short'u ayrı izle; kadraj, kesim, altyazı, vurgu, font ve sesi kaydet.
-6. En az bir kabul ve bir ret/revizyon kararı ver; gözlenen kanıta göre checkbox'ları güncelle.
-7. `narrated_theory` denenirse script okunmalı, üretilen bütün WAV'lar dinlenmelidir.
+1. `main` `origin/main`e push edildi (`a53b751`); bu madde kapalı.
+2. M0.10 (MoneyPrinter/Turbo yetenek farkı) kapatma devam ediyor:
+   - `local_pipeline/provider_adapters.py`: Edge-TTS + hız/volume normalizasyonu tamam.
+   - `local_pipeline/turbo.py` + `creator_console/turbo_studio.py`: dinamik ASS
+     entegrasyonu yazıldı fakat **commitlenmedi**, doğrulanmadı.
+   - Açık: Coverr, görsel stok/Ken Burns, çoklu LLM sağlayıcı genişletme.
+3. Creator Console'da >1 saat gerçek kaynakla final kalite planı oluştur.
+4. Tam kaynak taraması çalıştır; üç ayrı momenti üç slota seç.
+5. Her slot transcript'ini ayrı incele/onayla ve batch renderı çalıştır.
+6. Üç Short'u ayrı izle; kadraj, kesim, altyazı, vurgu, font ve sesi kaydet.
+7. En az bir kabul ve bir ret/revizyon kararı ver; gözlenen kanıta göre checkbox'ları güncelle.
+8. `narrated_theory` denenirse script okunmalı, üretilen bütün WAV'lar dinlenmelidir.
 
 ## 8. Yakın dönem kanıtı
 
@@ -310,5 +315,7 @@ Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive
 - 2026-08-23 — P0 transcript/glossary stabilizasyon testleri yeniden ölçüldü:
   `verify_transcript_editor` 113/113, `verify_revision_flow` 39/39,
   `verify_diagnostics` 110/110; ilgili 10 regresyon paketi tamamen yeşil.
-- 2026-08-23 — `feature/transcript-editor-revision-flow` üç commite bölünüp `main`e
-  conflict'siz merge edildi (`082cbbc`, 73 dosya); merge sonrası `main` yeşil. Push yok.
+- 2026-08-23 — `main` `origin`e push edildi (`a53b751`); MoneyPrinter/Turbo fark
+  kapatma oturumu başladı. Edge-TTS (kimliksiz fallback), ses hızı normalizasyonu
+  ve WAV chunk yürütme hatası çözüldü (`914f133`). ASS aktif-kelime vurgusu
+  Turbo'ya bağlandı (henüz commitlenmedi/test edilmedi).
