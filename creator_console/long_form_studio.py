@@ -26,7 +26,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from local_pipeline import google_ai, long_form, long_form_script, tts_chunks
+from local_pipeline import google_ai, long_form, long_form_script, stock_media, tts_chunks
+
+from . import quota_signals, tts_runner
 
 EVENT_LOG = "results/long_form/events.jsonl"
 AUDIO_DIRNAME = "results/long_form/tts"
@@ -49,6 +51,8 @@ EVENTS = (
     "audio_concat.started", "audio_concat.completed", "audio_concat.failed",
     "timeline.started", "timeline.completed", "timeline.failed",
     "render.started", "render.completed", "render.failed",
+    "broll.plan_created", "broll.search_completed", "broll.selected",
+    "broll.download_completed",
 )
 
 #: Fields that must never reach the event log even if a caller passes them.
@@ -159,6 +163,9 @@ class LongFormStudio:
 
     def consistency(self):
         return self._read(long_form_script.CONSISTENCY_ARTIFACT)
+
+    def broll_plan(self):
+        return self._read(stock_media.BROLL_ARTIFACT)
 
     def chunk_manifest(self) -> dict:
         record = self._read(tts_chunks.MANIFEST_ARTIFACT)
@@ -348,6 +355,80 @@ class LongFormStudio:
         self.save_workflow(record, actor=actor)
         return record
 
+    # ------------------------------------------------------ stock B-roll
+    def create_broll_plan(self, *, clip_duration_sec=5,
+                          actor: str = "console") -> dict:
+        """Create editable script-order slots; this performs no API request."""
+        record = stock_media.new_plan(
+            self.chapters(), clip_duration_sec=clip_duration_sec,
+            ownership=self.ownership)
+        self._write(stock_media.BROLL_ARTIFACT, record, actor=actor)
+        self.log_event("broll.plan_created", actor=actor,
+                       slot_count=len(record.get("slots") or []),
+                       clip_duration_sec=record.get("clip_duration_sec"))
+        return record
+
+    def search_broll(self, slot_id: str, *, provider: str, query: str,
+                     per_page=6, actor: str = "console") -> dict:
+        """One explicit stock API call. Credentials remain server-side."""
+        plan = self.broll_plan()
+        if not plan:
+            raise LongFormError("once B-roll arama plani olustur")
+        if stock_media.is_stale(plan, self.chapters()):
+            raise LongFormError("bolum scripti degisti; once B-roll planini yenile")
+        kind = {"pexels": "pexels", "pixabay": "pixabay"}.get(
+            str(provider or "").strip().lower())
+        if not kind:
+            raise LongFormError("stok video saglayicisi Pexels veya Pixabay olmali")
+        credential = self.service.secrets.credential(kind)
+        if not credential.configured:
+            raise LongFormError(
+                f"{kind} API anahtari tanimli degil; .env.local dosyasini guncelle")
+        result = stock_media.search_videos(
+            kind, query, credential.value, per_page=per_page)
+        plan = stock_media.store_search(plan, slot_id, result)
+        self._write(stock_media.BROLL_ARTIFACT, plan, actor=actor)
+        self.log_event("broll.search_completed", actor=actor, slot_id=slot_id,
+                       provider=kind, candidate_count=result.get("count"))
+        return plan
+
+    def select_broll(self, slot_id: str, candidate_id: str, *,
+                     actor: str = "console") -> dict:
+        plan = self.broll_plan()
+        if not plan:
+            raise LongFormError("once B-roll arama plani olustur")
+        if stock_media.is_stale(plan, self.chapters()):
+            raise LongFormError("bolum scripti degisti; once B-roll planini yenile")
+        plan = stock_media.select_candidate(plan, slot_id, candidate_id)
+        self._write(stock_media.BROLL_ARTIFACT, plan, actor=actor)
+        selected = next(item for item in plan["slots"] if item["id"] == slot_id)
+        self.log_event("broll.selected", actor=actor, slot_id=slot_id,
+                       provider=(selected.get("selected") or {}).get("provider"),
+                       asset_id=(selected.get("selected") or {}).get("asset_id"))
+        return plan
+
+    def download_broll(self, slot_id: str, *, actor: str = "console") -> dict:
+        plan = self.broll_plan()
+        if not plan:
+            raise LongFormError("once B-roll arama plani olustur")
+        if stock_media.is_stale(plan, self.chapters()):
+            raise LongFormError("bolum scripti degisti; once B-roll planini yenile")
+        slot = next((item for item in plan.get("slots") or []
+                     if item.get("id") == slot_id), None)
+        if not slot or not slot.get("selected"):
+            raise LongFormError("once bu slot icin bir B-roll adayi sec")
+        candidate = slot["selected"]
+        filename = stock_media.safe_filename(candidate)
+        destination = self._path(f"{stock_media.BROLL_DIRNAME}/{filename}")
+        downloaded = stock_media.download_candidate(candidate, destination)
+        plan = stock_media.record_download(plan, slot_id, downloaded)
+        self._write(stock_media.BROLL_ARTIFACT, plan, actor=actor)
+        self.log_event("broll.download_completed", actor=actor, slot_id=slot_id,
+                       provider=candidate.get("provider"),
+                       asset_id=candidate.get("asset_id"),
+                       bytes=downloaded.get("bytes"))
+        return plan
+
     def retry_billing(self, *, actor: str = "console") -> dict:
         """Explicitly requeue a billing-blocked stage after operator action.
 
@@ -435,67 +516,17 @@ class LongFormStudio:
 
     # ------------------------------------------------------------- TTS loop
     def _tts_quota_wait(self, ledger, model: str, estimated_tokens: int) -> dict:
-        """Turn the quota ledger into a persistent scheduling decision."""
-        reason = ledger.blocking_reason(model, estimated_tokens)
-        if not reason:
-            return {"ready": True, "model": model}
+        """Turn the quota ledger into a persistent scheduling decision.
 
-        record = ledger.record_for(model)
-        now = ledger._now()  # the ledger owns the injectable clock
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-
-        def parsed(value):
-            try:
-                moment = datetime.fromisoformat(str(value or ""))
-            except (TypeError, ValueError):
-                return None
-            return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
-
-        daily_until = parsed(record.get("daily_exhausted_until"))
-        rpd = int(record.get("configured_rpd") or 0)
-        if ((daily_until and now < daily_until)
-                or (rpd and int(record.get("requests_current_day") or 0) >= rpd)):
-            resume_at = daily_until or google_ai.next_pacific_reset(now)
-            return {"ready": False, "state": long_form.WAITING_DAILY_QUOTA,
-                    "chunk_state": tts_chunks.WAITING_DAILY_QUOTA,
-                    "resume_at": resume_at.isoformat(), "reason": reason,
-                    "model": model}
-
-        minute_start = parsed(record.get("minute_window_start")) or now
-        rpm = int(record.get("configured_rpm") or 0)
-        tpm = int(record.get("configured_tpm") or 0)
-        rpm_full = rpm and int(record.get("requests_current_minute") or 0) >= rpm
-        tpm_full = (tpm and estimated_tokens and
-                    int(record.get("estimated_input_tokens_current_minute") or 0)
-                    + int(estimated_tokens) > tpm)
-        cooldown = parsed(record.get("cooldown_until"))
-        if rpm_full or tpm_full or (cooldown and now < cooldown):
-            resume_at = (cooldown if cooldown and now < cooldown
-                         else minute_start + timedelta(seconds=60))
-            if resume_at <= now:
-                resume_at = now + timedelta(seconds=1)
-            return {"ready": False, "state": long_form.WAITING_RATE_LIMIT,
-                    "chunk_state": tts_chunks.WAITING_RATE_LIMIT,
-                    "resume_at": resume_at.isoformat(), "reason": reason,
-                    "model": model}
-
-        # Disabled/not-found models have no honest automatic resume time.
-        return {"ready": False, "state": None, "resume_at": None,
-                "reason": reason, "model": model}
+        The rules live in `quota_signals` so Turbo asks the same question of the
+        same code -- a second copy of "what does this refusal mean" would drift,
+        and the drift would only surface against a real provider.
+        """
+        return quota_signals.tts_quota_wait(ledger, model, estimated_tokens)
 
     @staticmethod
-    def _quota_kind_from_result(result: dict) -> str | None:
-        kinds = {str(result.get("error_kind") or "")}
-        kinds.update(str(item.get("error_kind") or "")
-                     for item in (result.get("provider_attempts") or []))
-        if google_ai.ERROR_BILLING_QUOTA in kinds:
-            return long_form.BLOCKED_BILLING
-        if google_ai.ERROR_RATE_LIMIT_RPD in kinds:
-            return long_form.WAITING_DAILY_QUOTA
-        if google_ai.ERROR_RATE_LIMIT_RPM in kinds:
-            return long_form.WAITING_RATE_LIMIT
-        return None
+    def _quota_kind_from_result(result: dict):
+        return quota_signals.quota_kind_from_result(result)
 
     def _record_stage_failure(self, stage: str, exc, result, *, actor: str,
                               started: float, event: str) -> None:
@@ -537,26 +568,12 @@ class LongFormStudio:
         self.log_event(event, error_kind=type(exc).__name__, latency_sec=latency)
 
     @staticmethod
-    def _quota_kind_from_exception(exc) -> str | None:
-        """Classify a raised provider error the route did not wrap.
-
-        The pilot's 429 arrived as a bare exception, so reading only
-        `provider_attempts` missed it.
-        """
-        kind = google_ai.classify_google_error(exc)
-        if kind == google_ai.ERROR_BILLING_QUOTA:
-            return long_form.BLOCKED_BILLING
-        if kind == google_ai.ERROR_RATE_LIMIT_RPD:
-            return long_form.WAITING_DAILY_QUOTA
-        if kind == google_ai.ERROR_RATE_LIMIT_RPM:
-            return long_form.WAITING_RATE_LIMIT
-        return None
+    def _quota_kind_from_exception(exc):
+        """Classify a raised provider error the route did not wrap."""
+        return quota_signals.quota_kind_from_exception(exc)
 
     def _quota_resume_at(self, quota_kind: str) -> str:
-        now = datetime.now(timezone.utc)
-        if quota_kind == long_form.WAITING_DAILY_QUOTA:
-            return google_ai.next_pacific_reset(now).isoformat()
-        return (now + timedelta(seconds=60)).isoformat()
+        return quota_signals.quota_resume_at(quota_kind)
 
     def plan_tts(self, *, actor: str = "console") -> dict:
         """Rebuild the chunk plan from the CURRENT chapters, keeping valid audio."""
@@ -586,9 +603,12 @@ class LongFormStudio:
         `only_chunk` retries or regenerates exactly one. `max_chunks` bounds a
         single pass so a job can yield; the next pass resumes where this stopped
         because the ledger is on disk, not in memory.
+
+        The pass itself lives in `tts_runner` -- speaking a list of chunks is
+        identical work in every workflow, and only the stage bookkeeping below
+        is long-form's own.
         """
         manifest = self.plan_tts(actor=actor) if not only_chunk else self.chunk_manifest()
-        plan = self.plan()
         pending = tts_chunks.pending_chunks(manifest)
         if only_chunk:
             _index, chunk = tts_chunks.find_chunk(manifest, only_chunk)
@@ -596,161 +616,16 @@ class LongFormStudio:
         if max_chunks:
             pending = pending[:int(max_chunks)]
 
-        audio_dir = self._path(AUDIO_DIRNAME)
-        client = self.service._build_google_client()
-        # One ledger for the whole pass: each chunk is a separate
-        # request and must be counted as one.
-        ledger = self.ledger()
-        produced, failed = 0, 0
-        waiting = None
-        for chunk in pending:
-            if cancel_check is not None and cancel_check():
-                # Between chunks, never inside one: a half-spoken chunk would
-                # have to be discarded anyway.
-                self.log_event("long_form.cancelled", actor=actor,
-                               stage="tts", chunk_id=chunk.get("id"))
-                break
-            tokens = google_ai.estimate_input_tokens(chunk.get("text") or "")
-            quota = self._tts_quota_wait(ledger, chunk["model"], tokens)
-            if not quota.get("ready") and quota.get("state"):
-                manifest = tts_chunks.mark_waiting(
-                    manifest, chunk["id"], state=quota["chunk_state"],
-                    resume_at=quota["resume_at"], reason=quota["reason"])
-                self._write(tts_chunks.MANIFEST_ARTIFACT, manifest, actor=actor)
-                waiting = quota
-                self.log_event(
-                    "tts_chunk.waiting", chunk_id=chunk["id"],
-                    sequence=chunk.get("sequence"), model=chunk.get("model"),
-                    wait_state=quota["state"], resume_at=quota["resume_at"])
-                break
-            if not quota.get("ready"):
-                manifest = tts_chunks.mark_failed(
-                    manifest, chunk["id"],
-                    error=quota.get("reason") or "TTS modeli kullanilamiyor",
-                    error_kind="model_unavailable")
-                self._write(tts_chunks.MANIFEST_ARTIFACT, manifest, actor=actor)
-                failed += 1
-                break
+        outcome = tts_runner.run_chunk_pass(
+            self, manifest=manifest,
+            manifest_artifact=tts_chunks.MANIFEST_ARTIFACT,
+            audio_dir=self._path(AUDIO_DIRNAME), pending=pending,
+            actor=actor, tracker=tracker, cancel_check=cancel_check)
 
-            manifest = tts_chunks.mark_running(manifest, chunk["id"])
-            self._write(tts_chunks.MANIFEST_ARTIFACT, manifest, actor=actor)
-            attempt = int(tts_chunks.find_chunk(manifest, chunk["id"])[1]
-                          .get("attempts") or 1)
-            self.log_event("tts_chunk.started" if attempt == 1 else "tts_chunk.retried",
-                           chunk_id=chunk["id"], sequence=chunk.get("sequence"),
-                           chapter_id=chunk.get("chapter_id"), attempt=attempt,
-                           provider=chunk.get("provider"), model=chunk.get("model"))
-            if tracker is not None:
-                tracker.count(produced, len(pending), unit="parca",
-                              message=f"TTS parcasi {chunk.get('sequence')}")
-            started = time.time()
-            try:
-                result = google_ai.run_google_tts_chunk(
-                    chunk["text"],
-                    tts_chunks.chunk_output_path(audio_dir, chunk),
-                    voice=chunk["voice"], language_code=chunk["language_code"],
-                    narration_direction=chunk.get("narration_direction") or "",
-                    client=client, ledger=ledger, mode="explicit",
-                    overrides={"tts": [chunk["model"]]},
-                    enable_model_fallback=False)
-            except Exception as exc:  # noqa: BLE001 - recorded, never fabricated
-                kind = tts_chunks.classify_error(exception=exc)
-                manifest = tts_chunks.mark_failed(
-                    manifest, chunk["id"], error=f"{type(exc).__name__}: {exc}",
-                    error_kind=kind["kind"])
-                self._write(tts_chunks.MANIFEST_ARTIFACT, manifest, actor=actor)
-                self.log_event("tts_chunk.failed", chunk_id=chunk["id"],
-                               attempt=attempt, error_kind=kind["kind"],
-                               retryable=kind["retryable"],
-                               latency_sec=round(time.time() - started, 3))
-                failed += 1
-                if not kind["retryable"]:
-                    break
-                continue
+        manifest = outcome["manifest"]
+        produced, failed = outcome["produced"], outcome["failed"]
+        waiting, readiness = outcome["waiting"], outcome["readiness"]
 
-            latency = round(time.time() - started, 3)
-            if result.get("status") != "ok" or not result.get("audio_path"):
-                # The route reports "all models failed" without the original
-                # status, so the per-attempt detail is where 401 vs 503 lives.
-                attempts_blob = json.dumps(result.get("provider_attempts") or [],
-                                           ensure_ascii=False, default=str)
-                kind = tts_chunks.classify_error(
-                    status_code=result.get("status_code"),
-                    exception=f"{result.get('status_reason')} {attempts_blob}")
-                quota_kind = self._quota_kind_from_result(result)
-                if quota_kind:
-                    if quota_kind == long_form.BLOCKED_BILLING:
-                        quota = {
-                            "ready": False, "state": long_form.BLOCKED_BILLING,
-                            "chunk_state": tts_chunks.BLOCKED_BILLING,
-                            "resume_at": None,
-                            "reason": (result.get("status_reason") or
-                                       "plan/billing veya kota yapilandirmasi engeli"),
-                            "model": chunk["model"],
-                        }
-                    else:
-                        quota = self._tts_quota_wait(ledger, chunk["model"], tokens)
-                    # A live 429 is authoritative even when its payload omitted
-                    # an exact retry time.
-                    if quota_kind != long_form.BLOCKED_BILLING and quota.get("ready"):
-                        resume_at = datetime.now(timezone.utc) + timedelta(seconds=60)
-                        quota = {
-                            "ready": False, "state": quota_kind,
-                            "chunk_state": (tts_chunks.WAITING_DAILY_QUOTA
-                                            if quota_kind == long_form.WAITING_DAILY_QUOTA
-                                            else tts_chunks.WAITING_RATE_LIMIT),
-                            "resume_at": (google_ai.next_pacific_reset(resume_at).isoformat()
-                                          if quota_kind == long_form.WAITING_DAILY_QUOTA
-                                          else resume_at.isoformat()),
-                            "reason": (result.get("status_reason")
-                                       or "saglayici kota siniri"),
-                            "model": chunk["model"],
-                        }
-                    if quota_kind == long_form.BLOCKED_BILLING:
-                        manifest = tts_chunks.mark_billing_blocked(
-                            manifest, chunk["id"], reason=quota["reason"])
-                    else:
-                        manifest = tts_chunks.mark_waiting(
-                            manifest, chunk["id"], state=quota["chunk_state"],
-                            resume_at=quota["resume_at"], reason=quota["reason"])
-                    self._write(tts_chunks.MANIFEST_ARTIFACT, manifest, actor=actor)
-                    waiting = quota
-                    self.log_event(
-                        ("tts_chunk.blocked_billing"
-                         if quota_kind == long_form.BLOCKED_BILLING
-                         else "tts_chunk.waiting"),
-                        chunk_id=chunk["id"], attempt=attempt,
-                        model=chunk.get("model"), wait_state=quota["state"],
-                        resume_at=quota["resume_at"], latency_sec=latency)
-                    break
-                manifest = tts_chunks.mark_failed(
-                    manifest, chunk["id"],
-                    error=result.get("status_reason") or "TTS basarisiz",
-                    error_kind=kind["kind"])
-                self._write(tts_chunks.MANIFEST_ARTIFACT, manifest, actor=actor)
-                self.log_event("tts_chunk.failed", chunk_id=chunk["id"],
-                               attempt=attempt, error_kind=kind["kind"],
-                               latency_sec=latency,
-                               provider=chunk.get("provider"))
-                failed += 1
-                if not kind["retryable"]:
-                    break
-                continue
-
-            manifest = tts_chunks.mark_completed(
-                manifest, chunk["id"], output_path=result["audio_path"],
-                output_sha256=result["output_audio_sha256"],
-                duration_sec=result.get("duration_sec") or 0.0,
-                latency_sec=latency)
-            self._write(tts_chunks.MANIFEST_ARTIFACT, manifest, actor=actor)
-            self.log_event("tts_chunk.completed", chunk_id=chunk["id"],
-                           sequence=chunk.get("sequence"), attempt=attempt,
-                           duration_sec=result.get("duration_sec"),
-                           latency_sec=latency, provider=chunk.get("provider"),
-                           model=result.get("model_used") or chunk.get("model"))
-            produced += 1
-
-        readiness = tts_chunks.concat_readiness(manifest)
         workflow = self.workflow()
         if readiness["ready"]:
             workflow = long_form.set_stage(workflow, "tts", long_form.COMPLETED,
@@ -1085,6 +960,13 @@ class LongFormStudio:
         workflow = self.workflow()
         chapters_record = self.chapters() or {}
         manifest = self.chunk_manifest()
+        broll = self.broll_plan()
+        stock_providers = []
+        for kind, label in (("pexels", "Pexels"), ("pixabay", "Pixabay")):
+            reference = self.service.secrets.reference(kind)
+            stock_providers.append({"id": kind, "label": label,
+                                    "configured": reference.configured,
+                                    "alias_used": reference.alias_used})
         return {
             "available": bool(plan),
             "plan": plan,
@@ -1102,6 +984,11 @@ class LongFormStudio:
             "full_script": long_form_script.full_script_text(chapters_record),
             "consistency": self.consistency(),
             "tts": tts_chunks.summarise(manifest),
+            "broll": {**stock_media.summary(broll, chapters_record),
+                      "providers": stock_providers,
+                      "provider_calls_are_explicit": True,
+                      "source_credit_note": ("Pexels/Pixabay kaynak sayfasi ve "
+                                             "ureticisi manifestte korunur.")},
             "events": self.events(limit=40),
             "quota": self.quota_summary(),
             "stage_states": list(long_form.STAGE_STATES),

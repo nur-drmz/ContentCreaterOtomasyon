@@ -25,6 +25,7 @@ doğmaz, hiçbir şey yüklenmez.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import struct
 import sys
@@ -38,7 +39,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from creator_console import fixtures  # noqa: E402
 from creator_console.api import ConsoleApi  # noqa: E402
 from creator_console.app import ConsoleApp, ConsoleConfig  # noqa: E402
-from local_pipeline import google_ai, long_form, tts_chunks  # noqa: E402
+from local_pipeline import google_ai, long_form, long_form_script, tts_chunks  # noqa: E402
 
 FAILURES: list = []
 CHECKS = 0
@@ -125,7 +126,9 @@ class FakeGoogle:
     def generate_content(self, *, model, contents, config=None, **_kwargs):
         is_tts = bool(config and "AUDIO" in (config.get("response_modalities") or []))
         self.calls.append({"model": model, "tts": is_tts,
-                           "chars": len(str(contents))})
+                           "chars": len(str(contents)),
+                           "contents": str(contents),
+                           "config": dict(config or {})})
         if is_tts:
             self.tts_calls += 1
             if self.tts_calls in self.fail_tts_sequence:
@@ -299,6 +302,42 @@ def main() -> int:
           str([ch["word_count"] for ch in chapters]))
     biggest = max(c["chars"] for c in chapter_calls)
     check(biggest < 30000, "2-tek-dev-prompt-yok", f"en buyuk istek {biggest} karakter")
+
+    # -- ortak onek: implicit context cache bolumler arasinda tutmali --------
+    # Bolum prompt'u degisken kismi (bolum no/baslik) basa koyarsa Gemini'nin
+    # ortuk cache'i HIC calismaz: alti bolum, ayni olgu/sozluk blogunun alti
+    # tam fiyatli kopyasi demektir. Bu kontrol, birinin o sirayi geri
+    # cevirmesini yakalar.
+    chapter_bodies = [c["contents"] for c in chapter_calls
+                      if "SIMDI YAZILACAK BOLUM" in c["contents"]]
+    check(len(chapter_bodies) == 6, "2-cache-alti-bolum-prompt-kaydedildi",
+          str(len(chapter_bodies)))
+    shared = os.path.commonprefix(chapter_bodies) if chapter_bodies else ""
+    expected_prefix = long_form_script.build_chapter_prompt_prefix(
+        long_form_script.build_story_bible(studio.plan(), studio.research(),
+                                           studio.outline(), index=1))
+    check(shared.startswith(expected_prefix),
+          "2-cache-ortak-onek-tam-story-bible",
+          f"ortak onek {len(shared)} karakter, beklenen en az {len(expected_prefix)}")
+    shortest = min(len(b) for b in chapter_bodies) if chapter_bodies else 1
+    check(len(shared) / shortest > 0.5, "2-cache-onek-promptun-yarisindan-fazlasi",
+          f"{len(shared)}/{shortest} = %{100 * len(shared) / shortest:.0f}")
+    check(len({b for b in chapter_bodies}) == 6,
+          "2-cache-onek-bolumleri-ayni-yapmiyor",
+          "her bolum prompt'u hala benzersiz")
+
+    # -- cikti tavani: kacak uretime karsi sinir, ama kesmeyecek kadar genis --
+    chapter_configs = [c["config"] for c in chapter_calls
+                       if "SIMDI YAZILACAK BOLUM" in c["contents"]]
+    expected_cap = google_ai.max_output_tokens_for("script_generation")
+    check(all(cfg.get("max_output_tokens") == expected_cap
+              for cfg in chapter_configs),
+          "2-cikti-tavani-her-bolum-cagrisinda",
+          str({cfg.get("max_output_tokens") for cfg in chapter_configs}))
+    # Bir bolum ~420 kelime; dusunme butcesi AYNI tavandan harcandigi icin
+    # tavanin cikti tahmininin kat kat ustunde olmasi gerekir.
+    check(expected_cap >= 16_000, "2-cikti-tavani-dusunme-butcesine-yer-birakiyor",
+          str(expected_cap))
 
     studio.run_consistency(actor="verify")
     check(studio.consistency()["issue_count"] == 1, "2-tutarlilik-incelemesi-calisti")

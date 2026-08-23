@@ -24,6 +24,8 @@ import hashlib
 import re
 from datetime import datetime, timezone
 
+from . import stage_machine
+
 SCHEMA_VERSION = 1
 WORKFLOW_ARTIFACT = "results/long_form/workflow.json"
 
@@ -50,22 +52,22 @@ STAGE_LABELS = {key: label for key, label, _auto in STAGES}
 #: `completed` only through an explicit approval.
 AUTOMATIC_STAGES = frozenset(key for key, _label, auto in STAGES if auto)
 
-NOT_STARTED = "not_started"
-QUEUED = "queued"
-RUNNING = "running"
-WAITING_RATE_LIMIT = "waiting_rate_limit"
-WAITING_DAILY_QUOTA = "waiting_daily_quota"
-BLOCKED_BILLING = "blocked_billing"
-REVIEW_REQUIRED = "review_required"
-COMPLETED = "completed"
-FAILED = "failed"
-CANCELLED = "cancelled"
-WAITING_STATES = frozenset({WAITING_RATE_LIMIT, WAITING_DAILY_QUOTA})
-BLOCKED_STATES = frozenset({BLOCKED_BILLING})
-STAGE_STATES = (NOT_STARTED, QUEUED, RUNNING, WAITING_RATE_LIMIT,
-                WAITING_DAILY_QUOTA, BLOCKED_BILLING, REVIEW_REQUIRED,
-                COMPLETED, FAILED, CANCELLED)
-TERMINAL_OK = frozenset({COMPLETED})
+# Re-exported so existing callers keep using `long_form.COMPLETED` etc. There is
+# now exactly ONE definition of each, in `stage_machine`.
+NOT_STARTED = stage_machine.NOT_STARTED
+QUEUED = stage_machine.QUEUED
+RUNNING = stage_machine.RUNNING
+WAITING_RATE_LIMIT = stage_machine.WAITING_RATE_LIMIT
+WAITING_DAILY_QUOTA = stage_machine.WAITING_DAILY_QUOTA
+BLOCKED_BILLING = stage_machine.BLOCKED_BILLING
+REVIEW_REQUIRED = stage_machine.REVIEW_REQUIRED
+COMPLETED = stage_machine.COMPLETED
+FAILED = stage_machine.FAILED
+CANCELLED = stage_machine.CANCELLED
+WAITING_STATES = stage_machine.WAITING_STATES
+BLOCKED_STATES = stage_machine.BLOCKED_STATES
+STAGE_STATES = stage_machine.STAGE_STATES
+TERMINAL_OK = stage_machine.TERMINAL_OK
 
 #: Narration pace band. Used for word targets AND for turning a word count back
 #: into an expected duration, so the two cannot drift apart.
@@ -207,191 +209,45 @@ def validate_final_duration(measured_sec) -> dict:
 
 
 # ----------------------------------------------------------------- workflow
+# The mechanics live in `stage_machine.StageMachine`, parameterised by the stage
+# list above. Long-form was the only workflow when they were written, so every
+# function read the module-level STAGE_KEYS directly and a second workflow could
+# not reuse a line of it. The module-level names below are kept EXACTLY as they
+# were so `long_form_studio.py` and `verify_long_form_studio.py` do not change.
+_MACHINE = stage_machine.StageMachine(
+    STAGES, artifact_type="long_form_workflow", schema_version=SCHEMA_VERSION,
+    error_cls=LongFormError)
+
+
 def new_workflow(*, plan_sha256: str = "", ownership=None) -> dict:
-    record = {
-        "schema_version": SCHEMA_VERSION,
-        "artifact_type": "long_form_workflow",
-        "status": NOT_STARTED,
-        "not_uploaded": True,
-        "plan_sha256": plan_sha256,
-        "paused": False,
-        "cancelled": False,
-        "stages": {key: {"state": NOT_STARTED, "started_at": None,
-                         "updated_at": None, "attempts": 0, "error": None,
-                         "detail": None}
-                   for key in STAGE_KEYS},
-        "created_at": _now(),
-        "updated_at": _now(),
-    }
-    if ownership is not None:
-        record.update(ownership.to_dict())
-    return record
+    return _MACHINE.new_workflow(ownership=ownership, plan_sha256=plan_sha256)
 
 
 def stage_state(record, key: str) -> str:
-    return ((record or {}).get("stages") or {}).get(key, {}).get("state", NOT_STARTED)
+    return _MACHINE.stage_state(record, key)
 
 
 def set_stage(record: dict, key: str, state: str, *, error=None, detail=None,
               attempt_delta: int = 0, resume_at=None) -> dict:
-    if key not in STAGE_KEYS:
-        raise LongFormError(f"bilinmeyen asama: {key!r}")
-    if state not in STAGE_STATES:
-        raise LongFormError(f"bilinmeyen asama durumu: {state!r}")
-    record = dict(record or new_workflow())
-    stages = {name: dict(value) for name, value in (record.get("stages") or {}).items()}
-    entry = dict(stages.get(key) or {})
-    entry["state"] = state
-    entry["updated_at"] = _now()
-    entry["attempts"] = int(entry.get("attempts") or 0) + max(0, int(attempt_delta))
-    if state == RUNNING and not entry.get("started_at"):
-        entry["started_at"] = _now()
-    # A sanitized message only: provider payloads and prompts never land here.
-    entry["error"] = (str(error)[:400] if error else None)
-    if state in WAITING_STATES:
-        entry["resume_at"] = str(resume_at or "") or None
-    else:
-        entry["resume_at"] = None
-    if detail is not None:
-        entry["detail"] = detail
-    stages[key] = entry
-    record["stages"] = stages
-    record["updated_at"] = _now()
-    record["status"] = overall_status(record)
-    return record
+    return _MACHINE.set_stage(record, key, state, error=error, detail=detail,
+                              attempt_delta=attempt_delta, resume_at=resume_at)
 
 
 def invalidate_from(record: dict, key: str, *, reason: str = "") -> dict:
-    """Reset `key` and every stage after it.
-
-    Editing chapter 3 cannot leave the consistency review, the audio and the
-    render claiming to describe a script that no longer exists. Resetting
-    FORWARD is the honest response; resetting backward would throw away research
-    that is still perfectly valid.
-    """
-    if key not in STAGE_KEYS:
-        raise LongFormError(f"bilinmeyen asama: {key!r}")
-    record = dict(record or new_workflow())
-    for name in STAGE_KEYS[STAGE_KEYS.index(key):]:
-        if stage_state(record, name) != NOT_STARTED:
-            record = set_stage(record, name, NOT_STARTED,
-                               detail=(reason or "yukari-akis degisti"))
-    return record
+    return _MACHINE.invalidate_from(record, key, reason=reason)
 
 
 def next_stage(record):
-    """The first stage that still has work, or None when everything is done.
-
-    Blocked stages stop the walk instead of being skipped: rendering while the
-    script review is still open is exactly the failure the review exists to
-    prevent.
-    """
-    if (record or {}).get("cancelled"):
-        return None
-    for key in STAGE_KEYS:
-        if stage_state(record, key) in TERMINAL_OK:
-            continue
-        return key
-    return None
-
-
-def _parse_moment(value):
-    try:
-        moment = datetime.fromisoformat(str(value or ""))
-    except (TypeError, ValueError):
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment
+    return _MACHINE.next_stage(record)
 
 
 def runnable_stage(record, *, now=None) -> dict:
-    """What a job may pick up right now, and if nothing, why not."""
-    if (record or {}).get("cancelled"):
-        return {"stage": None, "blocked": True, "reason": "is akisi iptal edildi"}
-    if (record or {}).get("paused"):
-        return {"stage": None, "blocked": True, "reason": "is akisi duraklatildi"}
-    key = next_stage(record)
-    if key is None:
-        return {"stage": None, "blocked": False, "reason": "tum asamalar tamam"}
-    state = stage_state(record, key)
-    if key not in AUTOMATIC_STAGES:
-        return {"stage": key, "blocked": True,
-                "reason": f"{STAGE_LABELS[key]} insan onayi bekliyor"}
-    if state == RUNNING:
-        return {"stage": key, "blocked": True,
-                "reason": f"{STAGE_LABELS[key]} zaten calisiyor"}
-    if state == BLOCKED_BILLING:
-        return {
-            "stage": key, "blocked": True, "billing_blocked": True,
-            "reason": (f"{STAGE_LABELS[key]} Google AI Studio plan/billing veya "
-                       "kota yapilandirmasi nedeniyle durdu; ayarlari duzelttikten "
-                       "sonra acikca yeniden deneyin"),
-        }
-    if state in WAITING_STATES:
-        entry = ((record or {}).get("stages") or {}).get(key, {})
-        resume_at = _parse_moment(entry.get("resume_at"))
-        current = now or datetime.now(timezone.utc)
-        if current.tzinfo is None:
-            current = current.replace(tzinfo=timezone.utc)
-        if resume_at is not None and current < resume_at:
-            wait_seconds = max(1, int((resume_at - current).total_seconds()))
-            label = ("dakika kotasi" if state == WAITING_RATE_LIMIT
-                     else "gunluk kota")
-            return {"stage": key, "blocked": True, "waiting": True,
-                    "wait_state": state, "resume_at": resume_at.isoformat(),
-                    "wait_seconds": wait_seconds,
-                    "reason": (f"{STAGE_LABELS[key]} {label} nedeniyle "
-                               f"bekliyor; {resume_at.isoformat()} sonrasinda "
-                               "devam edebilir")}
-    return {"stage": key, "blocked": False,
-            "reason": f"{STAGE_LABELS[key]} calistirilabilir"}
+    return _MACHINE.runnable_stage(record, now=now)
 
 
 def overall_status(record) -> str:
-    if (record or {}).get("cancelled"):
-        return CANCELLED
-    states = [stage_state(record, key) for key in STAGE_KEYS]
-    if all(state == COMPLETED for state in states):
-        return COMPLETED
-    if any(state == FAILED for state in states):
-        return FAILED
-    if any(state == RUNNING for state in states):
-        return RUNNING
-    if any(state == BLOCKED_BILLING for state in states):
-        return BLOCKED_BILLING
-    if any(state == WAITING_DAILY_QUOTA for state in states):
-        return WAITING_DAILY_QUOTA
-    if any(state == WAITING_RATE_LIMIT for state in states):
-        return WAITING_RATE_LIMIT
-    if any(state == REVIEW_REQUIRED for state in states):
-        return REVIEW_REQUIRED
-    if all(state == NOT_STARTED for state in states):
-        return NOT_STARTED
-    return QUEUED
+    return _MACHINE.overall_status(record)
 
 
 def progress_summary(record) -> dict:
-    stages = (record or {}).get("stages") or {}
-    states = {key: stage_state(record, key) for key in STAGE_KEYS}
-    done = len([key for key, state in states.items() if state == COMPLETED])
-    return {
-        "stages": [
-            {"key": key, "label": STAGE_LABELS[key], "state": states[key],
-             "automatic": key in AUTOMATIC_STAGES,
-             "attempts": stages.get(key, {}).get("attempts", 0),
-             "error": stages.get(key, {}).get("error"),
-             "detail": stages.get(key, {}).get("detail"),
-             "resume_at": stages.get(key, {}).get("resume_at"),
-             "started_at": stages.get(key, {}).get("started_at"),
-             "updated_at": stages.get(key, {}).get("updated_at")}
-            for key in STAGE_KEYS
-        ],
-        "completed_count": done,
-        "total_count": len(STAGE_KEYS),
-        "percent": round(done / len(STAGE_KEYS) * 100),
-        "status": overall_status(record),
-        "paused": bool((record or {}).get("paused")),
-        "cancelled": bool((record or {}).get("cancelled")),
-        "next": runnable_stage(record),
-    }
+    return _MACHINE.progress_summary(record)

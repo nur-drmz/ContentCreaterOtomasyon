@@ -267,13 +267,18 @@ def build_story_bible(plan: dict, research: dict, outline: dict, *, index: int,
     }
 
 
-def build_chapter_prompt(bible: dict) -> str:
-    current = bible.get("current_chapter") or {}
+def build_chapter_prompt_prefix(bible: dict) -> str:
+    """The part of the chapter prompt that is IDENTICAL for every chapter.
+
+    Kept first, and kept byte-identical, on purpose: Gemini's implicit context
+    cache only fires on a shared PREFIX. Before this split the chapter number
+    and title led the prompt, so twelve chapters meant twelve full-price copies
+    of the same topic/thesis/facts/glossary block. Anything chapter-specific
+    belongs in `build_chapter_prompt_suffix`, never here -- one interpolated
+    index at the top silently disables the cache for the whole run.
+    """
     return "\n".join([
-        "Bu uzun-form videonun SADECE su bolumunu yaz.",
-        f"Bolum {current.get('index')}: {current.get('title')}",
-        f"Bolum amaci: {current.get('goal')}",
-        f"Hedef kelime: {current.get('target_words')} (+/- %15)",
+        "Bu uzun-form videonun bolumlerini tek tek yaziyorsun.",
         "",
         f"Konu: {bible.get('topic')}",
         f"Tez: {bible.get('thesis')}",
@@ -286,11 +291,8 @@ def build_chapter_prompt(bible: dict) -> str:
         "Sozluk:",
         "\n".join(f"- {item}" for item in (bible.get("glossary") or [])) or "- (yok)",
         "",
-        f"Onceki bolum ozeti: {bible.get('previous_chapter_summary') or '(ilk bolum)'}",
-        f"Sonraki bolumun amaci: {bible.get('next_chapter_goal')}",
-        "",
         "KURALLAR:",
-        "- Sadece bu bolumu yaz; sonraki bolumun icerigine girme.",
+        "- Sadece istenen bolumu yaz; sonraki bolumun icerigine girme.",
         "- Onceki bolumde soylenenleri tekrar etme.",
         "- Seslendirilecek duz anlatim metni yaz (sahne yonergesi, baslik yok).",
         "- Yorum yapiyorsan bunu dilde belli et; olgu gibi sunma.",
@@ -299,6 +301,27 @@ def build_chapter_prompt(bible: dict) -> str:
         '{"text": "...", "summary": "...", "uses_facts": ["..."],'
         ' "interpretation_notes": ["..."]}',
     ])
+
+
+def build_chapter_prompt_suffix(bible: dict) -> str:
+    """The chapter-specific tail. Last, so the invariant prefix stays cacheable
+    and the concrete instruction is still the most recent thing the model read."""
+    current = bible.get("current_chapter") or {}
+    return "\n".join([
+        "",
+        "--- SIMDI YAZILACAK BOLUM ---",
+        f"Bolum {current.get('index')}: {current.get('title')}",
+        f"Bolum amaci: {current.get('goal')}",
+        f"Hedef kelime: {current.get('target_words')} (+/- %15)",
+        f"Onceki bolum ozeti: {bible.get('previous_chapter_summary') or '(ilk bolum)'}",
+        f"Sonraki bolumun amaci: {bible.get('next_chapter_goal')}",
+        "",
+        "SADECE bu bolumu, yukaridaki JSON sozlesmesine uyarak dondur.",
+    ])
+
+
+def build_chapter_prompt(bible: dict) -> str:
+    return build_chapter_prompt_prefix(bible) + "\n" + build_chapter_prompt_suffix(bible)
 
 
 def parse_chapter(raw, bible: dict) -> dict:
