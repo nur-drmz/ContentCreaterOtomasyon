@@ -187,6 +187,81 @@ def call_groq_text(prompt: str, *, model: str = "openai/gpt-oss-120b", secret_ge
         return _failed("groq", capability, model, exc, credential)
 
 
+#: capability -> the non-Google adapters, in the order CROSS_PROVIDER_ROUTES
+#: declares them. Google is not here: it is executed by its own router, which
+#: owns the quota ledger and the circuit breaker.
+CROSS_PROVIDER_TEXT_CALLS = {}
+
+
+def continue_text_route(google_result: dict, prompt: str, *,
+                        capability: str = "high_quality_text",
+                        secret_getter=None, transport=None,
+                        fallback_error_kinds=()) -> dict:
+    """Carry a FAILED Google text route onto the cross-provider chain.
+
+    Google runs first and on its own terms -- this never pre-empts it, because
+    the Google router is what holds the quota ledger, the circuit breaker and
+    the structured-output validation. Only once that route is exhausted does
+    this try Groq, then Cloudflare.
+
+    A provider switch is never silent. The returned envelope keeps Google's
+    `provider_attempts` and appends one entry per provider tried, sets
+    `fallback_used` and names the reason, so the artifact records which model
+    actually wrote the text.
+
+    A route that failed for a reason another provider cannot fix -- a safety
+    refusal, a missing credential, output the caller rejected as invalid -- is
+    returned untouched. Retrying those elsewhere would launder a refusal into
+    an answer.
+    """
+    result = dict(google_result or {})
+    if result.get("status") == "ok":
+        return result
+    kind = result.get("error_kind")
+    if fallback_error_kinds and kind is not None and kind not in fallback_error_kinds:
+        return result
+
+    attempts = list(result.get("provider_attempts") or [])
+    chain = [(name, model) for name, model in
+             (CROSS_PROVIDER_ROUTES.get(capability) or ()) if name != "google"]
+    for name, model in chain:
+        call = CROSS_PROVIDER_TEXT_CALLS.get(name)
+        if call is None:
+            continue
+        attempt = call(prompt, model=model, secret_getter=secret_getter,
+                       transport=transport, capability=capability)
+        attempts.append({"provider": name, "model": attempt.get("model"),
+                         "ok": bool(attempt.get("ok")),
+                         "skipped": bool(attempt.get("skipped")),
+                         "error": attempt.get("error"),
+                         "status": attempt.get("status")})
+        if attempt.get("ok") and str(attempt.get("output") or "").strip():
+            result.update({
+                "provider": name,
+                "model": attempt.get("model"),
+                "output": attempt.get("output"),
+                "usage_metadata": attempt.get("usage_metadata"),
+                "status": "ok",
+                "status_reason": (
+                    "Google rotasi tukendi; metin {0} ({1}) tarafindan uretildi"
+                    .format(name, attempt.get("model"))),
+                "fallback_used": True,
+                "fallback_reason": (
+                    "google:{0}".format(kind or result.get("status") or "failed")),
+                "provider_attempts": attempts,
+                "cross_provider": True,
+            })
+            return result
+
+    result["provider_attempts"] = attempts
+    result["cross_provider"] = True
+    tried = ", ".join(name for name, _ in chain) or "(yok)"
+    result["status_reason"] = (
+        (result.get("status_reason") or "")
+        + f" | capraz saglayici zinciri de uretemedi ({tried})").strip(" |")
+    return result
+
+
 def call_groq_transcription(audio_bytes: bytes, *, model: str = "whisper-large-v3-turbo",
                             secret_getter=None, transport=None, filename: str = "audio.wav") -> dict:
     """Optional transcription fallback. faster-whisper stays PRIMARY -- this only
@@ -341,6 +416,15 @@ def call_azure_tts(script_text: str, out_path, *, voice: str = "tr-TR-AhmetNeura
 #: Verified-at-write-time Turkish Edge voices. Edge exposes hundreds of voices
 #: and the catalog changes remotely, so this is a CURATED DEFAULT SET, not the
 #: whole catalog: `voice` accepts any well-formed `xx-XX-NameNeural` id.
+#: Filled here rather than at the definition site so the mapping cannot drift
+#: out of step with CROSS_PROVIDER_ROUTES: every non-google entry it names for a
+#: text capability must resolve to a callable below.
+CROSS_PROVIDER_TEXT_CALLS.update({
+    "groq": call_groq_text,
+    "cloudflare": call_cloudflare_text,
+})
+
+
 EDGE_TURKISH_VOICES = ("tr-TR-AhmetNeural", "tr-TR-EmelNeural")
 DEFAULT_EDGE_VOICE = "tr-TR-AhmetNeural"
 

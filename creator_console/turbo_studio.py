@@ -26,9 +26,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from local_pipeline import (google_ai, music_library, render_utils,
-                            stock_media, timeline, turbo, turbo_script,
-                            tts_chunks, stage_machine)
+from local_pipeline import (google_ai, music_library, provider_adapters,
+                            render_utils, stock_media, timeline, turbo,
+                            turbo_script, tts_chunks, stage_machine)
 
 from . import quota_signals, tts_runner
 
@@ -319,10 +319,18 @@ class TurboStudio:
         result = None
         try:
             client = self.service._build_google_client()
+            prompt = turbo_script.build_script_prompt(
+                brief, instructions=instructions)
             result = google_ai._text_task(
-                "script_generation",
-                turbo_script.build_script_prompt(brief, instructions=instructions),
+                "script_generation", prompt,
                 client=client, ledger=self.ledger())
+            # Google first, always: it owns the quota ledger and the circuit
+            # breaker. Only a route that is genuinely exhausted continues onto
+            # Groq/Cloudflare, and the artifact records which model answered.
+            result = provider_adapters.continue_text_route(
+                result, prompt, capability="high_quality_text",
+                secret_getter=self.service.secrets.getter,
+                fallback_error_kinds=google_ai.FALLBACK_ERROR_KINDS)
             if result.get("status") != "ok":
                 raise TurboError(result.get("status_reason") or "script uretimi basarisiz")
             script = turbo_script.parse_script(result.get("output"), brief)
@@ -331,7 +339,10 @@ class TurboStudio:
                                        started=started, event="script.failed")
             raise
         script["provider"] = result.get("provider")
-        script["model"] = result.get("model_used")
+        script["model"] = result.get("model_used") or result.get("model")
+        script["fallback_used"] = bool(result.get("fallback_used"))
+        script["fallback_reason"] = result.get("fallback_reason")
+        script["provider_attempts"] = list(result.get("provider_attempts") or [])
         self._write(turbo.SCRIPT_ARTIFACT, script, actor=actor)
         self._save_workflow(turbo.set_stage(
             self._require_workflow(), "script", turbo.COMPLETED,

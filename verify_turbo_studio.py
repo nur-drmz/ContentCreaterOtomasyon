@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from local_pipeline import turbo                      # noqa: E402
 from local_pipeline import stage_machine              # noqa: E402
 from local_pipeline import render_utils              # noqa: E402
+from local_pipeline import google_ai                 # noqa: E402
 
 CHECKS = 0
 FAILURES = 0
@@ -1403,6 +1404,86 @@ def test_image_clips_and_ken_burns():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_cross_provider_text():
+    section("L. Capraz saglayici metin zinciri (sahte transport)")
+    from local_pipeline import provider_adapters as pa
+
+    def secrets(name):
+        return {"GROQ_API_KEY": "FAKE-GROQ-" + "0" * 10,
+                "CLOUDFLARE_ACCOUNT_ID": "FAKE-ACC",
+                "CLOUDFLARE_AUTH_TOKEN": "FAKE-TOKEN"}.get(name)
+
+    def groq_transport(method, url, headers=None, json_body=None, **_kw):
+        calls.append(url)
+        return 200, {"choices": [{"message": {"content": "GROQ METNI"}}],
+                     "usage": {"total_tokens": 12}}
+
+    # A Google route that SUCCEEDED must never be second-guessed.
+    calls = []
+    ok_route = {"status": "ok", "provider": "google", "model": "gemini-3.6-flash",
+                "output": "GOOGLE METNI", "provider_attempts": []}
+    carried = pa.continue_text_route(ok_route, "prompt", secret_getter=secrets,
+                                     transport=groq_transport)
+    check(carried["provider"] == "google" and carried["output"] == "GOOGLE METNI",
+          "google-BASARILIYKEN-yedege-GECILMEZ", str(carried.get("provider")))
+    check(not calls, "basarili-rotada-hicbir-yedek-CAGRILMADI", str(calls))
+    check(not carried.get("fallback_used"), "basarili-rotada-fallback-isareti-YOK")
+
+    # An exhausted Google route continues, and says so.
+    calls = []
+    dead_route = {"status": "failed", "provider": "google", "model": None,
+                  "output": None, "error_kind": google_ai.ERROR_RATE_LIMIT_RPD,
+                  "status_reason": "gunluk kota doldu",
+                  "provider_attempts": [{"provider": "google", "ok": False}]}
+    switched = pa.continue_text_route(
+        dead_route, "prompt", secret_getter=secrets, transport=groq_transport,
+        fallback_error_kinds=google_ai.FALLBACK_ERROR_KINDS)
+    check(switched["status"] == "ok" and switched["output"] == "GROQ METNI",
+          "kota-dolunca-GROQ-uretiyor", str(switched.get("status")))
+    check(switched["provider"] == "groq", "kayit-GERCEK-saglayiciyi-soyluyor",
+          str(switched.get("provider")))
+    check(switched["fallback_used"] is True, "gecis-SESSIZ-DEGIL")
+    check("rate_limit_rpd" in str(switched.get("fallback_reason")),
+          "gecis-NEDENI-kayitli", str(switched.get("fallback_reason")))
+    providers = [a["provider"] for a in switched["provider_attempts"]]
+    check(providers[0] == "google" and "groq" in providers,
+          "google-denemesi-kayitta-KALIYOR", str(providers))
+
+    # A refusal is not a routing problem: retrying it elsewhere would launder
+    # a refusal into an answer.
+    calls = []
+    refused = {"status": "failed", "provider": "google", "output": None,
+               "error_kind": google_ai.ERROR_SAFETY,
+               "status_reason": "guvenlik reddi", "provider_attempts": []}
+    kept = pa.continue_text_route(
+        refused, "prompt", secret_getter=secrets, transport=groq_transport,
+        fallback_error_kinds=google_ai.FALLBACK_ERROR_KINDS)
+    check(kept["status"] == "failed", "GUVENLIK-REDDI-yedege-TASINMAZ",
+          str(kept.get("status")))
+    check(not calls, "reddedilen-istek-baska-saglayiciya-GONDERILMEDI", str(calls))
+
+    # No keys: the chain skips cleanly and the failure still names Google's
+    # reason rather than inventing a new one.
+    calls = []
+    nothing = pa.continue_text_route(
+        dict(dead_route), "prompt", secret_getter=lambda name: None,
+        transport=groq_transport,
+        fallback_error_kinds=google_ai.FALLBACK_ERROR_KINDS)
+    check(nothing["status"] == "failed", "anahtarsiz-zincir-uretmez")
+    check("gunluk kota doldu" in nothing["status_reason"],
+          "google-nedeni-KORUNUYOR", nothing["status_reason"][:70])
+    check(all(a.get("skipped") for a in nothing["provider_attempts"]
+              if a["provider"] != "google"),
+          "anahtarsiz-saglayicilar-TEMIZ-atlandi",
+          str(nothing["provider_attempts"]))
+    check(not calls, "anahtarsizken-HTTP-cagrisi-YOK", str(calls))
+
+    # And no secret reaches the record.
+    blob = json.dumps(switched) + json.dumps(nothing)
+    check("FAKE-GROQ" not in blob and "FAKE-TOKEN" not in blob,
+          "capraz-saglayici-kaydinda-SIR-YOK")
+
+
 def test_music_licensing():
     section("N. Muzik lisansi (hicbir parca telifsiz ilan edilmez)")
 
@@ -1824,6 +1905,7 @@ def main():
     test_timeline_revisions()
     test_real_render()
     test_image_clips_and_ken_burns()
+    test_cross_provider_text()
     test_music_licensing()
     test_render_gating()
     test_env_contract()

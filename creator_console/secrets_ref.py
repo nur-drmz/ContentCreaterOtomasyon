@@ -84,6 +84,16 @@ class SecretResolver:
     def __init__(self, getter=None):
         self._getter = getter or (lambda name: os.environ.get(name))
 
+    @property
+    def getter(self):
+        """The injected lookup, for adapters that resolve their OWN secrets.
+
+        Exposed deliberately and read-only: `provider_adapters` needs the same
+        source this resolver reads, and reaching into `_getter` from another
+        module would make the injection point invisible.
+        """
+        return self._getter
+
     def reference(self, kind: str) -> SecretReference:
         credential = self.credential(kind)
         # Registering here means every persistence path can scrub this value even
