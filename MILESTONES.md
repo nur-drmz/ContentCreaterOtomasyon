@@ -42,30 +42,42 @@ Her revizyonda yalnızca şunlar güncellenir:
 - Upload otomatik değildir; ilk yükleme yalnız `private`, görünürlük değişimi ayrı onaylıdır.
 - Her output slotu ayrı moment, render, inceleme listesi ve onay taşır.
 
-## 3. Genel durum panosu
+## 3. Milestone yapılacaklar listesi
 
-| ID | Milestone | Durum | Öncelik | Sonraki kapanış kanıtı |
-|---|---|---|---|---|
-| M0.0 | Planlama ve güvenlik | `in_progress` | P0 | MVP kabul kriterlerinin son onayı |
-| M0.05 | Faz 0 kaynak stratejisi | `verification_required` | P0 | Gerçek Colab mod/plan/kapı doğrulaması |
-| M0.1 | Tek-video analiz | `verification_required` | P0 | Gerçek momentlerin görsel doğrulaması |
-| M0.2 | Moment Explorer | `verification_required` | P1 | Preview izleme ve seçim kanıtı |
-| M0.3 | Script Studio | `verification_required` | P0 | Gerçek script kalite kabulü |
-| M0.4 | Voice Studio | `verification_required` | P0 | Gerçek TTS dinleme ve onay |
-| M0.5 | Uçtan uca Short PoC | `in_progress` | P0 | İzlenmiş final Short ve tam onay zinciri |
-| M0.6 | Temel edit/render | `verification_required` | P0 | 1080×1920 görsel kalite kabulü |
-| M0.7 | Private upload | `verification_required` | P2 | Gerçek OAuth ile private upload E2E |
-| M0.8 | Analytics | `not_started` | P2 | Gerçek yayın sonrası metrik toplama |
-| M0.9 | Creator Console | `verification_required` | P1 | Responsive/erişilebilirlik kabulü |
-| M0.10 | Tam film + batch Short | `verification_required` | P0 | Gerçek uzun film ve ayrı Short onayları |
-| M0.11 | Montaj motoru | `in_progress` | P1 | Sesli, müzikli, izlenmiş çoklu segment edit |
-| M0.12 | Konsol sadeleştirme | `not_started` | P1 | Tek ekranda sade batch/montaj akışı |
-| M0.13 | Long-form Studio | `verification_required` | P1 | Gerçek 15–20 dk pilot ve insan izlemesi |
-| R0.1 | YouTube araştırma | `verification_required` | P2 | Gerçek keşif ve CSV incelemesi |
-| R0.2 | Viral potansiyel | `in_progress` | P2 | Gerçek veride holdout/kalibrasyon |
-| M1.0 | Çoklu kanal | `not_started` | P3 | Kanal izolasyon testleri |
-| M1.1 | Web/mobil beta | `not_started` | P3 | Mobil onay ve izleme betası |
-| M2.0 | SaaS ve ölçek | `deferred` | P4 | MVP sonrası |
+Milestone checkbox'ı yalnızca alt görevler ve kapanış kanıtı tamamlandığında
+işaretlenir. Parantez içindeki değer mevcut durumdur.
+
+### P0 — Ana üretim kapıları
+
+- [ ] **M0.0 — Planlama ve güvenlik** (`in_progress`) — MVP kabul kriterlerinin son onayı.
+- [ ] **M0.05 — Faz 0 kaynak stratejisi** (`verification_required`) — gerçek Colab mod/plan/kapı doğrulaması.
+- [ ] **M0.1 — Tek-video analiz** (`verification_required`) — gerçek momentlerin görsel doğrulaması.
+- [ ] **M0.3 — Script Studio** (`verification_required`) — gerçek script kalite kabulü.
+- [ ] **M0.4 — Voice Studio** (`verification_required`) — gerçek TTS dinleme ve onay.
+- [ ] **M0.5 — Uçtan uca Short PoC** (`in_progress`) — izlenmiş final Short ve tam onay zinciri.
+- [ ] **M0.6 — Temel edit/render** (`verification_required`) — 1080×1920 görsel kalite kabulü.
+- [ ] **M0.10 — Tam film + batch Short** (`verification_required`) — gerçek uzun film ve ayrı Short onayları.
+
+### P1 — Ürün deneyimi ve genişletme
+
+- [ ] **M0.2 — Moment Explorer** (`verification_required`) — preview izleme ve seçim kanıtı.
+- [ ] **M0.9 — Creator Console** (`verification_required`) — responsive/erişilebilirlik kabulü.
+- [ ] **M0.11 — Montaj motoru** (`in_progress`) — sesli, müzikli, izlenmiş çoklu segment edit.
+- [ ] **M0.12 — Konsol sadeleştirme** (`not_started`) — tek ekranda sade batch/montaj akışı.
+- [ ] **M0.13 — Long-form Studio** (`verification_required`) — gerçek 15–20 dk pilot ve insan izlemesi.
+
+### P2 — Yayın ve araştırma
+
+- [ ] **M0.7 — Private upload** (`verification_required`) — gerçek OAuth ile private upload E2E.
+- [ ] **M0.8 — Analytics** (`not_started`) — gerçek yayın sonrası metrik toplama.
+- [ ] **R0.1 — YouTube araştırma** (`verification_required`) — gerçek keşif ve CSV incelemesi.
+- [ ] **R0.2 — Viral potansiyel** (`in_progress`) — gerçek veride holdout/kalibrasyon.
+
+### P3–P4 — Sonraki sürümler
+
+- [ ] **M1.0 — Çoklu kanal** (`not_started`) — kanal izolasyon testleri.
+- [ ] **M1.1 — Web/mobil beta** (`not_started`) — mobil onay ve izleme betası.
+- [ ] **M2.0 — SaaS ve ölçek** (`deferred`) — MVP sonrasında yeniden planlanacak.
 
 ## 4. Açık görevler — tek gerçek kaynak
 
@@ -188,10 +200,20 @@ tekrarlanmaz.
 - [ ] Final render 1080×1920 üretilip izlenmeli.
 - [ ] Altyazı okunabilirliği ve konuşma senkronu kabul edilmeli.
 - [ ] İsteğe bağlı voice-over anlaşılır ve ses dengesi kabul edilmiş olmalı.
-- [ ] Teknik doğrulama video ve ses stream'lerini başarılı bulmalı.
-- [ ] Render manifestindeki bütün üst-akış onay koşulları `True` olmalı.
-- [ ] `final_short.mp4` hiçbir platforma otomatik yüklenmemiş olmalı.
-- [ ] Çalıştırma özeti ve hata dosyaları saklanmalı.
+- [x] Teknik doğrulama video ve ses stream'lerini başarılı bulmalı.
+  `verify_short_poc.py`: `has_video_stream` ve `has_audio_stream` True, ffprobe
+  ile dosyada gerçek ses akışı doğrulandı.
+- [x] Render manifestindeki bütün üst-akış onay koşulları `True` olmalı.
+  `manifest["approval"]["conditions"]` tamamen True, `failed_conditions` boş;
+  zincirde plan/script/voiceover `effective_valid`, render insan onayını bekliyor.
+- [x] `final_short.mp4` hiçbir platforma otomatik yüklenmemiş olmalı.
+  `not_uploaded` True, `publish_manifest` üretilmiyor, sıfır yükleme çağrısı.
+- [x] Çalıştırma özeti ve hata dosyaları saklanmalı.
+  İş geçmişi dört fazı da taşıyor, reddedilen erken render denemesi NEDENİYLE
+  birlikte saklanıyor, audit izi kalıcı ve sır içermiyor.
+- [ ] **Ek bulgu:** final 1080×1920 yolu (`preview_mode=False`) bu pakete kadar
+  hiçbir testte çalışmamıştı; artık çalışıyor (**31/31**). Gerçek kaynakla
+  tekrarlanması hâlâ M0.10 kabul koşusuna bağlı.
 
 ### M0.6 — Edit/render kalitesi
 
@@ -285,6 +307,7 @@ Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları ar�
 | Tarayıcı UI | `verify_browser.py` **243/243** | Mobil/erişilebilirlik gözlemi |
 | Canlı Gemini script | `LIVE_SCRIPT_OK`, tek gerçek çağrı | Script kalite yargısı |
 | Canlı Gemini TTS | `LIVE_TTS_OK`, tek gerçek çağrı | WAV/voice karşılaştırmalı dinleme |
+| Short PoC (M0.5) | `verify_short_poc.py` **31/31**, final 1080×1920 | Script okuma, ses dinleme, videoyu izleme |
 | Long-form | `verify_long_form_studio.py` **97/97** | Billing/kota sonrası gerçek 15–20 dk pilot |
 | Stok medya | `verify_stock_media.py` **41/41** (Pexels, Pixabay, Coverr) | Gerçek sağlayıcı araması; **Coverr şeması canlı doğrulanmadı** |
 | Turbo Studio | `verify_turbo_studio.py` **333/333**, tarayıcı **24/24** | Gerçek sağlayıcılar ve izlenmiş final video |
