@@ -277,17 +277,22 @@ Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları ar�
 | Canlı Gemini script | `LIVE_SCRIPT_OK`, tek gerçek çağrı | Script kalite yargısı |
 | Canlı Gemini TTS | `LIVE_TTS_OK`, tek gerçek çağrı | WAV/voice karşılaştırmalı dinleme |
 | Long-form | `verify_long_form_studio.py` **97/97** | Billing/kota sonrası gerçek 15–20 dk pilot |
-| Stok medya | `verify_stock_media.py` 29 kontrol | Gerçek sağlayıcı araması, indirme ve telif incelemesi |
-| Turbo Studio | `verify_turbo_studio.py` 260, tarayıcı 24 kontrol | Gerçek sağlayıcılar ve izlenmiş final video |
+| Stok medya | `verify_stock_media.py` **41/41** (Pexels, Pixabay, Coverr) | Gerçek sağlayıcı araması; **Coverr şeması canlı doğrulanmadı** |
+| Turbo Studio | `verify_turbo_studio.py` **333/333**, tarayıcı **24/24** | Gerçek sağlayıcılar ve izlenmiş final video |
 
 ## 7. Bir sonraki çalışma oturumu
 
 1. `main` `origin/main`e push edildi (`a53b751`); bu madde kapalı.
-2. M0.10 (MoneyPrinter/Turbo yetenek farkı) kapatma devam ediyor:
-   - `local_pipeline/provider_adapters.py`: Edge-TTS + hız/volume normalizasyonu tamam.
-   - `local_pipeline/turbo.py` + `creator_console/turbo_studio.py`: dinamik ASS
-     entegrasyonu yazıldı fakat **commitlenmedi**, doğrulanmadı.
-   - Açık: Coverr, görsel stok/Ken Burns, çoklu LLM sağlayıcı genişletme.
+2. M0.10 (MoneyPrinter/Turbo yetenek farkı): kod tarafı 2026-08-23'te kapandı.
+   - Dinamik ASS altyazı (aktif kelime vurgusu) + caption teması; `subtitle_style`
+     revizyonu artık temayı değiştirip ASS'i yeniden üretiyor.
+   - Coverr üçüncü stok sağlayıcı olarak eklendi.
+   - Görsel klip + Ken Burns: `timeline` klip türü öğrendi, gerçek karışık
+     (video+görsel) ffmpeg render'ı doğrulandı.
+   - Turbo script üretimi Google tükendiğinde Groq/Cloudflare zincirine geçiyor;
+     güvenlik reddi taşınmıyor.
+   - **Açık:** görsel stok ARAMA uçları yok (motor hazır, besleme hattı değil);
+     Coverr şeması canlı bir çağrıyla doğrulanmadı.
 3. Creator Console'da >1 saat gerçek kaynakla final kalite planı oluştur.
 4. Tam kaynak taraması çalıştır; üç ayrı momenti üç slota seç.
 5. Her slot transcript'ini ayrı incele/onayla ve batch renderı çalıştır.
@@ -299,6 +304,12 @@ Ayrıntılı uygulama gerekçeleri, hata öyküleri ve eski test sonuçları ar�
 
 Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive taşınır.
 
+- 2026-08-23 — Turbo yetenek farkı kapandı: dinamik ASS, caption teması, Coverr,
+  görsel klip + Ken Burns, çapraz sağlayıcı script zinciri. `verify_turbo_studio`
+  260 → **333/333**, `verify_stock_media` 29 → **41/41**; tam süpürme **28/28**.
+- 2026-08-23 — Ken Burns hareket testi ilk yazımda sahteydi (kodlanmış kareleri
+  karşılaştırıyordu, hareket kapalıyken de geçiyordu); ham rgb24 piksel ölçümüne
+  çevrildi: pan varken ~95, yokken 0.002 ortalama mutlak fark.
 - 2026-08-23 — Otomasyon `direct_clip_series`'te kilitleniyordu: faz makinesinde
   transcript adımı yoktu, render kapıda reddedilip `phase_attempt_limit` ile ölüyordu.
   `transcript` makine fazı + `transcript_approval` insan kapısı eklendi.
