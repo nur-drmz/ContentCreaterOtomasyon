@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from local_pipeline import turbo                      # noqa: E402
 from local_pipeline import stage_machine              # noqa: E402
+from local_pipeline import render_utils              # noqa: E402
 
 CHECKS = 0
 FAILURES = 0
@@ -142,8 +143,11 @@ def test_revision_matrix():
         check(stale in effect["stale_stages"],
               f"anlatim-yenilemesi-{stale}-bayatlatir")
 
-    for kind in ("frame", "retime", "subtitle_style", "music_volume",
-                 "music_remove"):
+    # `subtitle_style` is deliberately NOT in this group any more: the caption
+    # look now lives in the ASS file's own styles, so changing the theme means
+    # regenerating the subtitles, not re-rendering with a force_style patched
+    # over the top.
+    for kind in ("frame", "retime", "music_volume", "music_remove"):
         effect = turbo.revision_effect(kind)
         check(effect["stale_stages"] == turbo.RENDER_STAGES,
               f"{kind}-yalnizca-render-bayatlatir",
@@ -152,6 +156,17 @@ def test_revision_matrix():
         check("media" in effect["preserved_stages"]
               and "tts" in effect["preserved_stages"],
               f"{kind}-indirmeleri-ve-sesi-korur")
+
+    effect = turbo.revision_effect("subtitle_style")
+    check("subtitles" in effect["stale_stages"],
+          "tema-degisimi-ALTYAZIYI-bayatlatir",
+          "tema degisip ASS yeniden uretilmezse eski gorunum yakilir")
+    check(not effect["manifest_only"], "tema-degisimi-manifest-ici-DEGIL",
+          str(effect))
+    check("media" in effect["preserved_stages"]
+          and "tts" in effect["preserved_stages"],
+          "tema-degisimi-indirmeleri-ve-sesi-korur",
+          str(effect["preserved_stages"]))
 
     effect = turbo.revision_effect("replace_clip")
     check("tts" in effect["preserved_stages"]
@@ -899,6 +914,90 @@ def test_subtitles_stage():
         shutil.rmtree(root, ignore_errors=True)
 
 
+    # --- the theme decides the look, on BOTH paths ---------------------------
+    root = Path(tempfile.mkdtemp(prefix="turbo_subs_theme_"))
+    try:
+        studio = _turbo_up_to_audio(root)
+        previous = install_fake_whisper(with_words=True)
+        try:
+            default_record = studio.run_subtitles()
+            default_body = studio._path(turbo.SUBTITLE_ASS_PATH).read_text(
+                encoding="utf-8")
+
+            # Switch the theme the way the operator does -- through the
+            # revision, not by hand-editing the brief.
+            studio.apply_revision("subtitle_style",
+                                  values={"caption_theme": "game_of_thrones"})
+            check(studio.brief()["caption_theme"] == "game_of_thrones",
+                  "revizyon-temayi-briefe-yazdi",
+                  str(studio.brief().get("caption_theme")))
+            check(turbo.stage_state(studio.workflow(), "subtitles")
+                  != turbo.COMPLETED,
+                  "tema-degisimi-altyazi-asamasini-acar",
+                  turbo.stage_state(studio.workflow(), "subtitles"))
+
+            themed_record = studio.run_subtitles()
+            themed_body = studio._path(turbo.SUBTITLE_ASS_PATH).read_text(
+                encoding="utf-8")
+        finally:
+            _restore_whisper(previous)
+
+        check(themed_record["caption_theme"] == "game_of_thrones",
+              "yeni-tema-kayda-yazildi", str(themed_record.get("caption_theme")))
+        got_font = render_utils.CAPTION_THEME_PROFILES["game_of_thrones"]["font_name"]
+        check(got_font in themed_body and got_font not in default_body,
+              "ASS-YENI-TEMAYLA-yeniden-uretildi",
+              f"{got_font!r} ASS icinde bulunmali")
+        check(themed_record["style"] == {}, "tema-degisse-de-force_style-YOK",
+              str(themed_record.get("style")))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # An unknown theme is refused BEFORE anything is invalidated.
+    root = Path(tempfile.mkdtemp(prefix="turbo_subs_badtheme_"))
+    try:
+        studio = _turbo_up_to_audio(root)
+        previous = install_fake_whisper(with_words=True)
+        try:
+            studio.run_subtitles()
+        finally:
+            _restore_whisper(previous)
+        before_state = turbo.stage_state(studio.workflow(), "subtitles")
+        try:
+            studio.apply_revision("subtitle_style",
+                                  values={"caption_theme": "yok-boyle-tema"})
+            check(False, "bilinmeyen-tema-REDDEDILIR", "kabul edildi")
+        except turbo.TurboError as exc:
+            check("tema" in str(exc).lower(), "bilinmeyen-tema-REDDEDILIR",
+                  str(exc)[:70])
+        check(turbo.stage_state(studio.workflow(), "subtitles") == before_state,
+              "reddedilen-revizyon-HICBIR-SEYI-bayatlatmaz",
+              "gecersiz istek isi geri almamali")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # The degraded path also follows the theme instead of a frozen look.
+    root = Path(tempfile.mkdtemp(prefix="turbo_subs_srttheme_"))
+    try:
+        client = FakeGoogle(beats=3)
+        _app, _api, _pid, studio = seeded_turbo(root, client,
+                                                caption_theme="game_of_thrones")
+        studio.run_script()
+        studio.approve_stage("script_review")
+        studio.run_tts()
+        studio.concat_audio()
+        previous = install_fake_whisper(with_words=False)
+        try:
+            record = studio.run_subtitles()
+        finally:
+            _restore_whisper(previous)
+        profile = render_utils.CAPTION_THEME_PROFILES["game_of_thrones"]
+        check(record["style"].get("font_name") == profile["font_name"],
+              "SRT-force_style-de-TEMADAN-turetiliyor", str(record.get("style")))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_render_helpers():
     section("J. Render yardimcilari (etiket catismasi ve yatay kadraj)")
 
@@ -1538,8 +1637,17 @@ def test_ui_wiring():
 
     for testid in ("turbo-save-brief", "turbo-run-stage", "turbo-media-plan",
                    "turbo-music-none", "turbo-render-preview-btn",
-                   "turbo-render-final-btn"):
+                   "turbo-render-final-btn", "turbo-caption-theme"):
         check(f"'{testid}'" in app_js, f"kontrol-var:{testid}")
+
+    # The theme list comes from the server, never a second copy in JS: a
+    # hardcoded option could offer a look `validate_brief` refuses.
+    check("options.caption_themes" in app_js,
+          "tema-secenekleri-SUNUCUDAN-geliyor",
+          "app.js kendi tema listesini tutmamali")
+    for theme in render_utils.CAPTION_THEME_PROFILES:
+        check(f"'{theme}'" not in app_js.split("function turboBriefCard")[1][:2000],
+              f"tema-{theme}-arayuze-GOMULMEMIS")
 
     # The Phase 1 placeholder must be gone now that the controls are real.
     check("turbo-pending" not in app_js,

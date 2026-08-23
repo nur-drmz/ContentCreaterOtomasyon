@@ -23,7 +23,7 @@ import json
 import re
 from math import ceil
 
-from . import stage_machine
+from . import render_utils, stage_machine
 
 SCHEMA_VERSION = 1
 
@@ -168,6 +168,9 @@ def new_brief(**fields) -> dict:
         "seed_input": "",
         "voice": "",
         "subtitles_enabled": True,
+        # Which caption look to burn. The SAME theme dictionary the main render
+        # path uses, so Turbo is not a second styling system.
+        "caption_theme": "default",
         "music_enabled": False,
         "notes": "",
         "not_uploaded": True,
@@ -209,7 +212,8 @@ def brief_sha256(brief: dict) -> str:
     material = {key: brief.get(key) for key in (
         "topic", "content_type", "language", "duration_sec", "aspect_ratio",
         "fps", "clip_duration_sec", "fit_mode", "transition", "transition_sec",
-        "ordering", "seed_input", "voice", "subtitles_enabled", "music_enabled")}
+        "ordering", "seed_input", "voice", "subtitles_enabled", "caption_theme",
+        "music_enabled")}
     blob = json.dumps(material, sort_keys=True, ensure_ascii=False,
                       separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -271,6 +275,11 @@ def validate_brief(brief: dict) -> dict:
         raise TurboError("gecis su secenklerden biri olmali: "
                          + ", ".join(TRANSITIONS))
 
+    caption_theme = _clean(data.get("caption_theme"), 40) or "default"
+    if caption_theme not in render_utils.CAPTION_THEME_PROFILES:
+        raise TurboError("altyazi temasi su seceneklerden biri olmali: "
+                         + ", ".join(sorted(render_utils.CAPTION_THEME_PROFILES)))
+
     ordering = _clean(data.get("ordering"), 20) or "sequential"
     if ordering not in ORDERINGS:
         raise TurboError("siralama su secenklerden biri olmali: "
@@ -305,6 +314,7 @@ def validate_brief(brief: dict) -> dict:
         seed_input=_clean(data.get("seed_input"), 80),
         voice=_clean(data.get("voice"), 80),
         subtitles_enabled=bool(data.get("subtitles_enabled", True)),
+        caption_theme=caption_theme,
         music_enabled=bool(data.get("music_enabled", False)),
         notes=_clean(data.get("notes"), 1000),
     )
@@ -397,8 +407,12 @@ REVISION_KINDS = {
                         "label": "Kadraj / zoom degisikligi"},
     "retime":          {"changed": (), "manifest_only": True,
                         "label": "Klip suresi degisikligi"},
-    "subtitle_style":  {"changed": (), "manifest_only": True,
-                        "label": "Altyazi stili"},
+    # Not manifest-only any more. The caption look now comes from a THEME that
+    # the ASS file bakes into its own [V4+ Styles], so changing it means
+    # regenerating the subtitles -- patching a force_style over the top would
+    # override the theme and flatten the active-word colouring.
+    "subtitle_style":  {"changed": ("subtitles",), "manifest_only": False,
+                        "label": "Altyazi temasi"},
     "music_volume":    {"changed": (), "manifest_only": True,
                         "label": "Muzik ses duzeyi"},
     "music_remove":    {"changed": (), "manifest_only": True,

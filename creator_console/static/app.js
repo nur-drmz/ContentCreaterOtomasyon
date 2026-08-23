@@ -4048,7 +4048,10 @@ function turboBriefCard() {
       ], 'Karartmali gecis toplam sureyi degistirmez.'),
       turboSelect('turbo-ordering', 'Siralama', 'ordering', [
         ['sequential', 'Script sirasi'], ['seeded_random', 'Seed ile rastgele'],
-      ])),
+      ]),
+      turboSelect('turbo-caption-theme', 'Altyazi temasi', 'caption_theme',
+        (options.caption_themes || ['default']).map(value => [value, value]),
+        'Aktif kelime vurgusunun font ve rengini belirler.')),
     inputField({ id: 'turbo-seed', label: 'Seed (istege bagli)',
       hint: 'Ayni seed ayni klip sirasini uretir; bos birakilirsa script sirasi kullanilir.',
       attrs: { value: draft.seed_input, maxlength: 80,

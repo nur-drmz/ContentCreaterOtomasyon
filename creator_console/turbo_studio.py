@@ -708,7 +708,9 @@ class TurboStudio:
         ass_path = self._path(turbo.SUBTITLE_ASS_PATH)
         render_utils.write_srt(cues, srt_path)
 
-        profile = render_utils.CAPTION_THEME_PROFILES["default"]
+        theme = str(brief.get("caption_theme") or "default")
+        profile = render_utils.CAPTION_THEME_PROFILES.get(
+            theme, render_utils.CAPTION_THEME_PROFILES["default"])
         caption_meta = None
         if words:
             caption_meta = render_utils.write_active_word_ass(
@@ -740,13 +742,15 @@ class TurboStudio:
             "dynamic_word_highlight": bool(words),
             "source": source,
             "degraded": degraded,
-            "caption_theme": "default",
+            "caption_theme": theme,
             "caption_meta": caption_meta,
             # ASS carries its own [V4+ Styles]; force_style would override the
             # theme, so it is only meaningful for the SRT path.
-            "style": ({} if words else
-                      {"font_size": 42, "margin_v": 120, "border_style": 3,
-                       "outline": 2}),
+            "style": ({} if words else {
+                "font_name": profile["font_name"],
+                "font_size": int(profile["font_size"] * 0.6),
+                "margin_v": profile["margin_v"],
+                "border_style": 3, "outline": 2}),
         }
         if degraded:
             self.log_event("subtitles.degraded", cue_count=len(cues),
@@ -1124,6 +1128,20 @@ class TurboStudio:
         record = self._require_workflow()
         manifest = self.timeline_manifest()
 
+        if kind == "subtitle_style":
+            # Writes the BRIEF, not the manifest: the theme decides how the ASS
+            # is generated, so the subtitles stage has to run again. Validated
+            # here so an unknown theme is refused before anything is thrown away.
+            theme = str(values.get("caption_theme") or "").strip()
+            if theme not in render_utils.CAPTION_THEME_PROFILES:
+                raise TurboError(
+                    "altyazi temasi su seceneklerden biri olmali: "
+                    + ", ".join(sorted(render_utils.CAPTION_THEME_PROFILES)))
+            brief = dict(self.brief() or {})
+            brief["caption_theme"] = theme
+            self._write(turbo.BRIEF_ARTIFACT, turbo.validate_brief(brief),
+                        actor=actor)
+
         if effect["manifest_only"]:
             if manifest is None:
                 raise TurboError("once zaman cizelgesini olusturun")
@@ -1155,14 +1173,6 @@ class TurboStudio:
             return timeline.retime_clip(
                 manifest, target, float(values.get("seconds") or 0.0),
                 policy=str(values.get("policy") or "spread_forward"))
-        if kind == "subtitle_style":
-            manifest = dict(manifest)
-            style = dict((manifest.get("subtitles") or {}).get("style") or {})
-            style.update({k: v for k, v in values.items() if v is not None})
-            manifest["subtitles"] = {**(manifest.get("subtitles") or {}),
-                                     "style": style}
-            manifest["render_fingerprint"] = timeline.render_fingerprint(manifest)
-            return manifest
         if kind in ("music_volume", "music_remove"):
             manifest = dict(manifest)
             audio = dict(manifest.get("audio") or {})
@@ -1270,6 +1280,9 @@ class TurboStudio:
                 "transitions": list(turbo.TRANSITIONS),
                 "orderings": list(turbo.ORDERINGS),
                 "fps_choices": [24, 25, 30, 60],
+                # Straight from the shared theme dictionary, so the picker can
+                # never offer a look `validate_brief` would refuse.
+                "caption_themes": sorted(render_utils.CAPTION_THEME_PROFILES),
             },
             "limits": {
                 "min_duration_sec": turbo.MIN_DURATION_SEC,
