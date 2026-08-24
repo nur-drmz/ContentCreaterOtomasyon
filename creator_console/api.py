@@ -26,6 +26,7 @@ from .errors import ApiError
 from .progress import load_progress
 from .ids import InvalidIdentifier
 from .jobs import JobConflict, JobError, JobNotFound
+from . import render_profile
 from .pipeline_service import (
     REWIND_LABELS,
     ArtifactProblem,
@@ -245,6 +246,21 @@ class ConsoleApi:
             return 200, {"script": artifact,
                          "approval": service.approval_state("script")}
 
+        if rest == ["subtitles"] and method == "PATCH":
+            payload = _json_body(body)
+            cues = payload.get("cues")
+            if not isinstance(cues, list) or not cues:
+                raise ApiError("missing_required_field", fields=["cues"],
+                               detail="cues bos veya liste degil")
+            view = self.app.update_subtitle_texts(
+                ownership,
+                cues=cues,
+                updated_by=payload.get("updated_by") or service.project_actor(),
+                notes=payload.get("notes", ""),
+                slot=_slot(payload),
+            )
+            return 200, {"subtitles": view}
+
         if rest == ["source-library"] and method == "POST":
             payload = _json_body(body)
             record = self.app.import_source_from_library(
@@ -296,6 +312,7 @@ class ConsoleApi:
                 target_duration_sec=payload.get("target_duration_sec"),
                 moment_ranks=payload.get("moment_ranks"),
                 theory_angle=payload.get("theory_angle", ""),
+                theory_angle_auto=bool(payload.get("theory_angle_auto")),
                 content_language=payload.get("content_language"),
                 narration_preset=payload.get("narration_preset"),
                 render_config=payload.get("render_config"),
@@ -315,6 +332,8 @@ class ConsoleApi:
                               if "moment_ranks" in payload else None),
                 theory_angle=(payload["theory_angle"]
                               if "theory_angle" in payload else None),
+                theory_angle_auto=(bool(payload["theory_angle_auto"])
+                                   if "theory_angle_auto" in payload else None),
                 content_language=(payload["content_language"]
                                   if "content_language" in payload else None),
                 narration_preset=(payload["narration_preset"]
@@ -555,6 +574,104 @@ class ConsoleApi:
                 return 200, {"render_review": service.clear_render_revision(
                     resolved_by=payload.get("resolved_by") or service.project_actor(),
                     slot=slot)}
+            raise ApiError("validation_failed", detail=f"eylem: {action!r}")
+
+        if rest == ["clip-bounds"] and method == "GET":
+            slot = _slot(query)
+            return 200, {"clip_bounds": service.clip_bounds_view(slot)}
+
+        if rest == ["clip-bounds"] and method == "POST":
+            payload = _json_body(body)
+            action = payload.get("action") or "save"
+            slot = _slot(payload)
+            actor = payload.get("actor") or service.project_actor()
+            if action == "save":
+                for key in ("start", "end"):
+                    if payload.get(key) is None:
+                        raise ApiError("validation_failed",
+                                       detail=f"{key} zorunlu")
+                try:
+                    start = float(payload["start"])
+                    end = float(payload["end"])
+                except (TypeError, ValueError):
+                    raise ApiError("validation_failed",
+                                   detail="start ve end sayisal olmali")
+                result = service.save_clip_bounds(start=start, end=end,
+                                                  actor=actor, slot=slot)
+                return 200, {"clip_bounds_saved": result,
+                             "clip_bounds": service.clip_bounds_view(slot)}
+            if action == "reset":
+                result = service.reset_clip_bounds(actor=actor, slot=slot)
+                return 200, {"clip_bounds_saved": result,
+                             "clip_bounds": service.clip_bounds_view(slot)}
+            raise ApiError("validation_failed", detail=f"eylem: {action!r}")
+
+        if rest == ["render-slot"] and method == "GET":
+            # EVERYTHING the Render Studio screen needs for ONE output slot, in
+            # one request.
+            #
+            # The screen used to be slot 1 only: the batch board's "Short 3"
+            # button navigated here and silently showed Short 1's video,
+            # checklist and approval. Splitting this into three fetches would
+            # let those three arrive separately, so the page could render a
+            # slot-3 video above a slot-1 checklist for a frame -- which is the
+            # same lie, briefly.
+            slot = _slot(query)
+            try:
+                slot = service.require_slot(slot)
+            except PipelineServiceError as exc:
+                raise ApiError("validation_failed", detail=str(exc)) from None
+            return 200, {"render_slot": {
+                "slot": slot,
+                "render_profile": service.render_profile_view(slot),
+                "clip_bounds": service.clip_bounds_view(slot),
+                "render_review": service.render_review_state(slot),
+                "approvals": {"render": service.approval_state("render", slot)},
+            }}
+
+        if rest == ["render-profile"] and method == "GET":
+            slot = _slot(query)
+            profile = service.render_profile(slot)
+            return 200, {"render_profile": {
+                **profile,
+                "slot": slot,
+                "effective": service.effective_render_config(slot),
+                "impact": service.render_profile_impact(slot),
+                "options": {
+                    "quality_presets": sorted(render_profile.QUALITY_PRESETS),
+                    "resolution_presets": sorted(render_profile.RESOLUTION_PRESETS),
+                    "render_modes": list(render_profile.RENDER_MODES),
+                    "caption_themes": ["auto"] + list(render_profile.allowed_themes()),
+                    "active_word_colors": sorted(render_profile.ACTIVE_COLORS),
+                    "delivery_quality": render_profile.DELIVERY_QUALITY,
+                },
+            }}
+
+        if rest == ["render-profile"] and method == "POST":
+            payload = _json_body(body)
+            action = payload.get("action") or "save"
+            slot = _slot(payload)
+            actor = payload.get("actor") or service.project_actor()
+            if action == "save":
+                settings = payload.get("settings")
+                if not isinstance(settings, dict):
+                    raise ApiError("validation_failed", detail="settings bir nesne olmali")
+                # `expected_hash` is passed through UNCHANGED, including when it is
+                # absent: the service decides what a missing echo means, so a
+                # client cannot skip the stale-write guard by omitting the field
+                # and having the API invent a matching value.
+                result = service.save_render_profile(
+                    settings, actor=actor, slot=slot,
+                    expected_hash=payload.get("expected_hash"),
+                    reason=payload.get("reason", ""))
+                return 200, {"render_profile_saved": result,
+                             "render_profile": service.render_profile(slot),
+                             "effective": service.effective_render_config(slot)}
+            if action == "reset":
+                result = service.reset_render_profile(actor=actor, slot=slot)
+                return 200, {"render_profile_saved": result,
+                             "render_profile": service.render_profile(slot),
+                             "effective": service.effective_render_config(slot)}
             raise ApiError("validation_failed", detail=f"eylem: {action!r}")
 
         if rest == ["copyright-review"] and method == "GET":

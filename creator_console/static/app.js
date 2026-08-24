@@ -169,6 +169,8 @@ const state = {
   scriptDraft: null,
   scriptDraftSource: null,
   scriptNotesDraft: '',
+  subtitleDraft: null,
+  subtitleNotesDraft: '',
   longFormStudio: null,
   turboStudio: null,
   turboDraft: null,
@@ -178,11 +180,18 @@ const state = {
   revisionNotes: '',
   transcriptFullDraft: null,
   glossaryDraft: null,
+  // Which Short the Render Studio screen is showing. Slot 1's data already
+  // rides along in the project payload; other slots are fetched into
+  // `renderSlotView` when the operator picks one.
+  renderSlot: 1,
+  renderSlotView: null,
+  renderSlotLoading: false,
   // Which (project, slot) each draft above belongs to. A mismatch clears it.
   transcriptDraftOwner: null,
   transcriptFullDraftOwner: null,
   glossaryDraftOwner: null,
   scriptDraftOwner: null,
+  subtitleDraftOwner: null,
   uploadRequest: null,
   uploadProgress: null,
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
@@ -1654,6 +1663,19 @@ function phase0PlanEditor(phase0, selectedMode) {
     planMode === 'narrated_theory'
       ? narrationPresetField((decision.narration || {}).preset) : null,
     planMode === 'narrated_theory'
+      ? el('label', { class: 'check-row' },
+          el('input', { id: 'plan-theory-auto', type: 'checkbox',
+            'data-testid': 'plan-theory-auto',
+            checked: Boolean(decision.theory_angle_auto),
+            // The plan is approved BEFORE the analysis runs, so at this point
+            // nobody has seen the moment the theory will be about. Ticking this
+            // defers the angle to script generation, where the moment's own
+            // transcript finally exists -- and it costs no extra provider call,
+            // because it is derived inside the script request.
+            onchange: () => render() }),
+          el('span', { text: 'Teori acisini secilen momentten OTOMATIK turet' }))
+      : null,
+    planMode === 'narrated_theory' && !decision.theory_angle_auto
       ? field({ id: 'plan-theory', label: 'Teori / yorum acisi', required: true,
                 hint: 'En az 20 karakter; Gemini scripti bu aciya gore uretilir.',
                 control: el('textarea', { id: 'plan-theory', 'aria-required': 'true',
@@ -1677,7 +1699,11 @@ function phase0PlanEditor(phase0, selectedMode) {
             { id: 'plan-duration', label: 'Hedef sure', required: true,
               number: true, min: 5, max: 180 },
           ];
-          if (planMode === 'narrated_theory') {
+          const autoAngle = Boolean(
+            (document.getElementById('plan-theory-auto') || {}).checked);
+          // Only demand a typed angle when the operator did NOT ask for one to
+          // be derived; supplying both is refused by the server anyway.
+          if (planMode === 'narrated_theory' && !autoAngle) {
             rules.push({ id: 'plan-theory', label: 'Teori / yorum acisi',
                          required: true, minLength: 20 });
           }
@@ -1695,7 +1721,8 @@ function phase0PlanEditor(phase0, selectedMode) {
               target_duration_sec: values['plan-duration'],
               moment_ranks: parseMomentRanks(
                 document.getElementById('plan-ranks').value),
-              theory_angle: values['plan-theory'] || '',
+              theory_angle: autoAngle ? '' : (values['plan-theory'] || ''),
+              theory_angle_auto: autoAngle,
               content_language: planMode === 'narrated_theory'
                 ? (document.getElementById('plan-language') || {}).value : null,
               narration_preset: planMode === 'narrated_theory'
@@ -2245,8 +2272,92 @@ function screenMoments() {
 }
 
 
+/* ------------------------------------------------- render slot selection */
+/* Which Short the render screen is acting on.
+ *
+ * Slot 1 reads straight from the project payload -- no extra request, and no
+ * behaviour change for the single-output projects that are the common case.
+ * Other slots come from ONE `render-slot` fetch that carries the profile, the
+ * clip range, the checklist and the approval together, so the screen can never
+ * show one Short's video above another Short's checklist. */
+function activeRenderSlot() {
+  return state.renderSlot || 1;
+}
+
+function slotView(key) {
+  const slot = activeRenderSlot();
+  if (slot === 1) return (state.project || {})[key] || {};
+  const view = state.renderSlotView;
+  return (view && view.slot === slot) ? (view[key] || {}) : {};
+}
+
+/* Only the RENDER review is per-Short. Voice and copyright describe the project
+ * as a whole, so they must keep reading the project payload and sending slot 1
+ * -- scoping them to a slot would invent a distinction the server does not make. */
+function reviewView(kind) {
+  const key = REVIEW_KINDS[kind].viewKey;
+  return kind === 'render' ? slotView(key)
+                           : ((state.project || {})[key] || {});
+}
+
+function reviewSlot(kind) {
+  return kind === 'render' ? activeRenderSlot() : 1;
+}
+
+function approvalView(kind) {
+  if (kind === 'render') return slotView('approvals')[kind] || {};
+  return (state.project.approvals || {})[kind] || {};
+}
+
+async function loadRenderSlot(slot) {
+  const wanted = Number(slot) || 1;
+  state.renderSlot = wanted;
+  // Drafts belong to the slot they were typed against. Carrying them across
+  // would let a value edited for Short 1 be saved onto Short 3.
+  state.renderProfileDraft = null;
+  state.clipDraft = null;
+  state.renderProfileReport = null;
+  state.clipReport = null;
+  if (wanted === 1) {
+    state.renderSlotView = null;
+    render();
+    return;
+  }
+  state.renderSlotLoading = true;
+  state.renderSlotView = null;
+  render();
+  try {
+    const payload = await api.get(
+      `/api/projects/${state.projectId}/render-slot?slot=${wanted}`);
+    state.renderSlotView = payload.render_slot;
+  } catch (error) {
+    pushAlert('danger', 'Short verisi alinamadi', error.message, error.hint);
+  } finally {
+    state.renderSlotLoading = false;
+    render();
+  }
+}
+
+/* Re-read the selected slot after a write. `refresh()` only reloads the project
+ * payload, which is slot 1 -- without this a save on Short 3 would leave the
+ * screen showing what Short 3 looked like BEFORE it. */
+async function refreshRenderSlot() {
+  await refresh();
+  const slot = activeRenderSlot();
+  if (slot === 1) return;
+  try {
+    const payload = await api.get(
+      `/api/projects/${state.projectId}/render-slot?slot=${slot}`);
+    state.renderSlotView = payload.render_slot;
+  } catch (error) {
+    state.renderSlotView = null;
+  }
+  render();
+}
+
+
 function approvalPanel(kind, actionLabel) {
-  const approval = (state.project.approvals || {})[kind] || {};
+  const approval = approvalView(kind);
   if (!approval.present) {
     return el('div', { class: 'muted', text: 'Onaylanacak artefakt henuz uretilmedi.' });
   }
@@ -2288,8 +2399,11 @@ function approvalPanel(kind, actionLabel) {
               await guard(() => api.post(`/api/projects/${state.projectId}/approvals/${kind}`, {
                 reviewed_sha256: approval.content_sha256,
                 approved_by: projectActor(),
+                // The hash above came from THIS slot; approving without saying
+                // which slot would bind it to Short 1's manifest instead.
+                slot: kind === 'render' ? activeRenderSlot() : 1,
               }), 'Onaylandi');
-              await refresh();
+              await refreshRenderSlot();
             },
           }, actionLabel))
       : null);
@@ -2645,6 +2759,29 @@ function resetScriptDraft(data) {
   state.scriptDraft = source;
   state.scriptDraftSource = source;
   state.scriptNotesDraft = '';
+}
+
+function subtitleDraftValue(track) {
+  const owner = `${draftOwner('narrated-subtitles')}::${track.source_sha256 || ''}`;
+  if (!state.subtitleDraft || state.subtitleDraftOwner !== owner) {
+    state.subtitleDraftOwner = owner;
+    state.subtitleDraft = Object.fromEntries(
+      (track.cues || []).map(cue => [cue.id, cue.text]));
+    state.subtitleNotesDraft = '';
+  }
+  return state.subtitleDraft;
+}
+
+function subtitleDraftDirty(track) {
+  const draft = subtitleDraftValue(track);
+  return (track.cues || []).some(cue => draft[cue.id] !== cue.text);
+}
+
+function resetSubtitleDraft(track) {
+  state.subtitleDraft = null;
+  state.subtitleDraftOwner = null;
+  state.subtitleNotesDraft = '';
+  subtitleDraftValue(track);
 }
 
 function transcriptDraft(t) {
@@ -3474,9 +3611,9 @@ function revisionRunCard(kind, open) {
           `/api/projects/${state.projectId}/${config.endpoint}`, {
             action: 'request_revision', requested_by: projectActor(),
             notes: open.notes, target_tab: open.target_tab,
-            start_confirmed: true,
+            start_confirmed: true, slot: reviewSlot(kind),
           }), 'Revizyon calismasi baslatildi');
-        await refresh();
+        await refreshRenderSlot();
       },
     }, `Duzeltmeyi baslat (${runnable})`));
 }
@@ -3493,7 +3630,7 @@ const RUNNABLE_REVISION_TARGETS = {
  * Shown only once the media really was replaced -- the server returns null
  * while the digest still matches the one the revision was raised against. */
 function revisionReportCard(kind) {
-  const review = (state.project && state.project[REVIEW_KINDS[kind].viewKey]) || {};
+  const review = reviewView(kind);
   const report = review.revision_report;
   if (!report) return null;
   const config = REVIEW_KINDS[kind];
@@ -3524,7 +3661,7 @@ function revisionReportCard(kind) {
 
 function reviewChecklist(kind) {
   const config = REVIEW_KINDS[kind];
-  const review = (state.project && state.project[config.viewKey]) || {};
+  const review = reviewView(kind);
   const items = review.items || [];
   if (!items.length) return null;
   return el('div', { class: 'card' },
@@ -3563,10 +3700,11 @@ function reviewChecklist(kind) {
           box.disabled = true;
           const result = await guard(() => api.post(
             `/api/projects/${state.projectId}/${config.endpoint}`,
-            { action: 'set_item', key: item.key, checked: wanted, reviewed_by: who }));
+            { action: 'set_item', key: item.key, checked: wanted, reviewed_by: who,
+              slot: reviewSlot(kind) }));
           if (!result) box.checked = !wanted;
           box.disabled = false;
-          await refresh();
+          await refreshRenderSlot();
         },
       }),
       el('div', {},
@@ -3587,7 +3725,7 @@ function reviewChecklist(kind) {
  * This is a UI courtesy. `PipelineService.approve` refuses independently, so a
  * user who bypasses the browser still cannot approve an unreviewed artifact. */
 function reviewApprovalSection(kind, heading, actionLabel, approvalKind) {
-  const review = (state.project && state.project[REVIEW_KINDS[kind].viewKey]) || {};
+  const review = reviewView(kind);
   const config = REVIEW_KINDS[kind];
   const gateOpen = Boolean(review.complete && !review.open_revision);
   return el('div', { class: 'card' },
@@ -3605,7 +3743,7 @@ function reviewApprovalSection(kind, heading, actionLabel, approvalKind) {
 
 function reviewRevisionPanel(kind) {
   const config = REVIEW_KINDS[kind];
-  const review = (state.project && state.project[config.viewKey]) || {};
+  const review = reviewView(kind);
   const open = review.open_revision;
   const notesId = `${config.testid('revision')}-notes`;
   return el('div', { class: 'card' },
@@ -3629,9 +3767,10 @@ function reviewRevisionPanel(kind) {
                 const who = projectActor();
                 await guard(() => api.post(
                   `/api/projects/${state.projectId}/${config.endpoint}`,
-                  { action: 'clear_revision', resolved_by: who }),
+                  { action: 'clear_revision', resolved_by: who,
+                    slot: reviewSlot(kind) }),
                   'Revizyon kaydi kapatildi');
-                await refresh();
+                await refreshRenderSlot();
               },
             }, 'Revizyonu kapat')))
       : el('div', { class: 'stack' },
@@ -3665,6 +3804,7 @@ function reviewRevisionPanel(kind) {
                   notes: values[notesId],
                   target_tab: target,
                   start_confirmed: Boolean(confirmed),
+                  slot: reviewSlot(kind),
                 });
               let result = await guard(() => send(false), 'Revizyon kaydedildi');
               const run = result && result.revision_run;
@@ -3900,14 +4040,500 @@ async function refreshRevision() {
   state.revision = result ? result.revision : null;
 }
 
+function narratedSubtitleEditor(decision) {
+  if ((decision || {}).mode && decision.mode !== 'narrated_theory') return null;
+  const track = (state.project && state.project.subtitles) || {};
+  if (track.problem) {
+    return el('div', { class: 'card', 'data-testid': 'subtitle-editor' },
+      el('h2', { text: 'Altyazi editoru' }),
+      alertBox('danger', 'Altyazi okunamadi', track.problem));
+  }
+  if (!track.available) {
+    return el('div', { class: 'card', 'data-testid': 'subtitle-editor' },
+      el('h2', { text: 'Altyazi editoru' }),
+      el('p', { class: 'subtitle',
+                text: 'Anlatimli videonun altyazisini satir satir duzenleyebilirsin.' }),
+      el('div', { class: 'empty', 'data-testid': 'subtitle-editor-empty',
+                  text: track.hint || 'Altyazi henuz hazir degil.' }));
+  }
+
+  const draft = subtitleDraftValue(track);
+  const dirty = subtitleDraftDirty(track);
+  const limit = ((track.limits || {}).max_cue_chars) || 300;
+  return el('div', { class: 'card', 'data-testid': 'subtitle-editor' },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Altyazi editoru' }),
+      badge(dirty ? 'review_required' : 'completed',
+            dirty ? 'kaydedilmedi' : `${track.cue_count || 0} satir`)),
+    el('p', { class: 'subtitle',
+              text: 'Zamanlamalar korunur. Yalniz metni duzenle; kaydettikten sonra '
+                    + 'videoyu yeniden render edip izle.' }),
+    alertBox('warn', 'Kaydetmek mevcut renderi gecersiz kilar',
+      'Eski video revizyon arsivine tasinir; duzeltilmis altyazi bir sonraki renderda kullanilir.'),
+    el('div', { class: 'stack subtitle-cue-list' }, (track.cues || []).map(cue => {
+      const value = draft[cue.id] !== undefined ? draft[cue.id] : cue.text;
+      const invalid = !String(value || '').trim() || value.length > limit;
+      return el('div', { class: 'subtitle-cue-row',
+                         'data-testid': `subtitle-cue-${cue.id}` },
+        el('div', { class: 'spread' },
+          el('span', { class: 'mono dim',
+                       text: `${formatClock(cue.start)} - ${formatClock(cue.end)}` }),
+          el('span', { class: 'dim', text: `${value.length} / ${limit}` })),
+        el('textarea', {
+          class: 'transcript-seg-input' + (invalid ? ' field--invalid' : ''),
+          rows: 2, maxlength: limit,
+          'data-testid': `subtitle-cue-input-${cue.id}`,
+          oninput: (event) => { state.subtitleDraft[cue.id] = event.currentTarget.value; },
+        }, value));
+    })),
+    textareaField({ id: 'subtitle-editor-notes', label: 'Revizyon notu',
+                    value: state.subtitleNotesDraft,
+                    attrs: { maxlength: 1000, 'data-testid': 'subtitle-editor-notes',
+                             placeholder: 'Duzeltilen isim, cumle veya yazim...',
+                             oninput: (event) => {
+                               state.subtitleNotesDraft = event.currentTarget.value;
+                             } } }),
+    el('div', { class: 'row' },
+      el('button', {
+        class: 'btn btn--primary', 'data-testid': 'subtitle-editor-save',
+        onclick: (event) => withButton(event, async () => {
+          const updates = (track.cues || [])
+            .filter(cue => draft[cue.id] !== cue.text)
+            .map(cue => ({ id: cue.id, text: draft[cue.id] }));
+          if (!updates.length) {
+            pushAlert('info', 'Degisiklik yok',
+                      'Kaydedilecek bir altyazi duzenlemesi bulunamadi.');
+            return;
+          }
+          if (updates.some(item => !String(item.text || '').trim())) {
+            pushAlert('danger', 'Bos altyazi satiri',
+                      'Satiri kaldirmak yerine metni duzelt; bos satir kaydedilemez.');
+            return;
+          }
+          const saved = await guard(() => api.request(
+            'PATCH', `/api/projects/${state.projectId}/subtitles`, {
+              body: { cues: updates, updated_by: projectActor(),
+                      notes: state.subtitleNotesDraft || '', slot: track.slot || 1 },
+            }), 'Altyazi kaydedildi; video yeniden render edilmeli');
+          if (saved) {
+            state.project.subtitles = saved.subtitles;
+            resetSubtitleDraft(saved.subtitles);
+            await refresh();
+          }
+        }),
+      }, 'Altyazi degisikliklerini kaydet'),
+      el('button', {
+        class: 'btn btn--sm', 'data-testid': 'subtitle-editor-discard',
+        onclick: () => { resetSubtitleDraft(track); render(); },
+      }, 'Duzenlemeleri geri al')));
+}
+
+// Render Studio's editable half. Deliberately a SEPARATE card from 'Mevcut
+// cikti': the settings below describe the NEXT render, and showing a pending
+// choice next to the existing video as if it produced it is the one thing this
+// screen must never do.
+//
+// Nothing here starts an encode. Saving archives the stale output and marks the
+// slot as needing a render; spending minutes of CPU stays a second, explicit
+// click.
+// The quality the EXISTING video was rendered at, read from the manifest the
+// render itself stamped. It matters because only one preset is delivery
+// quality: a 'draft' file that looks finished is exactly what someone would
+// upload by mistake.
+function renderedStampLine() {
+  const view = slotView('render_profile');
+  if (!view.has_output || !view.rendered_quality_preset) return null;
+  const delivery = view.rendered_is_delivery_quality;
+  return el('p', {
+    class: 'dim', 'data-testid': 'render-rendered-quality',
+    text: `Bu video "${view.rendered_quality_preset}" kalitesinde uretildi`
+          + (delivery ? ' (teslim kalitesi).'
+                      : ' -- TESLIM KALITESI DEGIL, yalnizca kontrol icin.'),
+  });
+}
+
+
+function fmtSec(value) {
+  const n = Number(value || 0);
+  const m = Math.floor(n / 60);
+  return `${m}:${(n - m * 60).toFixed(2).padStart(5, '0')}`;
+}
+
+
+// The single-clip Video Editor.
+//
+// It edits WHICH SECONDS of the source this slot renders. Until now that range
+// was whatever the analysis picked and the only way to change it was to re-run
+// the analysis -- which throws away the transcript and the script with it.
+//
+// No FFmpeg runs while dragging. The player is the SOURCE file served by byte
+// range, and a drag only moves numbers in `state.clipDraft`; nothing reaches
+// the server until Kaydet.
+function clipBoundsEditor() {
+  const view = slotView('clip_bounds');
+  if (!view.available) return null;
+  const saved = view.bounds || {};
+  const duration = Number(view.source_duration_sec || 0);
+  const draft = state.clipDraft || {
+    start: Number(saved.source_start_sec || 0),
+    end: Number(saved.source_end_sec || 0),
+  };
+  const dirty = Math.abs(draft.start - Number(saved.source_start_sec || 0)) > 1e-6
+    || Math.abs(draft.end - Number(saved.source_end_sec || 0)) > 1e-6;
+  const minDur = Number(view.min_duration_sec || 0.2);
+  const busy = Boolean(state.clipBusy);
+
+  const setDraft = (start, end) => {
+    state.clipDraft = { start, end };
+    render();
+  };
+
+  // Every edit goes through here, so a handle can never cross its partner and
+  // a clip can never leave the source -- the same limits the server enforces,
+  // applied early so the UI does not offer a value it will then be told is bad.
+  const clampAndSet = (start, end, keepDuration) => {
+    let s = start;
+    let e = end;
+    if (keepDuration) {
+      const len = e - s;
+      s = Math.max(0, Math.min(s, duration - len));
+      e = s + len;
+    } else {
+      s = Math.max(0, Math.min(s, e - minDur));
+      e = Math.min(duration || e, Math.max(e, s + minDur));
+    }
+    setDraft(Number(s.toFixed(3)), Number(e.toFixed(3)));
+  };
+
+  const nudge = (which, delta) => {
+    if (which === 'start') clampAndSet(draft.start + delta, draft.end, false);
+    else if (which === 'end') clampAndSet(draft.start, draft.end + delta, false);
+    else clampAndSet(draft.start + delta, draft.end + delta, true);
+  };
+
+  const pct = (value) => (duration ? (value / duration) * 100 : 0);
+
+  const dragFrom = (mode) => (event) => {
+    event.preventDefault();
+    const track = document.querySelector('[data-testid=clip-track]');
+    if (!track || !duration) return;
+    const rect = track.getBoundingClientRect();
+    const startDraft = { start: draft.start, end: draft.end };
+    const originSec = ((event.clientX - rect.left) / rect.width) * duration;
+    const move = (moveEvent) => {
+      const nowSec = ((moveEvent.clientX - rect.left) / rect.width) * duration;
+      const delta = nowSec - originSec;
+      if (mode === 'start') clampAndSet(startDraft.start + delta, startDraft.end, false);
+      else if (mode === 'end') clampAndSet(startDraft.start, startDraft.end + delta, false);
+      else clampAndSet(startDraft.start + delta, startDraft.end + delta, true);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
+  const save = async (action) => {
+    state.clipBusy = true;
+    render();
+    try {
+      const body = action === 'reset'
+        ? { action: 'reset', slot: view.slot }
+        : { action: 'save', slot: view.slot, start: draft.start, end: draft.end };
+      const result = await api.post(
+        `/api/projects/${state.projectId}/clip-bounds`, body);
+      state.clipDraft = null;
+      const saveResult = result.clip_bounds_saved || {};
+      state.clipReport = saveResult.unchanged
+        ? 'Aralik zaten boyleydi; hicbir sey degistirilmedi.'
+        : (saveResult.transcript_invalidated
+            ? 'Aralik kaydedildi. Altyazi metni BU aralikten geldigi icin '
+              + 'transkript onayi dustu: transkripti yeniden uret ve oku.'
+            : 'Aralik kaydedildi. Script ve seslendirme korundu; yalnizca '
+              + 'goruntu araligi degisti.');
+      await refreshRenderSlot();
+    } catch (error) {
+      state.clipReport = null;
+      pushAlert('danger', 'Klip araligi kaydedilemedi', error.message, error.hint);
+    } finally {
+      state.clipBusy = false;
+      render();
+    }
+  };
+
+  const nudgeRow = (which, label) => el('div', { class: 'row' },
+    el('span', { class: 'dim', text: label }),
+    ...[-1, -0.5, -0.1, 0.1, 0.5, 1].map(step => el('button', {
+      class: 'btn btn--small',
+      // Nokta iceren bir data-testid gecersiz bir CSS secicisi uretir
+      // ([data-testid=clip-start-plus0.5] parse edilemez), bu yuzden
+      // 0.5 -> "05" olarak yazilir.
+      'data-testid': `clip-${which}-${step > 0 ? 'plus' : 'minus'}`
+        + String(Math.abs(step)).replace('.', ''),
+      onclick: () => nudge(which, step),
+    }, `${step > 0 ? '+' : ''}${step}`)));
+
+  return el('div', { class: 'card', 'data-testid': 'clip-bounds-editor' },
+    el('h3', { text: 'Klip araligi' }),
+    el('p', { class: 'dim',
+              text: 'Klibi kaynagin icinde tasi veya uzat. Analizi yeniden '
+                    + 'calistirmaya gerek yok; surukleme sirasinda hicbir '
+                    + 'render calismaz.' }),
+
+    !view.editable
+      ? alertBox('warn', 'Aralik duzenlenemiyor', view.not_editable_reason)
+      : null,
+    view.transcript_will_be_invalidated
+      ? el('p', { class: 'dim', 'data-testid': 'clip-transcript-warning',
+                  text: 'Bu modda altyazi metni bu aralikten uretilir: araligi '
+                        + 'degistirirsen transkript onayi duser ve metni tekrar '
+                        + 'okuman gerekir.' })
+      : null,
+
+    view.source_media_path
+      ? el('video', {
+          controls: true, preload: 'metadata', playsinline: true,
+          class: 'clip-source-player', 'data-testid': 'clip-source-player',
+          src: `/api/projects/${state.projectId}/media/${view.source_media_path}`,
+        })
+      : null,
+
+    !duration
+      ? el('p', { class: 'dim', 'data-testid': 'clip-no-duration',
+                  text: 'Kaynak suresi olculemedi; zaman cizelgesi olceklenemiyor. '
+                        + 'Nudge dugmeleriyle yine de duzenleyebilirsin.' })
+      : null,
+
+    el('div', { class: 'clip-track', 'data-testid': 'clip-track' },
+      el('div', {
+        class: 'clip-band', 'data-testid': 'clip-band',
+        style: `left:${pct(draft.start)}%;width:${pct(draft.end - draft.start)}%`,
+        onpointerdown: view.editable ? dragFrom('move') : null,
+      },
+        el('span', { class: 'clip-handle clip-handle--start',
+                     'data-testid': 'clip-handle-start',
+                     onpointerdown: view.editable ? dragFrom('start') : null }),
+        el('span', { class: 'clip-handle clip-handle--end',
+                     'data-testid': 'clip-handle-end',
+                     onpointerdown: view.editable ? dragFrom('end') : null }))),
+
+    el('div', { class: 'row', 'data-testid': 'clip-readout' },
+      el('span', { text: `Baslangic ${fmtSec(draft.start)}` }),
+      el('span', { text: `Bitis ${fmtSec(draft.end)}` }),
+      el('span', { text: `Sure ${(draft.end - draft.start).toFixed(2)} sn` }),
+      el('span', { class: 'dim', text: `Kaynak ${fmtSec(duration)}` })),
+
+    view.editable ? nudgeRow('start', 'Baslangic') : null,
+    view.editable ? nudgeRow('end', 'Bitis') : null,
+    view.editable ? nudgeRow('move', 'Tumunu kaydir') : null,
+
+    dirty
+      ? el('p', { class: 'dim', 'data-testid': 'clip-dirty',
+                  text: 'Kaydedilmemis aralik degisikligi var.' })
+      : null,
+    state.clipReport
+      ? el('p', { class: 'dim', 'data-testid': 'clip-report',
+                  text: state.clipReport })
+      : null,
+
+    el('div', { class: 'row' },
+      el('button', { class: 'btn btn--primary', 'data-testid': 'clip-save',
+                     disabled: busy || !dirty || !view.editable ? 'disabled' : null,
+                     onclick: () => save('save') },
+        busy ? 'Kaydediliyor...' : 'Araligi kaydet'),
+      el('button', { class: 'btn', 'data-testid': 'clip-reset',
+                     disabled: busy || !view.editable ? 'disabled' : null,
+                     onclick: () => save('reset') },
+        'Analizin secdigi aralige don'),
+      el('button', { class: 'btn', 'data-testid': 'clip-preview-seek',
+                     onclick: () => {
+                       const player = document.querySelector(
+                         '[data-testid=clip-source-player]');
+                       if (player) { player.currentTime = draft.start; player.play(); }
+                     } },
+        'Klip basindan oynat')));
+}
+
+
+function renderProfilePanel() {
+  const view = slotView('render_profile');
+  if (!view.available) return null;
+  const options = view.options || {};
+  const saved = view.settings || {};
+  const draft = Object.assign({}, saved, state.renderProfileDraft || {});
+  const dirty = Object.keys(saved).filter(key =>
+    JSON.stringify(draft[key]) !== JSON.stringify(saved[key]));
+  const impact = view.impact || {};
+  const busy = Boolean(state.renderProfileBusy);
+
+  const set = (key, value) => {
+    state.renderProfileDraft = Object.assign({}, state.renderProfileDraft || {},
+                                             { [key]: value });
+    render();
+  };
+
+  const select = (id, label, key, choices, hint) => field({
+    id, label, hint,
+    control: el('select', {
+      id, 'data-testid': id,
+      onchange: (event) => set(key, event.currentTarget.value),
+    }, ...choices.map(value => el('option', {
+      value, selected: draft[key] === value ? 'selected' : null,
+    }, String(value)))),
+  });
+
+  const number = (id, label, key, range, hint) => field({
+    id, label, hint,
+    control: el('input', {
+      id, 'data-testid': id, type: 'number',
+      min: String(range[0]), max: String(range[1]),
+      value: draft[key] === null || draft[key] === undefined ? '' : String(draft[key]),
+      placeholder: 'Temadan gelsin',
+      onchange: (event) => {
+        const raw = event.currentTarget.value.trim();
+        set(key, raw === '' ? null : Number(raw));
+      },
+    }),
+  });
+
+  const save = async (action) => {
+    state.renderProfileBusy = true;
+    render();
+    try {
+      const body = action === 'reset'
+        ? { action: 'reset', slot: view.slot }
+        : { action: 'save', slot: view.slot, settings: draft,
+            // Echo the hash we were editing. If the slot moved underneath us the
+            // server refuses rather than silently discarding the other change.
+            expected_hash: view.content_sha256 };
+      const result = await api.post(
+        `/api/projects/${state.projectId}/render-profile`, body);
+      state.renderProfileDraft = null;
+      const changed = ((result || {}).render_profile_saved || {}).changed_fields || [];
+      state.renderProfileReport = (result.render_profile_saved || {}).unchanged
+        ? 'Ayarlar zaten boyleydi; hicbir sey degistirilmedi ve hicbir cikti arsivlenmedi.'
+        : `Degisen ayarlar: ${changed.join(', ') || 'yok'}. Eski cikti arsive tasindi, `
+          + 'script ve seslendirme korundu. Yeni videoyu gormek icin renderi calistir.';
+      await refreshRenderSlot();
+    } catch (error) {
+      state.renderProfileReport = null;
+      pushAlert('danger', 'Render ayarlari kaydedilemedi',
+                error.message, error.hint);
+    } finally {
+      state.renderProfileBusy = false;
+      render();
+    }
+  };
+
+  return el('div', { class: 'card', 'data-testid': 'render-profile-panel' },
+    el('h3', { text: 'Sonraki render' }),
+    el('p', { class: 'dim',
+              text: 'Bu ayarlar videonun NASIL gorundugunu degistirir. Script, '
+                    + 'seslendirme ve moment secimi korunur; saglayici kotasi '
+                    + 'harcanmaz, yalnizca encode yeniden yapilir.' }),
+
+    // Ayar kaydedildiginde eski cikti zaten arsive tasinir, bu yuzden
+    // "bayat video" diye bir durum yoktur -- ya guncel bir cikti vardir, ya da
+    // hic yoktur. Ekranin soyleyecegi dogru sey budur.
+    !view.has_output
+      ? el('p', { class: 'dim', 'data-testid': 'render-profile-needs-render',
+                  text: 'Bu ayarlarla henuz bir video uretilmedi. Asagidan '
+                        + 'renderi calistir.' })
+      : null,
+    view.unknown_rendered_settings
+      ? el('p', { class: 'dim', 'data-testid': 'render-profile-unknown',
+                  text: 'Mevcut video bu ozellik eklenmeden once uretilmis; hangi '
+                        + 'ayarlarla render edildigi kayitli degil.' })
+      : null,
+
+    el('div', { class: 'grid grid--2' },
+      select('render-profile-quality', 'Kalite', 'quality_preset',
+             options.quality_presets || [],
+             `Yalnizca "${options.delivery_quality}" teslim kalitesidir; digerleri hizli kontrol icindir.`),
+      select('render-profile-resolution', 'Cozunurluk', 'resolution_preset',
+             options.resolution_presets || [], 'Dikey Short hedefi.'),
+      select('render-profile-mode', 'Render modu', 'render_mode',
+             options.render_modes || [],
+             'Kadraj disi alan bulanik arka planla mi doldurulsun, yoksa kirpilsin mi.'),
+      select('render-profile-theme', 'Altyazi temasi', 'caption_theme',
+             options.caption_themes || [], 'Font ve renk ailesi.'),
+      select('render-profile-color', 'Vurgu rengi', 'active_word_color',
+             options.active_word_colors || [], 'Aktif kelimenin rengi.'),
+      number('render-profile-font-size', 'Font boyutu', 'caption_font_size',
+             options.font_size_range || [28, 120], 'Bos birakilirsa tema belirler.'),
+      number('render-profile-margin', 'Altyazi yuksekligi', 'caption_margin_v',
+             options.margin_v_range || [40, 600], 'Alt kenardan piksel.')),
+
+    el('h4', { text: 'Kadraj' }),
+    el('div', { class: 'grid grid--3' },
+      number('render-profile-zoom', 'Zoom', 'frame_zoom', [1, 2],
+             '1.0 = kirpma yok.'),
+      number('render-profile-focus-x', 'Odak X', 'frame_focus_x', [0, 1],
+             '0 sol, 1 sag.'),
+      number('render-profile-focus-y', 'Odak Y', 'frame_focus_y', [0, 1],
+             '0 ust, 1 alt.')),
+
+    el('label', { class: 'check-row' },
+      el('input', { id: 'render-profile-highlight', type: 'checkbox',
+        'data-testid': 'render-profile-highlight',
+        checked: Boolean(draft.active_word_highlight),
+        onchange: (event) => set('active_word_highlight',
+                                 event.currentTarget.checked) }),
+      el('span', { text: 'Konusulan kelimeyi vurgula' })),
+
+    dirty.length
+      ? el('p', { class: 'dim', 'data-testid': 'render-profile-dirty',
+                  text: `Kaydedilmemis degisiklik: ${dirty.join(', ')}` })
+      : null,
+
+    impact.file_count
+      ? el('p', { class: 'dim', 'data-testid': 'render-profile-impact',
+                  text: `Kaydedince ${impact.file_count} dosya `
+                        + `(${(impact.size_bytes / 1048576).toFixed(2)} MB) `
+                        + `${impact.destination} altina TASINIR, silinmez.` })
+      : el('p', { class: 'dim', 'data-testid': 'render-profile-impact',
+                  text: 'Bu slotta arsivlenecek bir cikti yok.' }),
+
+    state.renderProfileReport
+      ? el('p', { class: 'dim', 'data-testid': 'render-profile-report',
+                  text: state.renderProfileReport })
+      : null,
+
+    el('div', { class: 'row' },
+      el('button', { class: 'btn btn--primary', 'data-testid': 'render-profile-save',
+                     disabled: busy || !dirty.length ? 'disabled' : null,
+                     onclick: () => save('save') },
+        busy ? 'Kaydediliyor...' : 'Ayarlari kaydet'),
+      el('button', { class: 'btn', 'data-testid': 'render-profile-reset',
+                     disabled: busy ? 'disabled' : null,
+                     onclick: () => save('reset') },
+        'Faz 0 varsayilanina don')));
+}
+
+
 function screenRender() {
   const decision = ((state.project.phase0 || {}).plan || {}).decision || {};
   const config = decision.render || {};
-  const review = state.project.render_review || {};
+  const review = reviewView('render');
   const tech = review.technical || {};
   const outputs = state.project.outputs || [];
-  const primary = outputs[0] || {};
+  // Opening a DIFFERENT project keeps whatever slot was picked in the last one.
+  // A 1-output project with slot 3 still selected would find no matching output
+  // and render an empty screen, so an out-of-range slot heals back to Short 1
+  // here rather than depending on every navigation path remembering to reset it.
+  if (!outputs.some(item => item.index === activeRenderSlot())) {
+    state.renderSlot = 1;
+    state.renderSlotView = null;
+  }
+  const slot = activeRenderSlot();
+  // The Short this screen is acting on. It used to be `outputs[0]` no matter
+  // what, so the batch board's "Short 3" button landed here and showed Short 1
+  // -- its video, its checklist and its final approval, under Short 3's name.
+  const primary = outputs.find(item => item.index === slot) || {};
   const playable = primary.video && primary.video.usable;
+  const loading = state.renderSlotLoading;
   // Render settings are NOT editable here on purpose: they are part of the
   // approved plan's decision hash. Changing them must go through Phase 0.
   const params = {
@@ -3917,6 +4543,9 @@ function screenRender() {
     subtitle_language: config.subtitle_language || 'auto',
     caption_style: config.caption_style || 'active_word_yellow',
     caption_theme: config.caption_theme || 'auto',
+    // Which Short to render. Without it every run from this screen rendered
+    // slot 1, whichever Short the operator was looking at.
+    slot,
   };
   const approval = (state.project.approvals || {}).render || {};
 
@@ -3927,9 +4556,30 @@ function screenRender() {
                 text: 'Videoyu izle, teknik ozeti oku, kontrol listesini doldur; '
                       + 'final onay ancak ondan sonra acilir.' }))),
 
+    outputs.length > 1
+      ? el('div', { class: 'card', 'data-testid': 'render-slot-picker' },
+          field({ id: 'render-slot', label: 'Hangi Short',
+                  hint: 'Bu sayfadaki her sey -- video, ayarlar, klip araligi, '
+                        + 'kontrol listesi ve final onay -- secilen Short icindir.',
+            control: el('select', {
+              id: 'render-slot', 'data-testid': 'render-slot',
+              disabled: loading ? 'disabled' : null,
+              onchange: (event) => loadRenderSlot(Number(event.currentTarget.value)),
+            }, ...outputs.map(item => el('option', {
+              value: String(item.index),
+              selected: item.index === slot ? 'selected' : null,
+            }, `Short ${item.index}`)))}))
+      : null,
+
+    loading
+      ? el('div', { class: 'card', 'data-testid': 'render-slot-loading' },
+          el('p', { class: 'dim', text: `Short ${slot} yukleniyor...` }))
+      : null,
+
+    loading ? null :
     playable
       ? el('div', { class: 'card' },
-          el('h2', { text: 'Uretilen Short' }),
+          el('h2', { text: `Uretilen Short ${outputs.length > 1 ? slot : ''}`.trim() }),
           el('div', { class: 'review-player' },
             el('video', {
               controls: true, preload: 'metadata', playsinline: true,
@@ -3943,29 +4593,40 @@ function screenRender() {
                                   ? `${Number(tech.duration_sec).toFixed(2)} sn` : '' }),
               badge(primary.status || 'missing'))))
       : el('div', { class: 'card' },
-          el('h2', { text: 'Uretilen Short' }),
+          el('h2', { text: `Uretilen Short ${outputs.length > 1 ? slot : ''}`.trim() }),
           primary.problem
             ? alertBox('danger', 'Video oynatilamaz', primary.problem,
                        'Renderi yeniden calistir.')
             : el('div', { class: 'empty', 'data-testid': 'render-empty',
                           text: 'Henuz render edilmis bir video yok.' })),
 
-    renderTechnicalSummary(tech),
+    loading ? null : renderTechnicalSummary(tech),
 
     el('div', { class: 'card' },
-      el('h3', { text: 'Onaylanan render ayarlari' }),
+      el('h3', { text: 'Mevcut cikti' }),
       el('div', { class: 'mono dim', 'data-testid': 'render-config',
                   text: JSON.stringify(params) }),
+      renderedStampLine(),
       el('div', { class: 'field__hint',
-                  text: 'Degistirmek icin Faz 0 planini yenile ve yeniden onayla.' })),
+                  text: 'Altyazi dili ve Whisper modeli plana baglidir; onlari '
+                        + 'degistirmek icin Faz 0 planini yenile ve yeniden onayla.' })),
 
-    phaseRunCard('render', 'Render calistir',
-      'Plandaki render ayarlari kullanilir.', params),
+    loading ? null : renderProfilePanel(),
 
-    playable ? renderReviewChecklist() : null,
-    playable ? renderRevisionPanel() : null,
+    loading ? null : clipBoundsEditor(),
 
-    reviewApprovalSection('render', 'Final onay', 'Renderi onayla', 'render'));
+    narratedSubtitleEditor(decision),
+
+    loading ? null
+            : phaseRunCard('render', 'Render calistir',
+                'Bu Short icin kaydedilen render ayarlari kullanilir.', params),
+
+    !loading && playable ? renderReviewChecklist() : null,
+    !loading && playable ? renderRevisionPanel() : null,
+
+    loading ? null
+            : reviewApprovalSection('render', 'Final onay', 'Renderi onayla',
+                                    'render'));
 }
 
 
@@ -4264,6 +4925,17 @@ function turboBriefCard() {
       turboSelect('turbo-caption-theme', 'Altyazi temasi', 'caption_theme',
         (options.caption_themes || ['default']).map(value => [value, value]),
         'Aktif kelime vurgusunun font ve rengini belirler.')),
+    el('label', { class: 'check-row' },
+      el('input', { id: 'turbo-use-source-moment', type: 'checkbox',
+        'data-testid': 'turbo-use-source-moment',
+        checked: Boolean(draft.use_source_moment),
+        onchange: (event) => setTurboDraft(
+          'use_source_moment', event.currentTarget.checked) }),
+      el('span', { text: 'Bu projenin onayli momentini ILK klip olarak kullan' })),
+    el('p', { class: 'dim',
+      text: 'Isaretlenirse video kendi kaynagin uzerine kurulur: ilk sahne '
+            + 'secili moment, kalan sahneler stok goruntu. Once Moment '
+            + "Explorer'da bir moment secilmis olmali." }),
     inputField({ id: 'turbo-seed', label: 'Seed (istege bagli)',
       hint: 'Ayni seed ayni klip sirasini uretir; bos birakilirsa script sirasi kullanilir.',
       attrs: { value: draft.seed_input, maxlength: 80,

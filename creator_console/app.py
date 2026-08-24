@@ -545,6 +545,13 @@ class ConsoleApp:
         return self.service(ownership).update_script_text(
             script_text=script_text, updated_by=updated_by, notes=notes)
 
+    def update_subtitle_texts(self, ownership: Ownership, *, cues,
+                              updated_by: str, notes: str = "",
+                              slot: int = 1) -> dict:
+        self._assert_lifecycle_idle(ownership)
+        return self.service(ownership).save_subtitle_edits(
+            cues=cues, edited_by=updated_by, notes=notes, slot=slot)
+
     def assert_owned(self, project_id: str) -> Ownership:
         """Resolve a project id from the request, or refuse.
 
@@ -1209,6 +1216,10 @@ class ConsoleApp:
             # content you cannot read is not a review, so the text itself has to
             # reach the page -- a curated slice of it, not the whole artifact.
             "script": _script_review_view(service),
+            # Narrated captions become editable after their first render. The
+            # saved track is outside the render directory so a re-encode cannot
+            # destroy the operator's text corrections.
+            "subtitles": service.subtitle_view(),
             # The caption text of a clip Short, for the screen that lets a human
             # read it and fix misheard names before it is burned in.
             "transcript": service.transcript_view(),
@@ -1217,6 +1228,14 @@ class ConsoleApp:
             # instead of listing opaque names.
             "narration_presets": narration_presets.preset_public_list(),
             "render_review": service.render_review_state(),
+            # Presentation settings the operator may change WITHOUT
+            # re-approving Phase 0, plus what saving would archive. A
+            # server that accepts an edit the screen cannot make is a
+            # wall, so the panel ships with the resolver.
+            "render_profile": service.render_profile_view(),
+            # The single-clip editor: which seconds of the source this
+            # slot renders, and whether they may be moved at all.
+            "clip_bounds": service.clip_bounds_view(),
             "voice_review": service.voice_review_state(),
             # Gates plan approval, so the panel that answers it has to ship with
             # the plan screen -- a server gate the UI cannot satisfy is a wall.

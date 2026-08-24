@@ -768,14 +768,34 @@ def validate_processing_plan(plan, assessment=None, source_fingerprint: str | No
     return errors
 
 
-def check_config_drift(plan, render_config=None, narration_config=None) -> list:
-    """Reasons the LIVE notebook configuration no longer matches the approved plan.
+#: Render keys that change WHICH WORDS end up on screen. A render profile may
+#: never override these -- doing so would produce subtitles the human approved
+#: the plan for but never actually read.
+PLAN_BOUND_RENDER_KEYS = ("subtitle_language", "subtitle_whisper_model_size")
+
+#: Render keys that change only how the same content LOOKS. Render Studio may
+#: override these per output slot, because re-approving Phase 0 to switch a
+#: caption theme was the friction that made the console read-only after the
+#: first render.
+PRESENTATION_RENDER_KEYS = ("caption_style", "caption_theme", "preview_mode",
+                            "render_mode")
+
+
+def check_config_drift(plan, render_config=None, narration_config=None,
+                       *, presentation_overridden: bool = False) -> list:
+    """Reasons the LIVE configuration no longer matches the approved plan.
 
     The render/narration settings are part of `decision`, so editing them after
     approval already changes the approval hash. But the notebook defines those
     cells BELOW Phase 0, so a user can legitimately approve a plan and then edit
     `RENDER_MODE` further down. This check catches exactly that case and stops
     the render instead of quietly producing something the human never approved.
+
+    `presentation_overridden` says a render profile deliberately supplied the
+    keys in `PRESENTATION_RENDER_KEYS`, so a difference there is a recorded
+    choice rather than drift. It exempts ONLY that fixed list: a key nobody
+    listed still raises, so adding a new render setting fails closed instead of
+    silently becoming overridable.
     """
     errors: list[str] = []
     if not isinstance(plan, dict):
@@ -791,7 +811,10 @@ def check_config_drift(plan, render_config=None, narration_config=None) -> list:
         if label == "render":
             planned = {**RENDER_CONFIG_DEFAULTS, **planned}
             live = {**RENDER_CONFIG_DEFAULTS, **live}
-        for key in sorted(set(live) | set(planned)):
+        keys = sorted(set(live) | set(planned))
+        if label == "render" and presentation_overridden:
+            keys = [key for key in keys if key not in PRESENTATION_RENDER_KEYS]
+        for key in keys:
             if live.get(key) != planned.get(key):
                 errors.append(
                     f"{label}.{key}: plan={planned.get(key)!r} ama su anki ayar={live.get(key)!r}; "

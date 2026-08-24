@@ -57,6 +57,9 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
     service.write_artifact("render_manifest", {
         "schema_version": 1, "status": "review_required", "output": {}, "approval": {},
     }, actor="test")
+    service.storage.write_bytes(
+        ownership, "results/render/subtitles.srt",
+        b"1\n00:00:00,000 --> 00:00:02,000\nEditable caption\n")
     server = ConsoleServer(app, host="127.0.0.1", port=0, quiet=True)
     server.serve_in_thread()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -72,7 +75,25 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
             check("AKTIF CALISMA" in policy.inner_text()
                   and "UZUN SURELI SAKLAMA" in policy.inner_text(),
                   "storage-policy-explains-c-to-archive")
+            page.goto(f"{base}/?project={pid}#render", wait_until="networkidle")
+            check(page.locator("[data-testid=subtitle-editor]").is_visible(),
+                  "subtitle-editor-visible")
+            cue_input = page.locator("[data-testid^=subtitle-cue-input-]").first
+            check(cue_input.input_value() == "Editable caption",
+                  "subtitle-editor-prefilled")
+            cue_input.fill("Browser corrected caption")
+            page.fill("[data-testid=subtitle-editor-notes]", "Browser caption edit")
+            page.click("[data-testid=subtitle-editor-save]")
+            page.wait_for_timeout(700)
+            track = service.load_artifact("subtitle_track")["data"]
+            check(track["cues"][0]["text"] == "Browser corrected caption",
+                  "subtitle-edit-click-persists")
+            check(not service.path("render_manifest").exists(),
+                  "subtitle-edit-click-archives-render")
+            check(service.path("subtitle_track").exists(),
+                  "subtitle-edit-survives-render-archive")
             page.goto(f"{base}/?project={pid}#script", wait_until="networkidle")
+            page.wait_for_timeout(500)
             check(page.locator("[data-testid=project-lifecycle]").count() == 1,
                   "lifecycle-panel-visible")
             check(page.locator("[data-testid=script-editor]").count() == 1,

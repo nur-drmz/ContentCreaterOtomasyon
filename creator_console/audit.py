@@ -32,6 +32,7 @@ EVENT_TYPES = {
     "project.archived",
     "project.deleted",
     "script.updated",
+    "subtitle.updated",
     "source.registered",
     "assessment.created",
     "plan.created",
@@ -54,6 +55,9 @@ EVENT_TYPES = {
     "approval.granted",
     "approval.rejected",
     "approval.invalidated",
+    "clip_bounds.saved",
+    "render_profile.saved",
+    "render_profile.reset",
     "settings.changed",
     "provider.call",
 }

@@ -721,6 +721,19 @@ check("@media (max-width: 900px)" in _css_text and "@media (max-width: 560px)" i
       "frontend:responsive", "responsive kirilma noktalari eksik")
 check("skip-link" in _html_text and 'aria-live' in _html_text, "frontend:a11y",
       "atlama baglantisi / canli bolge yok")
+
+# Server flags need a control, or they are features nobody can reach. The
+# copyright gate shipped without one and made plan approval impossible; these
+# two exist so that does not repeat silently.
+check("'plan-theory-auto'" in _js, "frontend:auto-theory-angle-anahtari",
+      "teori acisini otomatik turetme kutusu arayuzde yok")
+check("theory_angle_auto" in _js, "frontend:auto-theory-angle-GONDERILIYOR",
+      "kutu isaretlense de sunucuya bayrak gitmiyor")
+# And the typed field has to disappear when derivation is on, otherwise the
+# form asks for something the server will refuse alongside the flag.
+check("!decision.theory_angle_auto" in _js,
+      "frontend:otomatikken-elle-aci-alani-GIZLENIYOR",
+      "ikisi birden gonderilirse sunucu reddeder")
 for screen in ("projects", "phase0", "jobs", "moments", "script", "voice", "render",
                "outputs", "settings"):
     check(f"'{screen}'" in _js or f'"{screen}"' in _js, "frontend:screens",

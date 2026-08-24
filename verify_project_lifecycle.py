@@ -69,6 +69,37 @@ with tempfile.TemporaryDirectory(prefix="project_lifecycle_") as temp:
         }, actor="test")
         service.storage.write_bytes(ownership, "results/tts/voice.wav", b"wav")
         service.storage.write_bytes(ownership, "results/render/final_short.mp4", b"mp4")
+        service.storage.write_bytes(
+            ownership, "results/render/subtitles.srt",
+            ("1\n00:00:00,000 --> 00:00:02,000\nOriginal caption\n\n"
+             "2\n00:00:02,000 --> 00:00:04,000\nSecond caption\n").encode("utf-8"))
+
+        # Narrated subtitle edits preserve timings, persist outside the render
+        # directory and archive the now-stale video for a deliberate re-render.
+        subtitle_view = service.subtitle_view()
+        check(subtitle_view["available"] and len(subtitle_view["cues"]) == 2,
+              "subtitle-track-loaded-from-render")
+        first_cue = subtitle_view["cues"][0]
+        status, payload = call(app, "PATCH", f"/api/projects/{pid}/subtitles", {
+            "cues": [{"id": first_cue["id"], "text": "Corrected caption"}],
+            "updated_by": "Editor", "notes": "Corrected a name",
+        })
+        check(status == 200, "subtitle-edit-accepted")
+        track = service.load_artifact("subtitle_track")["data"]
+        check(track["cues"][0]["text"] == "Corrected caption",
+              "subtitle-text-persisted")
+        check(not service.path("render_manifest").exists()
+              and not service.path("render_manifest").parent.joinpath("final_short.mp4").exists(),
+              "subtitle-edit-archives-render")
+        check(service.path("subtitle_track").exists(),
+              "subtitle-track-survives-render-archive")
+
+        # Recreate descendants so the following script edit still proves it
+        # archives a live render chain rather than merely observing absence.
+        service.write_artifact("render_manifest", {
+            "schema_version": 1, "status": "review_required", "output": {}, "approval": {},
+        }, actor="test")
+        service.storage.write_bytes(ownership, "results/render/final_short.mp4", b"mp4")
 
         # Human script edit keeps the script but archives every descendant.
         status, payload = call(app, "PATCH", f"/api/projects/{pid}/script", {
@@ -82,6 +113,8 @@ with tempfile.TemporaryDirectory(prefix="project_lifecycle_") as temp:
               and not edited["human_approval"]["approved"], "script-approval-reset")
         check(not service.path("selected_voiceover").exists(), "voice-removed-from-active-chain")
         check(not service.path("render_manifest").exists(), "render-removed-from-active-chain")
+        check(not service.path("subtitle_track").exists(),
+              "script-edit-archives-stale-subtitle-track")
         revisions = service.revisions()
         check(revisions and revisions[0]["action"] == "script_edit",
               "script-descendants-archived")

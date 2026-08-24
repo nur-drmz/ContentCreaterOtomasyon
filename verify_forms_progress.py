@@ -402,6 +402,12 @@ def section_frontend_contract():
           "script-editor-visible", "script editoru kapali ayrinti alanina saklanmis")
     check("script-hook-missing" in js, "hook-absence-stated",
           "hook yoklugu sessizce gizleniyor")
+    check("function narratedSubtitleEditor(decision)" in js,
+          "narrated-subtitle-editor", "anlatimli altyazi editoru yok")
+    check("subtitle-editor-save" in js and "subtitle-editor-discard" in js,
+          "subtitle-editor-actions", "altyazi editoru kaydet/geri al eylemlerini sunmuyor")
+    check("/subtitles" in js and "subtitleDraftOwner" in js,
+          "subtitle-editor-persistence", "altyazi taslagi veya kaydetme rotasi eksik")
     check("pbar--inner" in js and "pbar--inner" in css, "inner-bar",
           "ic olculu bar yok")
     check("record.item_total && record.state === 'running'" in js,

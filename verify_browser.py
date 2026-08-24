@@ -490,7 +490,237 @@ try:
                   f"{testid} duzenlenebilir alani mevcut")
         goto(page, _BASE, "render", _PID)
         check(page.locator("[data-testid=render-config]").count() == 1,
-              "manual:render-config-shown", "onaylanan render ayarlari gosteriliyor")
+              "manual:render-config-shown", "mevcut ciktinin ayarlari gosteriliyor")
+
+        # ---------------------------------------------------------------
+        # Render Studio Hizli Revize: sunum ayarlari DUZENLENEBILIR olmali.
+        # Sunucuda kapiyi acip ekranda alan birakmamak bu oturumda bir kez
+        # yasandi; bu yuzden alanlar gercek tarayicida araniyor.
+        # ---------------------------------------------------------------
+        panel = page.locator("[data-testid=render-profile-panel]")
+        check(panel.count() == 1, "manual:render-profile-panel",
+              "Sonraki render paneli mevcut")
+        for testid in ("render-profile-quality", "render-profile-resolution",
+                       "render-profile-mode", "render-profile-theme",
+                       "render-profile-color", "render-profile-font-size",
+                       "render-profile-margin", "render-profile-highlight"):
+            check(page.locator(f"[data-testid={testid}]").count() == 1,
+                  f"manual:{testid}", "alan duzenlenebilir")
+
+        # Kalite secenekleri SUNUCUDAN gelmeli, sayfada sabit kodlu olmamali.
+        quality_values = page.locator(
+            "[data-testid=render-profile-quality] option").all_inner_texts()
+        check(sorted(v.strip() for v in quality_values) == ["draft", "final", "preview"],
+              "manual:render-profile-quality-options", str(quality_values))
+
+        # Degisiklik yokken kaydet kapali olmali: hicbir sey degistirmeden
+        # basilan bir kaydet, hala gecerli bir render'i arsivlerdi.
+        save_button = page.locator("[data-testid=render-profile-save]")
+        check(save_button.is_disabled(), "manual:render-profile-save-disabled",
+              "degisiklik yokken kaydet kapali")
+        check(page.locator("[data-testid=render-profile-dirty]").count() == 0,
+              "manual:render-profile-clean", "kaydedilmemis degisiklik uyarisi yok")
+
+        # Etki plani, neyin TASINACAGINI basmadan once soylemeli.
+        check(page.locator("[data-testid=render-profile-impact]").count() == 1,
+              "manual:render-profile-impact", "arsiv etkisi basmadan once yaziyor")
+
+        page.select_option("[data-testid=render-profile-theme]", "game_of_thrones")
+        page.wait_for_timeout(200)
+        check(page.locator("[data-testid=render-profile-dirty]").count() == 1,
+              "manual:render-profile-dirty", "kaydedilmemis degisiklik isaretlendi")
+        check(not save_button.is_disabled(), "manual:render-profile-save-enabled",
+              "degisiklikten sonra kaydet acildi")
+
+        save_button.click()
+        page.wait_for_timeout(1500)
+        report = page.locator("[data-testid=render-profile-report]")
+        check(report.count() == 1, "manual:render-profile-report",
+              "degisiklik raporu gosterildi")
+        check("caption_theme" in report.inner_text(),
+              "manual:render-profile-report-names-field", report.inner_text()[:80])
+
+        # Kaydedilen ayar sayfa yenilendikten sonra da durmali.
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(400)
+        check(page.locator("[data-testid=render-profile-theme]").input_value()
+              == "game_of_thrones",
+              "manual:render-profile-persists", "kayit sayfa yenilemesinden sagi cikti")
+        check(page.locator("[data-testid=render-profile-dirty]").count() == 0,
+              "manual:render-profile-clean-after-save",
+              "kayittan sonra kaydedilmemis degisiklik kalmadi")
+
+        # Kaydetme eski ciktiyi ARSIVE tasidi: ekranda bayat bir video birakmak
+        # yerine, bu ayarlarla henuz video uretilmedigini soylemeli.
+        check(page.locator("[data-testid=render-profile-needs-render]").count() == 1,
+              "manual:render-profile-needs-render",
+              "eski cikti arsivlendi, ekran render gerektigini soyluyor")
+        # Asil iddia: oynatilabilir bir video KALMADI. Manifest arsivlendigi
+        # icin "render henuz calistirilmadi" uyarisi cizilir; bos-durum kutusu
+        # degil. Oynatici yoklugu, bolumun gercekten bosaldiginin kaniti.
+        check(page.locator("[data-testid=render-player]").count() == 0,
+              "manual:render-profile-output-archived",
+              "arsivleme sonrasi oynatilabilir video kalmadi")
+
+        # Faz 0 varsayilanina donus calismali.
+        page.locator("[data-testid=render-profile-reset]").click()
+        page.wait_for_timeout(1500)
+        check(page.locator("[data-testid=render-profile-theme]").input_value() == "auto",
+              "manual:render-profile-reset", "Faz 0 varsayilani geri geldi")
+
+        # Kadraj da profile ait: zoom/odak alanlari ekranda olmali.
+        for testid in ("render-profile-zoom", "render-profile-focus-x",
+                       "render-profile-focus-y"):
+            check(page.locator(f"[data-testid={testid}]").count() == 1,
+                  f"manual:{testid}", "kadraj alani duzenlenebilir")
+
+        # ---------------------------------------------------------------
+        # Tek klipli Video Editor
+        # ---------------------------------------------------------------
+        # Duzenlenecek bir KLIP olmadan editorun cizilmemesi dogru davranistir:
+        # bu proje su ana kadar bilerek moment secmedi (bkz. auto:no-auto-selection).
+        # Once yoklugunu, sonra secimden sonra varligini dogruluyoruz -- boylece
+        # "her zaman gorunuyor" ile "dogru zamanda goruluyor" ayirt edilir.
+        check(page.locator("[data-testid=clip-bounds-editor]").count() == 0,
+              "manual:clip-editor-hidden-without-moment",
+              "moment secilmeden klip editoru gosterilmiyor")
+
+        _hot = _service.load_artifact("hot_moments")["data"]
+        _service.record_moment_selection(
+            selected_rank=_hot["hot_moments"][0]["rank"],
+            reviewed_by="verify_browser", require_preview=False)
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(400)
+
+        editor = page.locator("[data-testid=clip-bounds-editor]")
+        check(editor.count() == 1, "manual:clip-editor-present",
+              "klip araligi editoru mevcut")
+        check(page.locator("[data-testid=clip-track]").count() == 1,
+              "manual:clip-track", "tam kaynagi temsil eden timeline var")
+        check(page.locator("[data-testid=clip-band]").count() == 1,
+              "manual:clip-band", "klip bandi cizildi")
+        for handle in ("clip-handle-start", "clip-handle-end"):
+            check(page.locator(f"[data-testid={handle}]").count() == 1,
+                  f"manual:{handle}", "suruklenebilir tutamac var")
+        check(page.locator("[data-testid=clip-source-player]").count() == 1,
+              "manual:clip-source-player",
+              "kaynak videosu byte-range ile oynatiliyor")
+
+        readout_before = page.locator("[data-testid=clip-readout]").inner_text()
+        check("Kaynak" in readout_before, "manual:clip-readout",
+              readout_before.replace("\n", " ")[:70])
+        # Kaynak suresi GERCEKTEN okunmus olmali. 0:00.00 gelirse timeline
+        # olceksizdir ve bant sifir genislikte cizilir -- "band var" kontrolu
+        # o durumda hicbir sey kanitlamaz.
+        check("Kaynak 0:00.00" not in readout_before,
+              "manual:clip-source-duration-measured",
+              readout_before.replace("\n", " ")[:70])
+        check(page.locator("[data-testid=clip-no-duration]").count() == 0,
+              "manual:clip-timeline-scaled", "zaman cizelgesi olceklendi")
+
+        save_clip = page.locator("[data-testid=clip-save]")
+        check(save_clip.is_disabled(), "manual:clip-save-disabled",
+              "degisiklik yokken kaydet kapali")
+
+        # Nudge FFmpeg calistirmadan sadece sayilari degistirmeli.
+        jobs_before = len(_app.job_store(_app.ownership(_PID)).list())
+        page.locator("[data-testid=clip-start-plus05]").click()
+        page.wait_for_timeout(200)
+        check(page.locator("[data-testid=clip-dirty]").count() == 1,
+              "manual:clip-dirty", "kaydedilmemis aralik degisikligi isaretlendi")
+        check(page.locator("[data-testid=clip-readout]").inner_text() != readout_before,
+              "manual:clip-nudge-moves-readout", "gostergeler guncellendi")
+        check(len(_app.job_store(_app.ownership(_PID)).list()) == jobs_before,
+              "manual:clip-drag-runs-no-job",
+              "surukleme/nudge hicbir render isi baslatmadi")
+        check(not save_clip.is_disabled(), "manual:clip-save-enabled",
+              "degisiklikten sonra kaydet acildi")
+
+        save_clip.click()
+        page.wait_for_timeout(1500)
+        report = page.locator("[data-testid=clip-report]")
+        check(report.count() == 1, "manual:clip-report", "aralik raporu gosterildi")
+
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(400)
+        check(page.locator("[data-testid=clip-dirty]").count() == 0,
+              "manual:clip-persists",
+              "kayit sayfa yenilemesinden sagi cikti")
+
+        page.locator("[data-testid=clip-reset]").click()
+        page.wait_for_timeout(1500)
+        check(page.locator("[data-testid=clip-dirty]").count() == 0,
+              "manual:clip-reset", "analizin secdigi aralige donuldu")
+
+        # Tek ciktili projede secici GORUNMEMELI: secilecek bir sey yokken
+        # secici sunmak ekrani karmasiklastirir.
+        check(page.locator("[data-testid=render-slot-picker]").count() == 0,
+              "manual:render-slot-picker-hidden-single-output",
+              "tek ciktili projede Short secici yok")
+
+        # ---------------------------------------------------------------
+        # Cok ciktili plan: Render Studio hangi Short'u gosterdigini bilmeli.
+        # Batch board'un "Short N" dugmesi buraya slot bilgisi olmadan
+        # geliyordu ve her zaman Short 1'i gosteriyordu.
+        # ---------------------------------------------------------------
+        _ms_seed = fixtures.seed_demo_project(_app, title="Cok ciktili render")
+        _ms_pid = _ms_seed["project_id"]
+        _ms_svc = _app.service(_app.ownership(_ms_pid))
+        _ms_api = ConsoleApi(_app)
+        _ms_api.handle(
+            "POST", f"/api/projects/{_ms_pid}/plan",
+            body=json.dumps({
+                "mode": "direct_clip_series", "selected_by": "verify_browser",
+                "output_count": 2,
+                "render_config": {"render_mode": "blurred_background",
+                                  "preview_mode": True,
+                                  "caption_style": "active_word_yellow",
+                                  "caption_theme": "auto"}}).encode(),
+            headers={})
+
+        goto(page, _BASE, "render", _ms_pid)
+        page.wait_for_timeout(400)
+        picker = page.locator("[data-testid=render-slot]")
+        check(picker.count() == 1, "manual:render-slot-picker",
+              "cok ciktili planda Short secici var")
+        check(len(picker.locator("option").all()) == 2,
+              "manual:render-slot-options", "plandaki her Short listeleniyor")
+        check(picker.input_value() == "1", "manual:render-slot-defaults-to-1",
+              picker.input_value())
+
+        # Short 2'ye gec ve GERCEKTEN 2. slotu duzenledigini kanitla: kayit
+        # dosyasi output_02.json olmali. Panel slot 1'i okusaydi kayit
+        # output_01.json'a giderdi ve bu kontrol duserdi.
+        page.select_option("[data-testid=render-slot]", "2")
+        page.wait_for_timeout(1200)
+        check(page.locator("[data-testid=render-slot]").input_value() == "2",
+              "manual:render-slot-switched", "Short 2 secildi")
+        check(page.locator("[data-testid=render-profile-panel]").count() == 1,
+              "manual:render-slot-2-panel", "Short 2 icin ayar paneli yuklendi")
+
+        page.select_option("[data-testid=render-profile-theme]", "game_of_thrones")
+        page.wait_for_timeout(200)
+        page.locator("[data-testid=render-profile-save]").click()
+        page.wait_for_timeout(1500)
+
+        _slot2 = _ms_svc.render_profile(2)
+        _slot1 = _ms_svc.render_profile(1)
+        check(_slot2["settings"]["caption_theme"] == "game_of_thrones",
+              "manual:render-slot-2-saved",
+              str(_slot2["settings"]["caption_theme"]))
+        check(_slot1["settings"]["caption_theme"] == "auto",
+              "manual:render-slot-1-untouched",
+              f"Short 1 degismemeli, su an: {_slot1['settings']['caption_theme']}")
+        check(_slot2["source"] == "saved_profile" and _slot1["source"] != "saved_profile",
+              "manual:render-slot-2-own-artifact",
+              f"{_slot1['source']} / {_slot2['source']}")
+
+        # Short 1'e geri donunce panel ONUN degerini gostermeli, Short 2'ninkini degil.
+        page.select_option("[data-testid=render-slot]", "1")
+        page.wait_for_timeout(800)
+        check(page.locator("[data-testid=render-profile-theme]").input_value() == "auto",
+              "manual:render-slot-back-to-1",
+              "Short 1'e donunce Short 2'nin temasi gosteriliyor")
 
         # ================================================================
         section("11. Moment cards and previews survive a refresh")

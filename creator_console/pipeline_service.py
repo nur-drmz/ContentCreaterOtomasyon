@@ -36,6 +36,7 @@ from local_pipeline import (
     scene_editor,
     script_generation,
     source_strategy,
+    subtitle_edit,
     transcript_edit,
     trend_ingest,
     tts as tts_module,
@@ -45,6 +46,7 @@ from local_pipeline import (
 from .audit import AuditLog
 from . import progress as progress_module
 from . import copyright_review as copyright_review_module
+from . import render_profile as render_profile_module
 from . import render_review as render_review_module
 from . import voice_review as voice_review_module
 from .ids import Ownership, new_id, safe_filename
@@ -67,6 +69,7 @@ ARTIFACTS = {
     "moment_selection": "results/moment_selection.json",
     "selected_script": "results/selected_script.json",
     "selected_voiceover": "results/selected_voiceover.json",
+    "subtitle_track": "results/subtitle_track.json",
     "moment_transcript": "results/moment_transcript.json",
     "glossary": "results/glossary.json",
     "long_form_plan": "results/long_form_plan.json",
@@ -129,6 +132,7 @@ REQUIRED_FIELDS = {
     "moment_selection": ("artifact_type", "status", "selected_moment_rank"),
     "selected_script": ("status", "provider_attempts"),
     "selected_voiceover": ("status",),
+    "subtitle_track": ("artifact_type", "status", "cues"),
     "moment_transcript": ("artifact_type", "status", "words", "cues"),
     "glossary": ("artifact_type", "status", "terms"),
     "long_form_plan": ("artifact_type", "status", "topic", "content_type",
@@ -217,6 +221,16 @@ REWIND_PATHS = {
 REWIND_PATHS = {
     stage: (paths + ("results/moment_transcript.json",)
             if stage in ("assessment", "plan", "analysis", "moment", "script")
+            else paths)
+    for stage, paths in REWIND_PATHS.items()
+}
+
+# Narrated subtitles are derived from the approved voice. Preserve manual text
+# edits across a plain re-render, but archive them when the plan, moment, script
+# or voice changes because their timings/text basis is then stale.
+REWIND_PATHS = {
+    stage: (paths + ("results/subtitle_track.json",)
+            if stage in ("assessment", "plan", "analysis", "moment", "script", "voice")
             else paths)
     for stage, paths in REWIND_PATHS.items()
 }
@@ -811,6 +825,579 @@ class PipelineService:
                                   "matched_commands": record["matched_commands"]})
         return record
 
+    # ---------------------------------------------------------- render profile
+    def render_profile_relative(self, slot: int = 1) -> str:
+        index = self.require_slot(slot)
+        return f"results/render_profiles/output_{index:02d}.json"
+
+    def plan_decision(self) -> dict:
+        return ((self.load_artifact("processing_plan")["data"] or {})
+                .get("decision") or {})
+
+    def render_profile(self, slot: int = 1) -> dict:
+        """The saved profile, or Phase 0's decision expressed as one.
+
+        A project that never opens Render Studio has NO profile file, and must
+        keep rendering exactly as the approved plan said. So the fallback is not
+        a hardcoded default -- it is the plan itself, plus whatever framing the
+        old `render_adjustment` artifact recorded, migrated on read so the two
+        never disagree.
+        """
+        decision = self.plan_decision()
+        loaded = self.load_artifact_path(self.render_profile_relative(slot))
+        if isinstance(loaded, dict) and isinstance(loaded.get("settings"), dict):
+            try:
+                settings = render_profile_module.validate(
+                    loaded["settings"], slot=slot, plan_decision=decision)
+            except render_profile_module.RenderProfileError:
+                # A profile written by an older schema, or hand-edited into an
+                # invalid state, must not brick the render screen. Fall back to
+                # the plan and say so, rather than raising at read time.
+                return {"settings": render_profile_module.default_profile(
+                            decision, slot=slot),
+                        "source": "plan_default_invalid_profile",
+                        "content_sha256": None, "updated_at": None,
+                        "updated_by": None, "reason": "", "base_plan_hash": None}
+            return {"settings": settings,
+                    "source": "saved_profile",
+                    "content_sha256": loaded.get("content_sha256"),
+                    "updated_at": loaded.get("updated_at"),
+                    "updated_by": loaded.get("updated_by"),
+                    "reason": loaded.get("reason") or "",
+                    "base_plan_hash": loaded.get("base_plan_hash")}
+
+        adjustment = self.load_artifact_path(self.render_adjustment_relative(slot))
+        settings = render_profile_module.from_render_adjustment(
+            adjustment if isinstance(adjustment, dict) else None, decision, slot=slot)
+        return {"settings": settings,
+                "source": ("migrated_render_adjustment"
+                           if isinstance(adjustment, dict) else "plan_default"),
+                "content_sha256": render_profile_module.content_sha256(settings),
+                "updated_at": None, "updated_by": None, "reason": "",
+                "base_plan_hash": None}
+
+    def effective_render_config(self, slot: int = 1) -> dict:
+        """What a render of this slot will actually use.
+
+        Phase 0 supplies every key; the profile replaces only the presentation
+        ones. `presentation_overridden` travels WITH the config so the drift
+        check knows the difference is a recorded choice and not an edited
+        notebook cell.
+        """
+        decision = self.plan_decision()
+        profile = self.render_profile(slot)["settings"]
+        config = render_profile_module.effective_render_config(decision, profile)
+        return {
+            "config": config,
+            "quality": render_profile_module.resolve_quality(profile),
+            "framing": {key: profile[key] for key in
+                        ("frame_zoom", "frame_focus_x", "frame_focus_y")},
+            "caption_overrides": {
+                "font_size": profile["caption_font_size"],
+                "margin_v": profile["caption_margin_v"],
+                "active_color_ass": render_profile_module.ACTIVE_COLORS[
+                    profile["active_word_color"]],
+            },
+            # Compared against the plan expressed AS a profile, not against the
+            # plan dict's raw keys: a plan that simply omits `preview_mode`
+            # would otherwise look overridden on every untouched project, and
+            # silently disarm the drift check for projects nobody edited.
+            "profile_settings": profile,
+            "presentation_overridden": config != render_profile_module
+                .effective_render_config(
+                    decision,
+                    render_profile_module.default_profile(decision, slot=slot)),
+        }
+
+    #: Artifacts that live in a slot's render directory but are INPUTS to the
+    #: render, not products of it. Re-encoding must never take them.
+    #:
+    #: Slot 1 keeps these at the historical top-level paths, outside the render
+    #: directory, so they were safe there by accident. Slots 2+ keep them INSIDE
+    #: `results/render/output_NN/`, where archiving the directory wholesale
+    #: silently destroyed the moment selection and the approved caption text --
+    #: turning "change the caption theme" into "lose your moment".
+    RENDER_ARCHIVE_PRESERVED = ("moment_selection.json", "moment_transcript.json")
+
+    def _render_slot_archive_paths(self, slot: int = 1, *,
+                                   preserve=None) -> list:
+        """Exactly this slot's render OUTPUT -- nothing another Short owns, and
+        nothing this Short needs in order to render again.
+
+        Slot 1's render directory CONTAINS slot 2's (`results/render/output_02`),
+        so archiving `results/render` wholesale would take every other Short with
+        it. That is the slot leak `PER_SLOT_ARTIFACTS` exists to prevent, and it
+        would be silent: the operator changes slot 1's caption theme and slot 3's
+        approved video quietly moves into the archive.
+
+        `preserve` names files to keep even though they sit in the slot's
+        directory; pass an empty tuple to archive the transcript too, which is
+        what a direct-mode clip-range edit has to do.
+        """
+        index = int(slot or 1)
+        keep = self.RENDER_ARCHIVE_PRESERVED if preserve is None else tuple(preserve)
+        paths = []
+        if index != 1:
+            root = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
+                                        f"output_{index:02d}")
+            if root.is_dir():
+                for child in sorted(root.iterdir()):
+                    if child.name in keep:
+                        continue
+                    paths.append(
+                        f"{RESULTS_DIRNAME}/render/output_{index:02d}/{child.name}")
+            return paths
+        root = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render")
+        if root.is_dir():
+            for child in sorted(root.iterdir()):
+                name = child.name
+                if (child.is_dir() and name.startswith("output_")
+                        and name[len("output_"):].isdigit()):
+                    continue                      # another slot's Short
+                if name in keep:
+                    continue
+                paths.append(f"{RESULTS_DIRNAME}/render/{name}")
+        paths.append(render_review_module.RENDER_REVIEW_ARTIFACT)
+        # A publish intent authorises ONE upload of ONE exact video hash, and
+        # `create_publish_intent` reads slot 1's manifest -- so the intent belongs
+        # to slot 1 and must not outlive slot 1's render.
+        paths.append(ARTIFACTS["publish_intent"])
+        return paths
+
+    def render_profile_impact(self, slot: int = 1) -> dict:
+        """What saving a new profile WOULD archive. Pure read, changes nothing.
+
+        Shown before the button is pressed for the same reason `revision_plan`
+        is: a confirmation that cannot name what it moves is not consent.
+        """
+        slot = self.require_slot(slot)
+        entries = []
+        for relative in self._render_slot_archive_paths(slot):
+            try:
+                path = self.storage.resolve(self.ownership, relative)
+            except StorageViolation:
+                continue
+            if not path.exists():
+                continue
+            if path.is_dir():
+                files = [child for child in path.rglob("*") if child.is_file()]
+                entries.append({"path": relative, "kind": "dir",
+                                "file_count": len(files),
+                                "size_bytes": sum(f.stat().st_size for f in files)})
+            else:
+                entries.append({"path": relative, "kind": "file", "file_count": 1,
+                                "size_bytes": path.stat().st_size})
+        return {
+            "slot": slot,
+            "moves": entries,
+            "file_count": sum(entry["file_count"] for entry in entries),
+            "size_bytes": sum(entry["size_bytes"] for entry in entries),
+            "nothing_to_move": not entries,
+            "destination": "revisions/<revizyon-id>/",
+            "reversible": True,
+            # Said plainly so the UI can promise it: changing how a Short LOOKS
+            # never re-runs the script or the voice, and never costs a provider
+            # call. Only the encode is redone.
+            "preserved": ["results/selected_script.json",
+                          "results/selected_voiceover.json",
+                          "results/moment_selection.json",
+                          "results/moment_transcript.json",
+                          "results/subtitle_track.json"],
+            "not_uploaded": True,
+        }
+
+    # --------------------------------------------------------- clip bounds
+    def clip_bounds_relative(self, slot: int = 1) -> str:
+        index = self.require_slot(slot)
+        return f"results/clip_bounds/output_{index:02d}.json"
+
+    def selected_moment(self, slot: int = 1) -> dict:
+        """The analysed moment this slot renders, or {} when none is chosen."""
+        selection = self.load_artifact("moment_selection", slot=slot)
+        hot = self.load_artifact("hot_moments")
+        if selection["problem"] or hot["problem"]:
+            return {}
+        rank = (selection["data"] or {}).get("selected_moment_rank")
+        for moment in ((hot["data"] or {}).get("hot_moments") or []):
+            if moment.get("rank") == rank:
+                return moment
+        return {}
+
+    def clip_bounds(self, slot: int = 1) -> dict:
+        """This slot's edited clip range, falling back to the analysed moment.
+
+        Per SLOT, not per project: `results/edl/edl.json` is a single
+        project-wide artifact, so storing a slot's in/out there would let one
+        Short's edit silently move another's -- the leak `PER_SLOT_ARTIFACTS`
+        exists to stop.
+        """
+        moment = self.selected_moment(slot)
+        default_start = moment.get("source_start_sec")
+        default_end = moment.get("source_end_sec")
+        loaded = self.load_artifact_path(self.clip_bounds_relative(slot))
+        if isinstance(loaded, dict) and loaded.get("source_end_sec") is not None:
+            return {
+                "source_start_sec": float(loaded["source_start_sec"]),
+                "source_end_sec": float(loaded["source_end_sec"]),
+                "edited": True,
+                "moment_start_sec": default_start,
+                "moment_end_sec": default_end,
+                "updated_at": loaded.get("updated_at"),
+                "updated_by": loaded.get("updated_by"),
+            }
+        return {
+            "source_start_sec": default_start,
+            "source_end_sec": default_end,
+            "edited": False,
+            "moment_start_sec": default_start,
+            "moment_end_sec": default_end,
+            "updated_at": None, "updated_by": None,
+        }
+
+    def clip_bounds_override(self, slot: int = 1):
+        """What `_run_render` passes down -- `None` when nothing was edited."""
+        bounds = self.clip_bounds(slot)
+        if not bounds["edited"]:
+            return None
+        return {"source_start_sec": bounds["source_start_sec"],
+                "source_end_sec": bounds["source_end_sec"]}
+
+    def source_duration_sec(self):
+        """How long the source video is, in seconds, or None.
+
+        Read from `source_assessment.source.duration_sec` -- the value ffprobe
+        actually measured in Phase 0. `hot_moments.source` does NOT carry a
+        duration (it records paths and the analysis window), so reading it there
+        silently yielded `None`, and a timeline whose scale is `None` collapses
+        to zero width: every clip band rendered as a sliver at the far left.
+        """
+        assessment = self.load_artifact("source_assessment")
+        duration = ((assessment["data"] or {}).get("source") or {}).get("duration_sec")
+        if duration:
+            return float(duration)
+        # An older project may predate the assessment artifact; measuring the
+        # file is still better than drawing a broken timeline.
+        try:
+            _ffmpeg, ffprobe = self.binaries()
+            info, _note = render_utils.probe_media(str(self.source_path()), ffprobe)
+        except Exception:                              # noqa: BLE001
+            return None
+        raw = ((info or {}).get("format") or {}).get("duration")
+        try:
+            return round(float(raw), 3) if raw else None
+        except (TypeError, ValueError):
+            return None
+
+    def clip_bounds_view(self, slot: int = 1) -> dict:
+        """Everything the single-clip editor needs, decided on the server.
+
+        Includes `source_duration_sec` because a timeline that does not know how
+        long the source is cannot draw a scrubber, and `editable` because the
+        answer depends on which file the render will actually seek into -- an
+        analysis clip is already cropped and absolute source seconds mean
+        something different in it.
+        """
+        try:
+            slot = self.require_slot(slot)
+        # Rendered on EVERY page load, including a project with no plan yet.
+        # A panel that cannot open must say so, never break the page.
+        except (PipelineServiceError, ArtifactProblem):
+            return {"available": False, "slot": int(slot or 1),
+                    "reason": "bu slot planda tanimli degil"}
+        moment = self.selected_moment(slot)
+        if not moment:
+            return {"available": False, "slot": slot,
+                    "reason": "once bir moment secilmeli"}
+        source = ((self.load_artifact("hot_moments")["data"] or {})
+                  .get("source") or {})
+        raw_path = source.get("raw_video_path")
+        # A project can reach this screen with its source file gone (moved,
+        # archived, restored onto another machine). That is a reason to say
+        # the range cannot be edited -- not a reason to break the whole page.
+        try:
+            project_source = self.source_path()
+        except (PipelineServiceError, ArtifactProblem):
+            project_source = None
+        editable = bool(project_source and Path(project_source).is_file()) \
+            or bool(raw_path and Path(raw_path).is_file())
+        bounds = self.clip_bounds(slot)
+        pipeline_mode = (self.load_artifact("processing_plan")["data"] or {}) \
+            .get("pipeline_mode")
+        return {
+            "available": True,
+            "slot": slot,
+            "bounds": bounds,
+            "source_duration_sec": self.source_duration_sec(),
+            "moment_rank": moment.get("rank"),
+            # The editor plays the SOURCE, not a rendered clip, and it plays it
+            # by byte range -- so dragging a handle costs no FFmpeg run. The
+            # server names the path; the browser never builds one.
+            "source_media_path": ((self.load_artifact("project")["data"] or {})
+                                  .get("source") or {}).get("stored_path"),
+            "editable": editable,
+            "not_editable_reason": ("" if editable else
+                                    "Orijinal kaynak video diskte bulunamadi; "
+                                    "klip araligi yalnizca orijinal kaynakla "
+                                    "duzenlenebilir."),
+            # Said before the drag, not after: in direct mode the captions come
+            # from this range, so moving it means the transcript has to be
+            # produced and read again.
+            "transcript_will_be_invalidated": pipeline_mode == "original_audio_subtitles",
+            "min_duration_sec": scene_editor.MIN_CLIP_DURATION_SEC,
+            "not_uploaded": True,
+        }
+
+    def save_clip_bounds(self, *, start: float, end: float, actor: str = "console",
+                         slot: int = 1) -> dict:
+        """Move or resize this slot's clip inside the source.
+
+        Direct mode captions come from THIS range, so changing it invalidates the
+        approved transcript: the words a human read are no longer the words that
+        will be spoken. Narrated mode keeps its script, voice and subtitles --
+        the narration does not change because the picture underneath moved.
+        """
+        slot = self.require_slot(slot)
+        moment = self.selected_moment(slot)
+        if not moment:
+            raise PipelineServiceError(
+                "Once bir moment secilmeli: duzenlenecek bir klip yok.")
+        # The measured source length. Reading it from `hot_moments.source` --
+        # which has no duration field -- yielded None, and a None upper bound
+        # means NO upper bound: an operator could drag the clip past the end of
+        # the file and only find out when ffmpeg failed.
+        source_duration = self.source_duration_sec()
+        clip = scene_editor.EDLClip(
+            clip_id=f"slot_{slot:02d}",
+            source_path=str(self.source_path()),
+            source_start_sec=float(moment.get("source_start_sec") or 0.0),
+            source_end_sec=float(moment.get("source_end_sec") or 0.0),
+        )
+        try:
+            edited = scene_editor.set_clip_source_bounds(
+                clip, start, end,
+                float(source_duration) if source_duration else None)
+        except ValueError as exc:
+            raise PipelineServiceError(str(exc)) from exc
+
+        previous = self.clip_bounds(slot)
+        unchanged = (abs(previous["source_start_sec"] - edited.source_start_sec) < 1e-6
+                     and abs(previous["source_end_sec"] - edited.source_end_sec) < 1e-6)
+        if unchanged:
+            return {"slot": slot, "bounds": previous, "unchanged": True,
+                    "archived": None, "transcript_invalidated": False,
+                    "not_uploaded": True}
+
+        pipeline_mode = (self.load_artifact("processing_plan")["data"] or {}) \
+            .get("pipeline_mode")
+        is_direct = pipeline_mode == "original_audio_subtitles"
+        if is_direct:
+            # The caption text was transcribed from the OLD range and a human
+            # approved THAT text. Keeping it would burn in words that are no
+            # longer spoken -- the exact failure the transcript gate exists for.
+            #
+            # Dropped from `preserve` rather than appended: for slots 2+ the
+            # transcript lives INSIDE the slot directory, so a slot-1-shaped
+            # path would name a file that is not there and archive nothing.
+            preserve = tuple(name for name in self.RENDER_ARCHIVE_PRESERVED
+                             if name != "moment_transcript.json")
+            paths = self._render_slot_archive_paths(slot, preserve=preserve)
+            paths = paths + [self.artifact_relative("moment_transcript", slot)]
+        else:
+            paths = self._render_slot_archive_paths(slot)
+        archived = self._archive_revision(
+            paths, action="clip_bounds_edited", actor=actor, target="render")
+
+        atomic_write_json(
+            self.storage.resolve(self.ownership, self.clip_bounds_relative(slot),
+                                 create_parent=True),
+            {"artifact_type": "clip_bounds", "schema_version": 1,
+             "output_slot": slot, "not_uploaded": True,
+             "source_start_sec": edited.source_start_sec,
+             "source_end_sec": edited.source_end_sec,
+             "moment_start_sec": moment.get("source_start_sec"),
+             "moment_end_sec": moment.get("source_end_sec"),
+             "updated_at": _now_iso(),
+             "updated_by": str(actor or "console")[:120]})
+
+        self.audit.record("clip_bounds.saved", actor=actor,
+                          artifact=self.clip_bounds_relative(slot),
+                          detail={"slot": slot,
+                                  "source_start_sec": edited.source_start_sec,
+                                  "source_end_sec": edited.source_end_sec,
+                                  "transcript_invalidated": is_direct,
+                                  "revision_id": (archived or {}).get("revision_id")})
+        return {"slot": slot, "bounds": self.clip_bounds(slot), "unchanged": False,
+                "archived": archived, "transcript_invalidated": is_direct,
+                "not_uploaded": True}
+
+    def reset_clip_bounds(self, *, actor: str = "console", slot: int = 1) -> dict:
+        """Snap back to the range the analysis chose."""
+        slot = self.require_slot(slot)
+        moment = self.selected_moment(slot)
+        if not moment:
+            raise PipelineServiceError("Once bir moment secilmeli.")
+        return self.save_clip_bounds(
+            start=float(moment["source_start_sec"]),
+            end=float(moment["source_end_sec"]), actor=actor, slot=slot)
+
+    def render_profile_view(self, slot: int = 1) -> dict:
+        """Everything the Render Studio panel needs, decided on the server.
+
+        Includes the CURRENT output's settings separately from the NEXT
+        render's, because the screen must never show a pending choice as though
+        it were what the existing video was made with. `stale` is the whole
+        point: an operator who saved a new theme and did not re-render has to
+        see that the video below is the old one.
+        """
+        try:
+            slot = self.require_slot(slot)
+        # Rendered on EVERY page load, including a project with no plan yet.
+        # A panel that cannot open must say so, never break the page.
+        except (PipelineServiceError, ArtifactProblem):
+            return {"available": False, "slot": int(slot or 1),
+                    "reason": "bu slot planda tanimli degil"}
+        profile = self.render_profile(slot)
+        effective = self.effective_render_config(slot)
+        manifest = self.load_artifact("render_manifest", slot=slot)
+        rendered = (manifest["data"] or {}).get("render_profile") or {}
+        current_hash = rendered.get("content_sha256")
+        return {
+            "available": True,
+            "slot": slot,
+            "settings": profile["settings"],
+            "source": profile["source"],
+            "content_sha256": profile["content_sha256"],
+            "updated_at": profile["updated_at"],
+            "updated_by": profile["updated_by"],
+            "reason": profile["reason"],
+            "effective": effective,
+            "impact": self.render_profile_impact(slot),
+            # What the EXISTING video was actually rendered with. Provenance,
+            # not a comparison: saving a profile ARCHIVES the old render, so a
+            # video and a profile can never disagree here -- there is no "stale
+            # output" state to warn about, only "no output yet".
+            #
+            # Older renders predate the stamp and report `null`, which the panel
+            # says plainly instead of guessing that they match.
+            "rendered_settings": rendered.get("settings"),
+            "rendered_sha256": current_hash,
+            "rendered_quality_preset": rendered.get("quality_preset"),
+            "rendered_is_delivery_quality": rendered.get("is_delivery_quality"),
+            "has_output": bool(manifest["data"]),
+            "unknown_rendered_settings": bool(manifest["data"]) and current_hash is None,
+            "options": {
+                "quality_presets": sorted(render_profile_module.QUALITY_PRESETS),
+                "resolution_presets": sorted(render_profile_module.RESOLUTION_PRESETS),
+                "render_modes": list(render_profile_module.RENDER_MODES),
+                "caption_themes": ["auto"] + list(render_profile_module.allowed_themes()),
+                "active_word_colors": sorted(render_profile_module.ACTIVE_COLORS),
+                "delivery_quality": render_profile_module.DELIVERY_QUALITY,
+                "font_size_range": [render_profile_module.FONT_SIZE_MIN,
+                                    render_profile_module.FONT_SIZE_MAX],
+                "margin_v_range": [render_profile_module.MARGIN_V_MIN,
+                                   render_profile_module.MARGIN_V_MAX],
+            },
+            "not_uploaded": True,
+        }
+
+    def save_render_profile(self, values, *, actor: str = "console",
+                            expected_hash=None, reason: str = "",
+                            slot: int = 1) -> dict:
+        """Validate, archive this slot's render, write the new profile.
+
+        Saving a profile and STARTING a render are deliberately separate: the
+        operator may want to line up several changes before spending an encode,
+        and an encode that begins on a keystroke is not a decision anyone made.
+        """
+        slot = self.require_slot(slot)
+        decision = self.plan_decision()
+        current = self.render_profile(slot)
+
+        # Stale-write guard. The echoed hash is the operator's claim about WHICH
+        # settings they were editing; if the slot moved underneath them, saving
+        # would silently discard the other change.
+        if expected_hash is not None:
+            echoed = str(expected_hash or "").strip()
+            if echoed != (current["content_sha256"] or ""):
+                raise PipelineServiceError(
+                    "Bu slotun render profili siz duzenlerken degisti. Sayfayi "
+                    "yenileyip degisikliginizi tekrar girin.")
+
+        # Validation FIRST: it is the step that can reject, and nothing may be
+        # archived on a request that was never going to be accepted.
+        try:
+            settings = render_profile_module.validate(
+                values, slot=slot, plan_decision=decision)
+        except render_profile_module.RenderProfileError as exc:
+            self.audit.record("artifact.rejected", actor=actor,
+                              artifact=self.render_profile_relative(slot),
+                              detail={"kind": "render_profile", "slot": slot,
+                                      "reason": str(exc)})
+            raise PipelineServiceError(str(exc)) from exc
+
+        changed = render_profile_module.changed_fields(current["settings"], settings)
+        if not changed and current["source"] == "saved_profile":
+            # Saving identical settings must archive NOTHING. Otherwise every
+            # stray click would throw away a render that is still exactly right.
+            return {"slot": slot, "settings": settings, "changed_fields": [],
+                    "unchanged": True, "archived": None,
+                    "content_sha256": current["content_sha256"],
+                    "render_required": False, "not_uploaded": True}
+
+        impact = self.render_profile_impact(slot)
+        archived = None
+        if not impact["nothing_to_move"]:
+            archived = self._archive_revision(
+                self._render_slot_archive_paths(slot),
+                action="render_profile_saved", actor=actor, target="render")
+
+        plan_hash = ((self.load_artifact("processing_plan")["data"] or {})
+                     .get("approval") or {}).get("content_sha256")
+        artifact = render_profile_module.build_artifact(
+            settings, slot=slot, base_plan_hash=plan_hash,
+            actor=actor, reason=reason,
+            previous_sha256=current["content_sha256"])
+        atomic_write_json(
+            self.storage.resolve(self.ownership,
+                                 self.render_profile_relative(slot),
+                                 create_parent=True),
+            artifact)
+
+        # Field NAMES only. `reason` is operator free text and never enters the
+        # trail as content.
+        self.audit.record("render_profile.saved", actor=actor,
+                          artifact=self.render_profile_relative(slot),
+                          detail={"slot": slot, "changed_fields": changed,
+                                  "previous_sha256": current["content_sha256"],
+                                  "content_sha256": artifact["content_sha256"],
+                                  "has_reason": bool(str(reason or "").strip()),
+                                  "archived_paths": (archived or {}).get("moved_paths", []),
+                                  "revision_id": (archived or {}).get("revision_id")})
+        return {"slot": slot, "settings": settings, "changed_fields": changed,
+                "unchanged": False, "archived": archived,
+                "content_sha256": artifact["content_sha256"],
+                "render_required": True, "not_uploaded": True}
+
+    def reset_render_profile(self, *, actor: str = "console",
+                             slot: int = 1) -> dict:
+        """Return this slot to what Phase 0 approved.
+
+        Implemented as a save of the plan's own defaults rather than by deleting
+        the file, so the reset archives the stale render exactly like any other
+        change and leaves the same audit trail.
+        """
+        slot = self.require_slot(slot)
+        defaults = render_profile_module.default_profile(self.plan_decision(),
+                                                         slot=slot)
+        result = self.save_render_profile(
+            defaults, actor=actor, reason="Faz 0 varsayilanlarina donuldu",
+            slot=slot)
+        self.audit.record("render_profile.reset", actor=actor,
+                          artifact=self.render_profile_relative(slot),
+                          detail={"slot": slot,
+                                  "changed_fields": result["changed_fields"]})
+        return result
+
     def revision_plan(self, *, target: str, slot: int = 1) -> dict:
         """What starting this revision WOULD archive. Pure read, changes nothing.
 
@@ -1064,6 +1651,90 @@ class PipelineService:
                               "downstream_archived": revision["moved_paths"],
                           })
         return artifact
+
+    def subtitle_view(self, slot: int = 1) -> dict:
+        """Editable narrated-caption rows, preferring saved human revisions."""
+        slot = self.require_slot(slot)
+        plan = self.load_artifact("processing_plan")["data"] or {}
+        mode = (plan.get("decision") or {}).get("mode")
+        loaded = self.load_artifact("subtitle_track")
+        if loaded["problem"]:
+            return {"slot": slot, "mode": mode, "available": False,
+                    "problem": loaded["problem"], "cues": []}
+
+        artifact = loaded["data"] or {}
+        source = artifact.get("source") or "saved_revision"
+        cues = artifact.get("cues") or []
+        if not cues:
+            srt_path = self.slot_render_dir(slot) / "subtitles.srt"
+            if not srt_path.is_file():
+                return {
+                    "slot": slot, "mode": mode, "available": False,
+                    "problem": None, "cues": [], "source": None,
+                    "hint": "Ilk renderden sonra altyazi satirlari burada duzenlenebilir.",
+                }
+            try:
+                cues = subtitle_edit.parse_srt(srt_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, subtitle_edit.SubtitleEditError) as exc:
+                return {"slot": slot, "mode": mode, "available": False,
+                        "problem": f"altyazi dosyasi okunamadi: {exc}", "cues": []}
+            source = "rendered_srt"
+
+        try:
+            public = subtitle_edit.public_cues(cues)
+            digest = subtitle_edit.content_sha256(cues)
+        except subtitle_edit.SubtitleEditError as exc:
+            return {"slot": slot, "mode": mode, "available": False,
+                    "problem": f"altyazi artefakti gecersiz: {exc}", "cues": []}
+        return {
+            "slot": slot, "mode": mode, "available": True, "problem": None,
+            "source": source, "source_sha256": digest,
+            "revision": int(artifact.get("revision") or 0),
+            "cues": public, "cue_count": len(public),
+            "limits": {"max_cue_chars": subtitle_edit.MAX_CUE_CHARS,
+                       "max_total_chars": subtitle_edit.MAX_TOTAL_CHARS},
+        }
+
+    def save_subtitle_edits(self, *, cues, edited_by: str, notes: str = "",
+                            slot: int = 1) -> dict:
+        """Save text-only cue edits and archive the now-stale rendered video."""
+        slot = self.require_slot(slot)
+        actor = str(edited_by or "").strip()
+        if not actor:
+            raise PipelineServiceError("altyaziyi duzenleyen kisi zorunlu")
+        current = self.subtitle_view(slot)
+        if current.get("problem"):
+            raise PipelineServiceError(current["problem"])
+        if not current.get("available"):
+            raise PipelineServiceError(
+                "duzenlenecek altyazi yok; once anlatimli videoyu bir kez render et")
+        raw_cues = [
+            {"start": cue["start"], "end": cue["end"], "text": cue["text"]}
+            for cue in current["cues"]
+        ]
+        try:
+            rebuilt, changed = subtitle_edit.apply_text_edits(raw_cues, cues)
+        except subtitle_edit.SubtitleEditError as exc:
+            raise PipelineServiceError(str(exc)) from None
+        if not changed:
+            return current
+
+        previous = self.load_artifact("subtitle_track")["data"] or None
+        revision = self._archive_revision(
+            REWIND_PATHS["render"], action="subtitle_edit", actor=actor,
+            target="render")
+        artifact = subtitle_edit.build_artifact(
+            rebuilt, source=current.get("source") or "rendered_srt",
+            actor=actor, notes=notes, previous=previous,
+            revision_id=revision["revision_id"])
+        relative = self.write_artifact("subtitle_track", artifact, actor=actor)
+        self.audit.record(
+            "subtitle.updated", actor=actor, artifact=relative,
+            detail={"slot": slot, "changed_cues": changed,
+                    "changed_count": len(changed),
+                    "revision_id": revision["revision_id"],
+                    "render_archived": revision["moved_paths"]})
+        return self.subtitle_view(slot)
 
     def register_source_video(self, *, filename: str, payload: bytes,
                               registered_by: str, track: bool = False) -> dict:
@@ -1713,6 +2384,7 @@ class PipelineService:
 
     def create_processing_plan(self, *, mode: str, selected_by: str, output_count=None,
                                target_duration_sec=None, moment_ranks=None, theory_angle="",
+                               theory_angle_auto: bool = False,
                                render_config=None, notes="",
                                content_language=None,
                                narration_preset=None) -> dict:
@@ -1724,7 +2396,8 @@ class PipelineService:
         plan = source_strategy.build_processing_plan(
             assessment["data"], mode, selected_by, output_count=output_count,
             target_duration_sec=target_duration_sec, moment_ranks=moment_ranks,
-            theory_angle=theory_angle, render_config=render_config,
+            theory_angle=theory_angle, theory_angle_auto=theory_angle_auto,
+            render_config=render_config,
             content_language=content_language,
             narration_preset=narration_preset,
             render_root=render_root, notes=notes,
@@ -1743,6 +2416,7 @@ class PipelineService:
     def update_processing_plan(self, *, updated_by: str, mode=None, selected_by=None,
                                output_count=None, target_duration_sec=None,
                                moment_ranks=None, theory_angle=None,
+                           theory_angle_auto=None,
                                render_config=None, notes=None,
                                content_language=None,
                                narration_preset=None) -> dict:
@@ -1780,6 +2454,14 @@ class PipelineService:
                         else old_decision.get("moment_ranks") or [])
         chosen_angle = (theory_angle if theory_angle is not None
                         else old_decision.get("theory_angle") or "")
+        chosen_auto_angle = (bool(theory_angle_auto) if theory_angle_auto is not None
+                             else bool(old_decision.get("theory_angle_auto")))
+        # Typing an angle is an explicit choice to stop deriving one; keeping
+        # both would hit the server's "not both" refusal on every later edit.
+        if chosen_angle and chosen_auto_angle and theory_angle:
+            chosen_auto_angle = False
+        if chosen_auto_angle:
+            chosen_angle = ""
         chosen_notes = notes if notes is not None else old_plan.get("notes") or ""
         chosen_language = (content_language if content_language is not None
                            else old_decision.get("content_language"))
@@ -3237,12 +3919,29 @@ class PipelineService:
         plan = self.load_artifact("processing_plan", required=True)
         if plan["problem"]:
             raise ArtifactProblem(plan["problem"])
+
+        # Render Studio's per-slot profile is the authority on PRESENTATION, so
+        # it replaces the caller's four presentation arguments. It cannot touch
+        # `subtitle_language` or the whisper model: those decide which WORDS
+        # appear, and the drift check below still holds them to the approved
+        # plan. A slot with no saved profile resolves to the plan itself, so
+        # this changes nothing for a project nobody has edited.
+        resolved = self.effective_render_config(slot)
+        config = resolved["config"]
+        render_mode = config["render_mode"]
+        preview_mode = config["preview_mode"]
+        caption_style = config["caption_style"]
+        caption_theme = config["caption_theme"]
+        quality = resolved["quality"]
+        caption_overrides = resolved["caption_overrides"]
+
         drift = source_strategy.check_config_drift(
             plan["data"], render_config={"render_mode": render_mode, "preview_mode": preview_mode,
                                           "subtitle_whisper_model_size": subtitle_whisper_model_size,
                                           "subtitle_language": subtitle_language,
                                           "caption_style": caption_style,
-                                          "caption_theme": caption_theme})
+                                          "caption_theme": caption_theme},
+            presentation_overridden=resolved["presentation_overridden"])
         if drift:
             raise PipelineServiceError(
                 "onaylanan plan ile istenen render ayari uyusmuyor: " + "; ".join(drift))
@@ -3251,7 +3950,11 @@ class PipelineService:
         if hot["problem"]:
             raise ArtifactProblem(hot["problem"])
         render_dir = self.slot_render_dir(slot)
-        frame = self.render_adjustment(slot)
+        # Framing now lives in the profile, which migrates the old
+        # `render_adjustment` artifact on read -- so there is exactly one source
+        # of truth and a project that used the revision-note framing commands
+        # still renders with the framing it was given.
+        frame = resolved["framing"]
         pipeline_mode = plan["data"]["pipeline_mode"]
 
         if pipeline_mode == "original_audio_subtitles":
@@ -3275,19 +3978,27 @@ class PipelineService:
                 self.relative(self.path("moment_selection", slot)),
                 moment_transcript=transcript["data"],
                 render_dir=render_dir, render_mode=render_mode, preview_mode=preview_mode,
+                encode_profile=quality,
+                target_width=quality["target_width"],
+                target_height=quality["target_height"],
                 subtitle_whisper_model_size=subtitle_whisper_model_size,
                 subtitle_language=subtitle_language,
                 caption_style=caption_style, caption_theme=caption_theme,
+                caption_font_size=caption_overrides["font_size"],
+                caption_margin_v=caption_overrides["margin_v"],
+                caption_active_color_ass=caption_overrides["active_color_ass"],
                 frame_zoom=frame["frame_zoom"],
                 frame_focus_x=frame["frame_focus_x"],
                 frame_focus_y=frame["frame_focus_y"],
                 source_video_path_override=str(self.source_path()),
+                source_bounds_override=self.clip_bounds_override(slot),
                 progress=tracker,
             )
         else:
             script = self.load_artifact("selected_script", required=True)
             voice = self.load_artifact("selected_voiceover", required=True)
-            for loaded in (script, voice):
+            subtitle_track = self.load_artifact("subtitle_track")
+            for loaded in (script, voice, subtitle_track):
                 if loaded["problem"]:
                     raise ArtifactProblem(loaded["problem"])
             manifest = render_utils.run_render_pipeline(
@@ -3296,13 +4007,29 @@ class PipelineService:
                 self.relative(self.path("selected_script")),
                 self.relative(self.path("selected_voiceover")),
                 render_dir=render_dir, render_mode=render_mode, preview_mode=preview_mode,
+                encode_profile=quality,
+                target_width=quality["target_width"],
+                target_height=quality["target_height"],
                 frame_zoom=frame["frame_zoom"],
                 frame_focus_x=frame["frame_focus_x"],
                 frame_focus_y=frame["frame_focus_y"],
                 source_video_path_override=str(self.source_path()),
+                subtitle_cues_override=(subtitle_track["data"] or {}).get("cues"),
+                source_bounds_override=self.clip_bounds_override(slot),
                 progress=tracker,
             )
         manifest["output_slot"] = int(slot)
+        # Stamp the profile that produced this video. Without it the screen
+        # cannot tell "you changed the theme and have not re-rendered" from
+        # "this is current", and would have to guess -- so it would either nag
+        # about renders that are fine or stay silent about ones that are stale.
+        manifest["render_profile"] = {
+            "content_sha256": render_profile_module.content_sha256(
+                resolved["profile_settings"]),
+            "settings": resolved["profile_settings"],
+            "quality_preset": quality["quality_preset"],
+            "is_delivery_quality": quality["is_delivery_quality"],
+        }
         self.write_artifact("render_manifest", manifest, job_id=job_id, actor=actor, slot=slot)
         # A render that failed technical validation is NOT a completed render,
         # and the panel must not claim otherwise.

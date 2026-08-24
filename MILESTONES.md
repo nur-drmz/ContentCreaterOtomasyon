@@ -1,6 +1,6 @@
 # Milestone ve Aktif İş Takibi
 
-**Son güncelleme:** 2026-08-23
+**Son güncelleme:** 2026-08-24
 **Ana hedef:** `M0.10 — Tam film analizi ve batch çoklu Short üretimi`
 **Aktif sıra:** transcript/glossary branch stabilizasyonu → `main` merge → gerçek uzun
 filmde batch kabul koşusu → her Short'un ayrı insan onayı
@@ -65,6 +65,8 @@ işaretlenir. Parantez içindeki değer mevcut durumdur.
 - [ ] **M0.11 — Montaj motoru** (`in_progress`) — sesli, müzikli, izlenmiş çoklu segment edit.
 - [ ] **M0.12 — Konsol sadeleştirme** (`not_started`) — tek ekranda sade batch/montaj akışı.
 - [ ] **M0.13 — Long-form Studio** (`verification_required`) — gerçek 15–20 dk pilot ve insan izlemesi.
+- [ ] **M0.14 — NVIDIA NIM entegrasyonu** (`in_progress`) — metin fallback'i bağlandı ve
+  secret-güvenli; **ölçüm, hata-kodu testleri ve `/v1/models` doğrulaması açık**.
 
 ### P2 — Yayın ve araştırma
 
@@ -191,6 +193,9 @@ tekrarlanmaz.
 
 ### M0.3 — Script Studio
 
+- [x] Üretilen script doğrudan düzenlenebilmeli; taslak yenilemede korunmalı, kaydetme
+  script onayını düşürüp ses/render zincirini revizyon arşivine taşımalı.
+  `verify_lifecycle_browser.py` **17/17**, `verify_project_lifecycle.py` **23/23**.
 - [ ] Gerçek `GeminiKey` ile başarılı script üretimi doğrulanmalı.
 - [ ] İlk 2 saniyelik hook kalite kontrolü yapılmalı.
 - [ ] Hedef süre ile gerçek konuşma uzunluğu karşılaştırılmalı.
@@ -231,6 +236,16 @@ tekrarlanmaz.
 
 ### M0.6 — Edit/render kalitesi
 
+- [x] Anlatımlı render altyazıları zaman damgaları korunarak satır satır
+  düzenlenebilmeli; kayıt eski renderı arşivleyip yeni renderda insan track'ini
+  kullanmalı. Birim **3/3**, servis **29/29**, gerçek tarayıcı **22/22**.
+- [ ] Slot bazlı `render_profile` ve effective render-config katmanı eklenmeli;
+  çözünürlük, kalite, caption tema/font, aktif kelime ve kadraj hızlı revize
+  panelinden değiştirilebilmeli.
+- [ ] Hızlı revize yalnız render/review/publish çıktısını arşivlemeli; moment,
+  script, voice ve onaylı altyazı metnini gereksiz yere geçersiz kılmamalı.
+- [ ] Teknik özet mevcut videonun gerçeklerini, hızlı revize alanları ise sonraki
+  render ayarlarını birbirine karıştırmadan göstermeli.
 - [ ] Altyazı taşma, font ve zamanlama kontrolü geçmeli.
 - [ ] 1080×1920 final render teknik ve görsel kontrolden geçmeli.
 
@@ -250,6 +265,16 @@ tekrarlanmaz.
 
 ### M0.11 — Montaj motoru
 
+- [ ] EDL slot bazlı kaynak fingerprint'i, moment-selection hash'i ve gerçek
+  `source_duration_sec` ile ana edit kararı olarak sürümlenmeli.
+- [ ] Clip başlangıç/bitişi kaynak video içinde uzatılabilmeli, kısaltılabilmeli
+  ve süre korunarak başka konuma taşınabilmeli.
+- [ ] Ana Short renderı EDL source in/out değerlerini tüketmeli; eski projelerde
+  moment zamanlarına geriye uyumlu fallback korunmalı.
+- [ ] Tek clip Video Editör sayfasında kaynak oynatıcı, timeline, in/out handle,
+  drag, nudge, crop/zoom/focus, preview ve geri alma bulunmalı.
+- [ ] Direct clip zaman revizyonu transcript onayını; narrated görsel revizyonu
+  varsayılan olarak yalnız render sonrasını geçersiz kılmalı.
 - [ ] Kliplerin orijinal sesleri video sırasıyla normalize ve concat edilmeli.
 - [ ] Kullanıcının müziği gerçek FFmpeg girdisi olarak bağlanmalı.
 - [ ] Müzik + orijinal ses miksinde ortak audio-ducking motoru kullanılmalı.
@@ -261,6 +286,9 @@ tekrarlanmaz.
 - [ ] Script/TTS yapısal olarak kapalı ve sağlayıcı çağrısı sıfır olmalı.
 - [ ] Gerçek kaynak ve kullanıcı müziğiyle en az üç segmentli edit render edilip izlenmeli.
 
+Uygulama/handoff planı:
+[docs/CLAUDE_RENDER_STUDIO_VIDEO_EDITOR_PLAN.md](docs/CLAUDE_RENDER_STUDIO_VIDEO_EDITOR_PLAN.md)
+
 ### M0.13 — Long-form Studio
 
 - [ ] Outline üretimi, düzenleme ve ayrı insan onayı tamamlanmalı.
@@ -271,6 +299,40 @@ tekrarlanmaz.
 - [ ] TTS/kendi sesi seçimi, müzik ducking ve tam video altyazısı tamamlanmalı.
 - [ ] 720p preview ve 1080p final render üretilmeli.
 - [ ] Gerçek bir konuda 15–20 dakikalık video baştan sona izlenmeli.
+
+### M0.14 — NVIDIA NIM entegrasyonu
+
+- [x] `NVIDIA_API_KEY` örnek env, allowlist ve secret alias kayıtlarına eklenmeli; değeri loga/artefakta yazılmamalı.
+  `.env.example`, `SUPPORTED_LOCAL_ENV_KEYS`, `google_ai.SECRET_ALIASES`,
+  `CONSOLE_SECRET_ALIASES` ve Ayarlar paneli (kayıt güdümlü, sabit satır yok).
+  Anahtarın ne dönüşe ne URL'e sızmadığı ayrıca test ediliyor.
+- [ ] OpenAI uyumlu NVIDIA metin adaptörü `/v1/models` doğrulaması ve `/v1/chat/completions` desteğiyle eklenmeli.
+  `/v1/chat/completions` **yapıldı** (`call_nvidia_text`, Bearer başlık, 12 kontrol).
+  `/v1/models` doğrulaması **YOK** — model kimlikleri dokümantasyondan alındı,
+  canlı çağrıyla teyit edilmedi.
+- [x] Yüksek hacimli ve yüksek kaliteli metin rotalarına NVIDIA kontrollü fallback olarak bağlanmalı.
+  `CROSS_PROVIDER_ROUTES` içinde iki rotada da `google → groq → nvidia → cloudflare`.
+  Yapısal test: rotada adı geçen her sağlayıcı bir adaptöre çözülmeli.
+  *(«Ultra yalnız manuel» maddesi kapsam dışı: kodda Ultra diye bir kademe yok.)*
+- [ ] İstekler ilgili transcript parçaları, sınırlı çıktı tokeni, tek düzeltme denemesi, önbellek ve başlangıçta concurrency `1` ile sınırlandırılmalı.
+  Yalnızca `max_tokens=1024` var. **Önbellek, concurrency sınırı ve tek-düzeltme
+  denemesi YOK.**
+- [ ] `401` tekrar edilmemeli; `429`/geçici hata bekleme ve devre kesiciyle yönetilmeli; güvenlik reddi başka sağlayıcıyla aşılmamalı.
+  Güvenlik reddinin taşınmadığı **yapıldı ve test edildi** (`continue_text_route`,
+  hiç HTTP çağrısı yapılmadığı da iddia ediliyor). `401` zaten tekrarlanmıyor
+  çünkü adaptörde retry yok — ama **`429` beklemesi ve devre kesici NVIDIA için
+  YOK**; o mekanizma `google_ai` router'ında ve yalnızca Google'ı koruyor.
+- [ ] Eksik anahtar, başarılı yanıt, bozuk JSON, `401`/`429`/`5xx`, route sırası ve secret sızıntısı testleri eklenmeli.
+  Eksik anahtar, başarılı yanıt, rota sırası ve secret sızıntısı **yazıldı**
+  (`verify_turbo_studio` 347 → **360/360**). **Bozuk JSON, 401, 429, 5xx
+  testleri YOK.**
+- [ ] Google/Groq/NVIDIA için 20 örneklik kalite-token-gecikme ölçümü yapılmalı; rota sırası kanıta göre kesinleştirilmeli.
+  Yapılmadı: gerçek sağlayıcı çağrısı gerektiriyor. Mevcut rota sırası ölçüme
+  değil, kota mantığına dayanıyor (Google birincil, kotası en dar olan).
+- [x] Embedding ve multimodal kullanım ancak ayrı kalite/fayda ölçümünden sonra açılmalı; ilk sürüm TTS/transkripsiyonu değiştirmemeli.
+  Bu sürüm yalnızca metin rotasına dokundu. `CROSS_PROVIDER_ROUTES["transcription"]`
+  hâlâ `("local", "faster-whisper (BIRINCIL, degismedi)")`; embedding rotası
+  değişmedi.
 
 ### R0.1 — YouTube araştırma
 
@@ -292,8 +354,8 @@ tekrarlanmaz.
 - Faz 0 kaynak değerlendirmesi ve `direct_clip_series` / `narrated_theory` ayrımı.
 - Yerel video analizi, transcript, sahne/enerji sinyalleri ve hot moment üretimi.
 - Moment preview, seçim/ret kaydı ve seçimin kaynak hash'ine bağlanması.
-- Gemini script/TTS rotaları, script/ses inceleme ekranları ve canlı tek çağrı doğrulamaları.
-- 9:16 crop/blur, dinamik altyazı, ses miksleme ve FFmpeg teknik kontrolleri.
+- Gemini script/TTS rotaları, taslak korumalı script editörü, inceleme ekranları ve canlı tek çağrı doğrulamaları.
+- 9:16 crop/blur, dinamik ve insan düzenlemeli altyazı, ses miksleme ve FFmpeg teknik kontrolleri.
 - Creator Console, kalıcı işler, retry/cancel/recovery, akış haritası ve insan kapıları.
 - Fault-injection, tarayıcı, yerel kabul ve gerçek kaynak preview testleri.
 - İki geçişli tam kaynak taraması, output-slot izolasyonu ve batch render mekaniği.
@@ -370,8 +432,10 @@ Bu bölüm en fazla 10 kısa satır tutulur. Ayrıntı ve eski kayıtlar arşive
   `0.0` sayıyordu; isim düzeltmek transcript'i daha kötü gösteriyordu. Düzeltildi.
 - 2026-08-23 — Disk temizliği (106 GB boş) sonrası `verify_real_preview` tekrar
   **REAL_PREVIEW_OK**; tam süpürme (canlı paketler hariç 28 paket) **28/28 yeşil**.
-- 2026-08-22 — Stok medya adaptörü: mock sağlayıcı ve güvenlik testleri geçti; canlı kabul bekliyor.
-- 2026-08-22 — Turbo Studio: aşama grafiği ve gerçek FFmpeg mekaniği geçti; insan izlemesi yok.
+- 2026-08-24 — Script Studio editörü görünür ve taslak korumalı yapıldı; kaydetme
+  onayı düşürüyor ve ses/renderi arşivliyor. Tarayıcı **17/17**, genel UI **243/243**.
+- 2026-08-24 — Anlatımlı altyazı editörü eklendi: cue metni düzenleniyor,
+  zaman korunuyor, eski render arşivleniyor. Birim **3/3**, tarayıcı **22/22**.
 - 2026-08-23 — P0 transcript/glossary stabilizasyon testleri yeniden ölçüldü:
   `verify_transcript_editor` 113/113, `verify_revision_flow` 39/39,
   `verify_diagnostics` 110/110; ilgili 10 regresyon paketi tamamen yeşil.

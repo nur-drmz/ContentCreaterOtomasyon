@@ -2010,6 +2010,17 @@ def test_ui_wiring():
     check("options.caption_themes" in app_js,
           "tema-secenekleri-SUNUCUDAN-geliyor",
           "app.js kendi tema listesini tutmamali")
+
+    # A server flag with no control is a feature nobody can reach; the copyright
+    # gate shipped that way once and made plan approval impossible.
+    check("'turbo-use-source-moment'" in app_js,
+          "kaynak-moment-anahtari-ARAYUZDE",
+          "use_source_moment yalnizca API'den erisilebilir kalmamali")
+    # The id and the testid are both "turbo-use-source-moment", so splitting
+    # on it lands between the two occurrences. Look for the write itself.
+    check("'use_source_moment', event.currentTarget.checked" in app_js,
+          "kaynak-moment-anahtari-briefe-YAZIYOR",
+          "kutu isaretlense de brief'e bayrak yazilmiyor")
     for theme in render_utils.CAPTION_THEME_PROFILES:
         check(f"'{theme}'" not in app_js.split("function turboBriefCard")[1][:2000],
               f"tema-{theme}-arayuze-GOMULMEMIS")

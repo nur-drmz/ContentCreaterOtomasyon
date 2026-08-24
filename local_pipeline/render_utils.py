@@ -610,6 +610,17 @@ def transcribe_for_subtitles(narration_audio_path, fallback_text: str = '', max_
         return cues, 'proportional-fallback'
 
 
+def resolve_narrated_subtitle_cues(narration_audio_path, fallback_text: str,
+                                    max_chars_per_cue: int,
+                                    subtitle_cues_override=None):
+    """Use the saved human track verbatim; otherwise derive cues from audio."""
+    if subtitle_cues_override is not None:
+        from . import subtitle_edit
+        return subtitle_edit.normalize_cues(subtitle_cues_override), 'human-edited-track'
+    return transcribe_for_subtitles(
+        narration_audio_path, fallback_text, max_chars_per_cue)
+
+
 #: A word Whisper is unsure about is where a proper noun usually goes wrong
 #: ("Rhaenyra" -> "Renira"). Surfaced for review rather than silently burned in.
 #:
@@ -1031,6 +1042,40 @@ def resolve_render_source(hot_moments_data: dict, selected_moment: dict, source_
     return chosen_path, resolution_mode, seek_start, seek_duration, description
 
 
+def apply_source_bounds_override(seek_start: float, seek_duration: float,
+                                 resolution_mode: str, override=None) -> tuple:
+    """(seek_start, seek_duration) after a per-slot clip-bounds edit.
+
+    The Video Editor lets an operator move the clip inside the SOURCE -- "the
+    moment starts a second late" -- without re-running the analysis and losing
+    the transcript and script with it.
+
+    It deliberately does NOT patch `hot_moments`, because the narrated pipeline
+    cross-checks `selected_script`'s timestamps against that file and would
+    refuse the render. The moment stays what the analysis found; this is a
+    separate, explicit, per-slot override applied at seek time.
+
+    Only `raw` resolution accepts it. `analysis_clip` and `preview` are already
+    cropped, so an absolute source timestamp means something different in them
+    -- seeking there would silently render the wrong seconds, which is worse
+    than refusing.
+    """
+    if not override:
+        return seek_start, seek_duration
+    start = float(override['source_start_sec'])
+    end = float(override['source_end_sec'])
+    if end <= start:
+        raise ValueError(
+            f"klip bitisi ({end}) baslangictan ({start}) buyuk olmali")
+    if resolution_mode != 'raw':
+        raise ValueError(
+            "klip araligi duzenlemesi yalnizca orijinal kaynak videoyla "
+            f"calisir; su anki cozumleme modu {resolution_mode!r}. Kaynak "
+            "videoyu projeye kaydedip tekrar dene."
+        )
+    return start, end - start
+
+
 def _transcript_usable(transcript) -> bool:
     """A transcript may drive a render only when a human approved THAT text.
 
@@ -1148,11 +1193,35 @@ def run_moment_transcription(
     return artifact
 
 
+def resolve_encode_profile(preview_mode: bool, encode_profile=None) -> tuple:
+    """(x264 preset, CRF, scale factor) for one render.
+
+    With `encode_profile=None` this returns EXACTLY the historical pair -- the
+    two lines it replaced, unchanged -- so every existing caller, notebook and
+    test renders byte-for-byte what it rendered before.
+
+    The parameter exists because Render Studio now offers named quality presets
+    and `preview_mode` is a single boolean: there was no way to express a
+    third, faster "draft" without either lying about the quality or silently
+    ignoring the operator's choice.
+
+    The caller supplies the numbers, but only ever from a server-side table --
+    `render_profile.QUALITY_PRESETS`. Nothing here accepts an encoder argument
+    from a browser.
+    """
+    if encode_profile:
+        return (str(encode_profile['encode_preset']),
+                int(encode_profile['crf']),
+                float(encode_profile['scale']))
+    return ('ultrafast', 30, 0.5) if preview_mode else ('slow', 18, 1.0)
+
+
 def run_original_audio_subtitle_pipeline(
         hot_moments_data: dict, moment_selection: dict, hot_moments_path,
         moment_selection_path, render_dir, render_mode: str = 'blurred_background',
         target_width: int = 1080, target_height: int = 1920,
-        preview_mode: bool = True, subtitle_fontsize: int = 20,
+        preview_mode: bool = True, encode_profile=None,
+        source_bounds_override=None, subtitle_fontsize: int = 20,
         subtitle_margin_v: int = 90, subtitle_max_chars_per_cue: int = 42,
         subtitle_whisper_model_size: str = 'small',
         subtitle_language: str = 'auto',
@@ -1199,6 +1268,12 @@ def run_original_audio_subtitle_pipeline(
     chosen_path, resolution_mode, seek_start, seek_duration, source_description = resolve_render_source(
         hot_moments_data, selected_moment, source_video_path_override,
     )
+    seek_start, seek_duration = apply_source_bounds_override(
+        seek_start, seek_duration, resolution_mode, source_bounds_override)
+    if source_bounds_override:
+        source_description += (
+            f' [klip araligi elle duzenlendi: {seek_start:.3f}-'
+            f'{seek_start + seek_duration:.3f}s]')
     theme_context = ' '.join([
         str(chosen_path), str(source_description),
         str(selected_moment.get('transcript') or ''),
@@ -1237,10 +1312,8 @@ def run_original_audio_subtitle_pipeline(
     resolved_letter_spacing = float(caption_profile.get('letter_spacing', 0.0))
     caption_font_asset = ensure_caption_theme_font(caption_theme_result, render_dir / 'fonts')
 
-    if preview_mode:
-        encode_preset, encode_crf, encode_scale = 'ultrafast', 30, 0.5
-    else:
-        encode_preset, encode_crf, encode_scale = 'slow', 18, 1.0
+    encode_preset, encode_crf, encode_scale = resolve_encode_profile(
+        preview_mode, encode_profile)
     render_width = max(2, int(target_width * encode_scale) // 2 * 2)
     render_height = max(2, int(target_height * encode_scale) // 2 * 2)
 
@@ -1524,12 +1597,15 @@ def run_original_audio_subtitle_pipeline(
 def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_voiceover: dict,
                          hot_moments_path, selected_script_path, selected_voiceover_path,
                          render_dir, render_mode: str = 'blurred_background', target_width: int = 1080,
-                         target_height: int = 1920, preview_mode: bool = True, ducking_enabled: bool = True,
+                         target_height: int = 1920, preview_mode: bool = True,
+                         encode_profile=None, source_bounds_override=None,
+                         ducking_enabled: bool = True,
                          original_audio_base_volume: float = 0.35, narration_volume: float = 1.0,
                          duck_ratio: float = 8, subtitle_fontsize: int = 20, subtitle_margin_v: int = 90,
                          subtitle_max_chars_per_cue: int = 42, source_video_path_override: str = '',
                          frame_zoom: float = 1.0, frame_focus_x: float = 0.5,
-                         frame_focus_y: float = 0.5, progress=None) -> dict:
+                         frame_focus_y: float = 0.5, subtitle_cues_override=None,
+                         progress=None) -> dict:
     """High-level, single-run render entry point shared by
     06_render_pipeline.ipynb and 00_youtube_automation_master.ipynb: extracts
     the selected moment's source clip, generates subtitles from the real
@@ -1596,11 +1672,15 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
     chosen_path, resolution_mode, seek_start, seek_duration, source_description = resolve_render_source(
         hot_moments_data, selected_moment, source_video_path_override,
     )
+    seek_start, seek_duration = apply_source_bounds_override(
+        seek_start, seek_duration, resolution_mode, source_bounds_override)
+    if source_bounds_override:
+        source_description += (
+            f' [klip araligi elle duzenlendi: {seek_start:.3f}-'
+            f'{seek_start + seek_duration:.3f}s]')
 
-    if preview_mode:
-        encode_preset, encode_crf, encode_scale = 'ultrafast', 30, 0.5
-    else:
-        encode_preset, encode_crf, encode_scale = 'slow', 18, 1.0
+    encode_preset, encode_crf, encode_scale = resolve_encode_profile(
+        preview_mode, encode_profile)
     render_width = max(2, int(target_width * encode_scale) // 2 * 2)
     render_height = max(2, int(target_height * encode_scale) // 2 * 2)
 
@@ -1623,7 +1703,9 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
 
     script_text_for_subs = (selected_script.get('script_text') or selected_moment.get('transcript') or '').strip()
     report.stage('subtitles', 'Anlatimdan altyazi uretiliyor')
-    cues, subtitle_source = transcribe_for_subtitles(narration_audio_path, script_text_for_subs, subtitle_max_chars_per_cue)
+    cues, subtitle_source = resolve_narrated_subtitle_cues(
+        narration_audio_path, script_text_for_subs, subtitle_max_chars_per_cue,
+        subtitle_cues_override=subtitle_cues_override)
     subtitles_srt_path = render_dir / 'subtitles.srt'
     write_srt(cues, subtitles_srt_path)
     report.count(len(cues), len(cues), unit='altyazi',
@@ -1727,7 +1809,10 @@ def run_render_pipeline(hot_moments_data: dict, selected_script: dict, selected_
             'narration_volume': narration_volume,
             'encode_preset': encode_preset, 'encode_crf': encode_crf,
         },
-        'subtitles': {'source': subtitle_source, 'cue_count': len(cues), 'srt_path': str(subtitles_srt_path)},
+        'subtitles': {
+            'source': subtitle_source, 'cue_count': len(cues),
+            'srt_path': str(subtitles_srt_path),
+        },
         'output': {
             'final_video_path': str(final_output_path),
             'final_video_sha256_16': sha256_file(final_output_path) if final_output_path.is_file() else None,

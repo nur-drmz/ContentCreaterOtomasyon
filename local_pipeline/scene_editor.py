@@ -191,6 +191,77 @@ def trim_clip(clip: EDLClip, start: float, end: float,
     return new_clip
 
 
+MIN_CLIP_DURATION_SEC = 0.2
+
+
+def set_clip_source_bounds(clip: EDLClip, start: float, end: float,
+                           source_duration: float | None = None) -> EDLClip:
+    """Move and/or resize a clip ANYWHERE inside the source.
+
+    `trim_clip` only ever narrows: it refuses a start before the current one and
+    an end after it. That is correct for "trim", and it is kept -- but it also
+    made the chosen range permanent. An operator who found the moment starts a
+    second too late had no way to reach back; the only route was re-running the
+    analysis and picking a different moment, which throws away the transcript
+    and the script with it.
+
+    This function is the editable version. The ONLY limits are the source
+    itself and a floor on duration, because a zero-length clip is not an edit,
+    it is a broken render.
+    """
+    try:
+        start = float(start)
+        end = float(end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("klip sinirlari sayisal olmali") from exc
+    if start != start or end != end:            # NaN
+        raise ValueError("klip sinirlari sayisal olmali")
+    if start < 0:
+        raise ValueError("klip baslangici negatif olamaz")
+    if end <= start:
+        raise ValueError("klip bitisi baslangictan buyuk olmali")
+    if end - start < MIN_CLIP_DURATION_SEC:
+        raise ValueError(
+            f"klip suresi en az {MIN_CLIP_DURATION_SEC} saniye olmali "
+            f"(istenen: {end - start:.3f} sn)")
+    if source_duration is not None and end > float(source_duration):
+        raise ValueError("klip bitisi kaynak suresini asamaz")
+    new_clip = EDLClip(
+        clip_id=clip.clip_id,
+        source_path=clip.source_path,
+        source_start_sec=start,
+        source_end_sec=end,
+        timeline_start_sec=clip.timeline_start_sec,
+        crop=clip.crop,
+        zoom=clip.zoom,
+        caption_style=clip.caption_style,
+        b_roll=clip.b_roll,
+        notes=clip.notes,
+    )
+    if not new_clip.is_valid(source_duration):
+        raise ValueError("yeni klip sinirlari gecersiz")
+    return new_clip
+
+
+def shift_clip(clip: EDLClip, delta: float,
+               source_duration: float | None = None) -> EDLClip:
+    """Slide the clip along the source, PRESERVING its duration.
+
+    Separate from `set_clip_source_bounds` because "the moment starts a second
+    late" and "the moment should be a second longer" are different edits, and a
+    drag on the middle of a clip must not silently change how long it runs.
+
+    Hitting either end of the source clamps instead of raising: a drag that runs
+    into the boundary should stop there, the way every timeline behaves.
+    """
+    duration = clip.source_end_sec - clip.source_start_sec
+    start = clip.source_start_sec + float(delta)
+    start = max(0.0, start)
+    if source_duration is not None:
+        start = min(start, max(0.0, float(source_duration) - duration))
+    return set_clip_source_bounds(clip, start, start + duration, source_duration)
+
+
 def crop_clip(clip: EDLClip, x: float, y: float, w: float, h: float) -> EDLClip:
     new_crop = Box(x, y, w, h)
     if not new_crop.is_valid():
