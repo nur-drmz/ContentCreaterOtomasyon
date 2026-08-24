@@ -23,7 +23,8 @@ STATUS_VALUES = {
 
 def build_user_prompt(selected_moment: dict, content_mode: str = "spoiler-free-recap",
                        tone: str = "gergin ve merak uyandirici", target_duration_sec: int = 60,
-                       content_language: str | None = None) -> str:
+                       content_language: str | None = None,
+                       theory_angle: str = "", derive_angle: bool = False) -> str:
     """Builds the exact user prompt sent to the LLM, from a hot_moments.json
     moment dict (rank/source_start_sec/source_end_sec/reason/transcript)."""
     summary = (
@@ -40,12 +41,31 @@ def build_user_prompt(selected_moment: dict, content_mode: str = "spoiler-free-r
     # trailing "oh and write it in English" after a Turkish instruction block is
     # exactly the kind of thing a model half-follows, producing a Turkish hook
     # on an English script.
+    # The angle is derived INSIDE this call rather than by a second request:
+    # the model already has the transcript in front of it here, and a separate
+    # "what is the angle" call would spend a second slot of a 20-request daily
+    # quota to re-read material it was about to read anyway.
+    if derive_angle:
+        angle_rule = (
+            "Once bu sahneden cikarilabilecek bir TEORI/YORUM acisi belirle: "
+            "sahnede gecenlere dayanan, tek cumlelik, iddiali ama uydurma "
+            "olmayan bir bakis. Sonra scripti O aciya gore yaz. "
+            "Belirledigin aciyi 'theory_angle' alaninda dondur. ")
+        angle_field = ', "theory_angle": "..."'
+    elif theory_angle:
+        angle_rule = f"Scripti su teori/yorum acisina gore yaz: {theory_angle}. "
+        angle_field = ""
+    else:
+        angle_rule = ""
+        angle_field = ""
     return (
         f"{profile['prompt_rule']} "
         f"Asagidaki sahne ozetinden, {target_duration_sec} saniyelik bir YouTube Shorts scripti yaz. "
+        f"{angle_rule}"
         f"Ton: {tone}. Mod: {content_mode}. Spoiler verme, merak uyandir, guclu bir hook cumlesiyle basla. "
         f"Cikti dili: {profile['prompt_name']} ({profile['code']}). "
-        f'SADECE JSON don: {{"script": "...", "hook": "...", "estimated_duration_sec": <int>}}\n\n'
+        f'SADECE JSON don: {{"script": "...", "hook": "...", '
+        f'"estimated_duration_sec": <int>{angle_field}}}\n\n'
         f"Sahne ozeti:\n{summary}"
     )
 
@@ -62,6 +82,13 @@ def script_extras(parsed: dict) -> dict:
     hook = str(parsed.get("hook") or "").strip()
     if hook:
         extras["hook"] = hook[:400]
+    # Only present when the plan asked for the angle to be derived. Recorded so
+    # the reviewer reads the claim the script was built on instead of inferring
+    # it from the script, and so the artifact says which angle produced it.
+    angle = str(parsed.get("theory_angle") or "").strip()
+    if angle:
+        extras["theory_angle"] = angle[:400]
+        extras["theory_angle_source"] = "derived_from_moment"
     try:
         estimated = int(parsed["estimated_duration_sec"])
     except (KeyError, TypeError, ValueError):
@@ -432,7 +459,9 @@ def run_script_generation(hot_moments_data: dict, hot_moments_source_path, selec
                            max_provider_attempts: int = 3,
                            cross_provider_secret_getter=None,
                            cross_provider_transport=None,
-                           content_language: str | None = None) -> dict:
+                           content_language: str | None = None,
+                           theory_angle: str = "",
+                           derive_theory_angle: bool = False) -> dict:
     """Master-pipeline script generation: exactly ONE paid LLM call on the happy
     path.
 
@@ -470,7 +499,9 @@ def run_script_generation(hot_moments_data: dict, hot_moments_source_path, selec
         "reviewed_at": datetime.now(timezone.utc).isoformat(),
     }
     user_prompt = build_user_prompt(selected_moment, content_mode, tone, target_duration_sec,
-                                    content_language=content_language)
+                                    content_language=content_language,
+                                    theory_angle=theory_angle,
+                                    derive_angle=derive_theory_angle)
     source_video_meta = hot_moments_data.get("source") or {}
     prompt_package = {
         "user_prompt": user_prompt, "content_mode": content_mode, "tone": tone,

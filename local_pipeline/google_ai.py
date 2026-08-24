@@ -131,6 +131,7 @@ SECRET_ALIASES = {
     "google_api": ("GeminiKey", "GOOGLE_API_KEY"),
     "youtube_data_api": ("YoutubeKEY", "YOUTUBE_DATA_API_KEY"),
     "groq": ("GROQ_API_KEY",),
+    "nvidia": ("NVIDIA_API_KEY",),
     "cloudflare_account_id": ("CLOUDFLARE_ACCOUNT_ID",),
     "cloudflare_auth_token": ("CLOUDFLARE_AUTH_TOKEN",),
     "azure_speech_key": ("AZURE_SPEECH_KEY",),

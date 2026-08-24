@@ -4297,6 +4297,75 @@ if not _ss.validate_processing_plan(_p0_tampered):
     raise AssertionError("[p0] elle acilan faz kapisi yakalanmadi")
 if _ss.plan_allows_phase(_p0_tampered, "script_generation")[0]:
     raise AssertionError("[p0] elle kurcalanmis plan script fazini acti")
+# --- teori acisi: elle yazilir VEYA momentten turetilir -----------------------
+# The plan is approved BEFORE the analysis runs, so at plan time nobody has seen
+# the moment the theory will be about. `theory_angle_auto` defers the angle to
+# script generation, where the moment's own transcript finally exists.
+_p0_auto = _ss.build_processing_plan(
+    _p0_assessment, "narrated_theory", "verify_local", output_count=1,
+    theory_angle_auto=True,
+    render_config={"render_mode": "blurred_background", "preview_mode": True},
+    render_root=_P0_TMP / "render_auto",
+)
+if _p0_auto["decision"].get("theory_angle") is not None:
+    raise AssertionError("[p0] otomatik acida plan bir aci TASIMAMALI")
+if not _p0_auto["decision"].get("theory_angle_auto"):
+    raise AssertionError("[p0] otomatik aci bayragi plana yazilmadi")
+if _ss.validate_processing_plan(_p0_auto):
+    raise AssertionError(
+        f"[p0] otomatik acili plan gecersiz sayildi: {_ss.validate_processing_plan(_p0_auto)}")
+
+# The 20-character rule still applies when the operator types one.
+try:
+    _ss.build_processing_plan(
+        _p0_assessment, "narrated_theory", "verify_local", output_count=1,
+        theory_angle="kisa",
+        render_config={"render_mode": "blurred_background", "preview_mode": True},
+        render_root=_P0_TMP / "render_short")
+    raise AssertionError("[p0] kisa teori acisi kabul edildi")
+except ValueError:
+    pass
+
+# Both at once is a contradiction, not a preference, so it is refused rather
+# than one silently winning.
+try:
+    _ss.build_processing_plan(
+        _p0_assessment, "narrated_theory", "verify_local", output_count=1,
+        theory_angle="Yeterince uzun bir teori acisi metni burada duruyor",
+        theory_angle_auto=True,
+        render_config={"render_mode": "blurred_background", "preview_mode": True},
+        render_root=_P0_TMP / "render_both")
+    raise AssertionError("[p0] elle aci + otomatik aci birlikte kabul edildi")
+except ValueError:
+    pass
+
+# The panel must SAY it will be derived; an empty angle field would otherwise
+# read as "nobody filled this in".
+_auto_panel = _ss.format_plan_panel(_p0_auto)
+if "OTOMATIK" not in _auto_panel:
+    raise AssertionError(f"[p0] panel otomatik aciyi bildirmiyor: {_auto_panel[:120]}")
+
+# And the prompt actually asks for it, in the same call that writes the script.
+_auto_prompt = _sg.build_user_prompt(
+    {"rank": 1, "source_start_sec": 10, "source_end_sec": 40,
+     "reason": "audio=0.9", "transcript": "Ejderha binicisi geri dondu."},
+    derive_angle=True)
+if "theory_angle" not in _auto_prompt:
+    raise AssertionError("[p0] turetme prompt'u theory_angle alanini istemiyor")
+_manual_prompt = _sg.build_user_prompt(
+    {"rank": 1, "source_start_sec": 10, "source_end_sec": 40,
+     "reason": "audio=0.9", "transcript": "x"},
+    theory_angle="Elle yazilmis aci")
+if "Elle yazilmis aci" not in _manual_prompt or "theory_angle" in _manual_prompt:
+    raise AssertionError("[p0] elle aci prompt'u yanlis kuruldu")
+# The derived angle is recorded with its provenance, so a reviewer can tell
+# which claim the script was written to and where that claim came from.
+_extras = _sg.script_extras({"hook": "h", "theory_angle": "Turetilmis aci"})
+if _extras.get("theory_angle_source") != "derived_from_moment":
+    raise AssertionError(f"[p0] turetilen acinin kaynagi kaydedilmedi: {_extras}")
+print("  [p0:theory-angle] aci elle YAZILIR veya momentten TURETILIR; "
+      "ikisi birden reddedilir, turetilen aci kaynagiyla kaydedilir")
+
 print("  [p0:artifact-contract] production_ready yok, otomatik onay yok, elle acilan faz kapisi "
       "reddediliyor, artefaktta sir yok")
 

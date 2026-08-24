@@ -168,6 +168,11 @@ def new_brief(**fields) -> dict:
         "seed_input": "",
         "voice": "",
         "subtitles_enabled": True,
+        # Anchor the video on THIS project's approved moment instead of filling
+        # every scene from stock. The moment becomes the first clip; the rest of
+        # the beats still get stock footage, so the result is an edit ABOUT the
+        # source rather than a slideshow beside it.
+        "use_source_moment": False,
         # Which caption look to burn. The SAME theme dictionary the main render
         # path uses, so Turbo is not a second styling system.
         "caption_theme": "default",
@@ -213,7 +218,7 @@ def brief_sha256(brief: dict) -> str:
         "topic", "content_type", "language", "duration_sec", "aspect_ratio",
         "fps", "clip_duration_sec", "fit_mode", "transition", "transition_sec",
         "ordering", "seed_input", "voice", "subtitles_enabled", "caption_theme",
-        "music_enabled")}
+        "use_source_moment", "music_enabled")}
     blob = json.dumps(material, sort_keys=True, ensure_ascii=False,
                       separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -314,6 +319,7 @@ def validate_brief(brief: dict) -> dict:
         seed_input=_clean(data.get("seed_input"), 80),
         voice=_clean(data.get("voice"), 80),
         subtitles_enabled=bool(data.get("subtitles_enabled", True)),
+        use_source_moment=bool(data.get("use_source_moment", False)),
         caption_theme=caption_theme,
         music_enabled=bool(data.get("music_enabled", False)),
         notes=_clean(data.get("notes"), 1000),

@@ -88,8 +88,10 @@ def new_review(ownership, video_sha256: str | None = None) -> dict:
     return media_review.new_review(SPEC, ownership, video_sha256)
 
 
-def evaluate(review: dict | None, video_sha256: str | None, ownership) -> dict:
-    state = media_review.evaluate(SPEC, review, video_sha256, ownership)
+def evaluate(review: dict | None, video_sha256: str | None, ownership,
+             current_snapshot: dict | None = None) -> dict:
+    state = media_review.evaluate(SPEC, review, video_sha256, ownership,
+                                  current_snapshot=current_snapshot)
     # Legacy aliases: the render UI and its tests read these names.
     state["video_sha256"] = state["media_sha256"]
     state["recorded_video_sha256"] = state["recorded_media_sha256"]
@@ -105,10 +107,11 @@ def set_item(review: dict, key: str, *, checked: bool, video_sha256: str,
 
 
 def request_revision(review: dict, *, video_sha256: str, requested_by: str,
-                     notes: str, target_tab: str = "moments") -> dict:
+                     notes: str, target_tab: str = "moments",
+                     before: dict | None = None) -> dict:
     return media_review.request_revision(
         SPEC, review, media_sha256=video_sha256, requested_by=requested_by,
-        notes=notes, target_tab=target_tab)
+        notes=notes, target_tab=target_tab, before=before)
 
 
 def clear_revision(review: dict, *, video_sha256: str, resolved_by: str) -> dict:

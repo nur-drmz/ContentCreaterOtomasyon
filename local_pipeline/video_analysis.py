@@ -1066,6 +1066,14 @@ def build_moment_selection(
         "status": "approved",
         "status_reason": "preview insan tarafindan incelendi ve moment secildi",
         "selected_moment_rank": selected_rank,
+        # The analysis already ORDERS candidates, so rank 1 is a recommendation
+        # whether or not anyone says so. Recording it -- and whether the human
+        # took it -- makes "the system suggested this" auditable instead of
+        # implicit, and is the same shape Phase 0 uses for the mode decision
+        # (`recommended_mode` / `followed_recommendation`).
+        "recommended_moment_rank": 1,
+        "recommendation_is_advisory": True,
+        "followed_recommendation": selected_rank == 1,
         "selected_moment": {
             "rank": selected_rank,
             "source_start_sec": selected.get("source_start_sec"),

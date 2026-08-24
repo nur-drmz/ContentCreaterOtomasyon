@@ -355,9 +355,19 @@ class AutomationEngine:
 
         selection = service.load_artifact("moment_selection")
         if selection["problem"] or not selection["data"]:
+            # The analysis already ranked the candidates, so there IS a
+            # recommendation to name. Saying "automation cannot pick" and
+            # stopping told the operator nothing about what to pick; naming the
+            # suggestion turns a dead end into one decision. It stays a gate:
+            # which second of someone else's film gets published is a human
+            # call, and automation still records no selection of its own.
+            top = (hot["data"].get("hot_moments") or [])[0]
             return {"kind": "gate", "blocker": "moment_selection",
-                    "message": "Moment Explorer'da adaylari izle ve bir moment SEC. "
-                               "Otomatik akis moment secemez."}
+                    "message": (
+                        "Moment Explorer'da onerilen momenti (rank "
+                        f"{top.get('rank')}, {top.get('source_start_sec')}-"
+                        f"{top.get('source_end_sec')}s) izleyip ONAYLA veya "
+                        "baskasini sec. Otomasyon senin adina secmez.")}
 
         decision = plan["data"].get("decision") or {}
         approvals = service.approval_chain()

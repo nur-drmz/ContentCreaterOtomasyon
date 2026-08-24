@@ -52,6 +52,9 @@ EVENTS = (
     "audio_concat.started", "audio_concat.completed", "audio_concat.failed",
     "media_plan.created", "media.search_completed", "media.selected",
     "media.download_completed", "media.replaced",
+    # The anchor clip is cut from the user's own source, not fetched from a
+    # provider, so it gets its own event rather than pretending a download.
+    "media.source_moment_extracted",
     "music.selected", "music.removed", "music.license_unverified",
     "subtitles.completed", "subtitles.degraded",
     "timeline.completed", "timeline.repacked",
@@ -564,7 +567,21 @@ class TurboStudio:
                     for slot in ((self.media_plan() or {}).get("slots") or [])}
 
         slots, reused = [], 0
+        anchor_slot_id = None
+        if brief.get("use_source_moment"):
+            # The project's own approved moment leads. It is not a stock search
+            # result, so it never enters the candidate/selection dance -- it is
+            # extracted from the source the operator already chose and reviewed,
+            # and arrives already "downloaded".
+            anchor = self._source_moment_slot(actor=actor)
+            slots.append(anchor)
+            anchor_slot_id = anchor["id"]
+
         for beat in script["scene_beats"]:
+            if anchor_slot_id is not None and beat["index"] == 1:
+                # Beat 1 is spoken over the source moment itself, so it needs no
+                # stock footage of its own.
+                continue
             slot_id = beat["slot_id"]
             fresh = {
                 "id": slot_id, "sequence": beat["index"],
@@ -644,6 +661,87 @@ class TurboStudio:
         self.log_event("media.selected", slot_id=slot_id,
                        candidate_id=candidate_id)
         return plan
+
+    SOURCE_MOMENT_SLOT_ID = "src_moment"
+
+    def _source_moment_slot(self, *, actor: str = "console") -> dict:
+        """Cut this project's approved moment into Turbo's clip directory.
+
+        Cut from the ORIGINAL source at the moment's own timestamps, not from
+        the low-resolution preview: the preview exists so a human can watch
+        candidates quickly, and burning it into a delivered video would ship
+        that compromise.
+
+        Returned already `downloaded`, with provenance saying it came from the
+        user's own footage. `record_download` refuses a slot with no selected
+        candidate, so this builds the slot directly rather than pretending a
+        stock provider returned it.
+        """
+        selection = self.service.load_artifact("moment_selection")
+        if selection["problem"] or not selection["data"]:
+            raise TurboError(
+                "Once Moment Explorer'da bir moment sec; kaynak momenti "
+                "kullanmak icin onaylanmis bir secim gerekir.")
+        hot = self.service.load_artifact("hot_moments", required=True)
+        if hot["problem"]:
+            raise TurboError(hot["problem"])
+
+        moment = (selection["data"] or {}).get("selected_moment") or {}
+        start = float(moment.get("source_start_sec")
+                      or moment.get("aligned_start_sec") or 0.0)
+        end = float(moment.get("source_end_sec")
+                    or moment.get("aligned_end_sec") or 0.0)
+        span = round(max(0.5, end - start), 3)
+
+        destination = self._path(
+            f"{stock_media.clip_dirname(self.MEDIA_KIND)}/source_moment.mp4")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg_bin, _ffprobe = render_utils.resolve_ffmpeg_binaries()
+        if not ffmpeg_bin:
+            raise TurboError("ffmpeg bulunamadi")
+        render_utils.run_ffmpeg(ffmpeg_bin, [
+            "-ss", str(start), "-i", str(self.service.source_path()),
+            "-t", str(span), "-an", "-c:v", "libx264", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-y", str(destination)])
+        info, _probe_note = render_utils.probe_media(
+            *render_utils.resolve_ffmpeg_binaries(), destination)
+
+        relative = self.storage.relative_to_namespace(self.ownership, destination)
+        self.log_event("media.source_moment_extracted",
+                       slot_id=self.SOURCE_MOMENT_SLOT_ID,
+                       moment_rank=moment.get("rank"), duration_sec=span)
+        return {
+            "id": self.SOURCE_MOMENT_SLOT_ID, "sequence": 0,
+            "chapter_index": 0,
+            "chapter_title": "Kaynak moment",
+            "script_excerpt": str(moment.get("reason") or "")[:260],
+            "query": "", "status": "downloaded",
+            "provider": "source_moment", "candidates": [],
+            "selected": {
+                "id": self.SOURCE_MOMENT_SLOT_ID,
+                "provider": "source_moment",
+                "asset_id": str(moment.get("rank")),
+                "query": "", "source_page": None,
+                "creator": {"name": None, "profile_page": None},
+                "duration_sec": span,
+                "width": info.get("width"), "height": info.get("height"),
+                "bytes": destination.stat().st_size, "quality": "source",
+                "preview_url": None, "download_url": None,
+                # No attribution is invented for the operator's own footage; the
+                # rights question for it was answered at the Phase 0 gate.
+                "attribution": "Kullanicinin kendi kaynak videosu",
+                "license_note": "kaynak video: proje sahibi tarafindan saglandi",
+            },
+            "download": {
+                "relative_path": relative,
+                "sha256": render_utils.sha256_file(destination),
+                "bytes": destination.stat().st_size,
+                "downloaded_at": _now(),
+                "provider": "source_moment",
+            },
+            "searched_at": None,
+            "source_moment_rank": moment.get("rank"),
+        }
 
     def download_clip(self, slot_id: str, *, actor: str = "console") -> dict:
         """Fetch the chosen clip, atomically, with provenance preserved."""

@@ -1890,10 +1890,12 @@ class PipelineService:
 
     def render_review_state(self, slot: int = 1) -> dict:
         review = self.load_artifact_path(self.render_review_relative(slot))
-        state = render_review_module.evaluate(
-            review, self.render_video_digest(slot), self.ownership)
-        state["technical"] = render_review_module.technical_summary(
+        technical = render_review_module.technical_summary(
             self.load_artifact("render_manifest", slot=slot)["data"])
+        state = render_review_module.evaluate(
+            review, self.render_video_digest(slot), self.ownership,
+            current_snapshot=technical)
+        state["technical"] = technical
         state["slot"] = int(slot or 1)
         return state
 
@@ -1925,6 +1927,43 @@ class PipelineService:
                           detail={"checklist_item": key, "checked": checked, "slot": slot})
         return self.render_review_state(slot)
 
+    #: Which revision target the machine can actually act on, and with what job.
+    #: `moments` and `phase0` are absent on purpose: choosing a different moment
+    #: or changing the plan is a human decision, and a job cannot make it.
+    REVISION_JOBS = {
+        "render": "render",
+        "voice": "tts",
+        "script": "script_generation",
+    }
+    #: Targets whose job spends provider quota. The console asks before starting
+    #: these, because a mis-click used to cost nothing and should not silently
+    #: start costing a daily quota that allows 20 requests.
+    REVISION_JOBS_WITH_PROVIDER_COST = ("voice", "script")
+
+    def revision_action(self, target_tab: str) -> dict:
+        """What clicking 'request revision' can DO for this target.
+
+        Returns the plan, never performs it: the caller decides whether the
+        operator has confirmed a quota-spending run.
+        """
+        job_type = self.REVISION_JOBS.get(str(target_tab or ""))
+        if job_type is None:
+            return {
+                "target_tab": target_tab, "runnable": False, "job_type": None,
+                "needs_confirmation": False,
+                "reason": ("Bu revizyon senin karariniz gerektiriyor "
+                           "(moment secimi / plan degisikligi); otomatik "
+                           "calistirilamaz."),
+            }
+        costs = target_tab in self.REVISION_JOBS_WITH_PROVIDER_COST
+        return {
+            "target_tab": target_tab, "runnable": True, "job_type": job_type,
+            "needs_confirmation": costs,
+            "reason": ("Bu faz saglayici kotasi harcar; baslatmadan once onay "
+                       "istenir." if costs else
+                       "Yerel islem; saglayici kotasi harcamaz."),
+        }
+
     def request_render_revision(self, *, requested_by: str, notes: str,
                                  target_tab: str = "moments", slot: int = 1) -> dict:
         slot = self.require_slot(slot)
@@ -1932,8 +1971,12 @@ class PipelineService:
         if not digest:
             raise PipelineServiceError("Revizyon istenecek bir render videosu yok.")
         review = render_review_module.request_revision(
-            self._load_or_new_review(slot), video_sha256=digest, requested_by=requested_by,
-            notes=notes, target_tab=target_tab)
+            self._load_or_new_review(slot), video_sha256=digest,
+            requested_by=requested_by, notes=notes, target_tab=target_tab,
+            # Snapshot taken BEFORE the fix runs, so the report afterwards
+            # compares against what the reviewer actually objected to.
+            before=render_review_module.technical_summary(
+                self.load_artifact("render_manifest", slot=slot)["data"]))
         self._save_render_review(review, slot)
         # A revision request is a NOTE: it changes no artifact, no status, and
         # never touches the video.
@@ -1969,13 +2012,15 @@ class PipelineService:
         review = self.load_artifact_path(voice_review_module.VOICE_REVIEW_ARTIFACT)
         decision = ((self.load_artifact("processing_plan")["data"] or {})
                     .get("decision") or {})
+        voiceover = self.load_artifact("selected_voiceover")["data"]
+        script = self.load_artifact("selected_script")["data"]
+        technical = voice_review_module.technical_summary(voiceover, script)
         state = voice_review_module.evaluate(
             review, self.voice_audio_digest(), self.ownership,
             content_language=decision.get("content_language"),
-            narration_preset=(decision.get("narration") or {}).get("preset"))
-        voiceover = self.load_artifact("selected_voiceover")["data"]
-        script = self.load_artifact("selected_script")["data"]
-        state["technical"] = voice_review_module.technical_summary(voiceover, script)
+            narration_preset=(decision.get("narration") or {}).get("preset"),
+            current_snapshot=technical)
+        state["technical"] = technical
         # The exact words being spoken, so the listener can follow along instead
         # of judging "does this sound right" from memory.
         state["script_text"] = (script or {}).get("script_text")
@@ -2110,7 +2155,10 @@ class PipelineService:
             raise PipelineServiceError("Revizyon istenecek bir seslendirme yok.")
         review = voice_review_module.request_revision(
             self._load_or_new_voice_review(), audio_sha256=digest,
-            requested_by=requested_by, notes=notes, target_tab=target_tab)
+            requested_by=requested_by, notes=notes, target_tab=target_tab,
+            before=voice_review_module.technical_summary(
+                self.load_artifact("selected_voiceover")["data"],
+                self.load_artifact("selected_script")["data"]))
         self._save_voice_review(review)
         # A revision request is a NOTE: it changes no artifact, no status, and
         # never touches the audio.
@@ -2583,12 +2631,19 @@ class PipelineService:
             moment_approved=True, moment_approved_by=selection["data"]["reviewed_by"],
             script_provider="google", allow_provider_fallback=False,
             content_language=decision.get("content_language"),
+            theory_angle=decision.get("theory_angle") or "",
+            derive_theory_angle=bool(decision.get("theory_angle_auto")),
             enable_google_model_fallback=enable_google_model_fallback,
             max_google_model_attempts=max_google_model_attempts,
             max_google_transient_retries=max_google_transient_retries,
         )
         tracker.stage("parse", "Yanit ayristirildi")
-        result["theory_angle"] = decision.get("theory_angle")
+        # A derived angle is the one the script was actually written to, so it
+        # wins over the plan's empty field. Which of the two it is stays visible
+        # in `theory_angle_source`.
+        result["theory_angle"] = (result.get("theory_angle")
+                                  or decision.get("theory_angle"))
+        result["theory_angle_auto"] = bool(decision.get("theory_angle_auto"))
         result["content_language"] = decision.get("content_language")
         tracker.stage("write", "Script artefakti yaziliyor")
         self.write_artifact("selected_script", result, job_id=job_id, actor=actor)

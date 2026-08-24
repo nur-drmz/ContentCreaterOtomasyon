@@ -536,10 +536,21 @@ class ConsoleApi:
                     reviewed_by=payload.get("reviewed_by") or service.project_actor(),
                     note=payload.get("note", ""), slot=slot)}
             if action == "request_revision":
-                return 200, {"render_review": service.request_render_revision(
+                target_tab = payload.get("target_tab", "moments")
+                review = service.request_render_revision(
                     requested_by=payload.get("requested_by") or service.project_actor(),
                     notes=payload.get("notes", ""),
-                    target_tab=payload.get("target_tab", "moments"), slot=slot)}
+                    target_tab=target_tab, slot=slot)
+                # Recording the note and STARTING the fix are separate steps on
+                # purpose: the note must survive even if the job is refused,
+                # and a quota-spending job only starts once the operator has
+                # confirmed it.
+                started = self._start_revision_job(
+                    service, ownership, target_tab,
+                    confirmed=bool(payload.get("start_confirmed")),
+                    actor=payload.get("requested_by") or service.project_actor())
+                return 200, {"render_review": service.render_review_state(slot),
+                             "revision_run": started}
             if action == "clear_revision":
                 return 200, {"render_review": service.clear_render_revision(
                     resolved_by=payload.get("resolved_by") or service.project_actor(),
@@ -579,10 +590,17 @@ class ConsoleApi:
                     reviewed_by=payload.get("reviewed_by") or service.project_actor(),
                     note=payload.get("note", ""))}
             if action == "request_revision":
-                return 200, {"voice_review": service.request_voice_revision(
+                target_tab = payload.get("target_tab", "voice")
+                service.request_voice_revision(
                     requested_by=payload.get("requested_by") or service.project_actor(),
                     notes=_required({"note": payload.get("notes")}, "note"),
-                    target_tab=payload.get("target_tab", "voice"))}
+                    target_tab=target_tab)
+                started = self._start_revision_job(
+                    service, ownership, target_tab,
+                    confirmed=bool(payload.get("start_confirmed")),
+                    actor=payload.get("requested_by") or service.project_actor())
+                return 200, {"voice_review": service.voice_review_state(),
+                             "revision_run": started}
             if action == "clear_revision":
                 return 200, {"voice_review": service.clear_voice_revision(
                     resolved_by=payload.get("resolved_by") or service.project_actor())}
@@ -945,6 +963,33 @@ class ConsoleApi:
         raise ApiError("unknown_route", detail=f"{method} /{'/'.join(parts)}")
 
     # -------------------------------------------------------------- helpers
+    def _start_revision_job(self, service, ownership, target_tab, *,
+                            confirmed: bool, actor: str) -> dict:
+        """Start the phase that owns this fix, when starting it is meaningful.
+
+        Three outcomes, and each one is reported rather than guessed at:
+          - not runnable: choosing a moment or changing the plan is a human
+            decision, so the console navigates instead of pretending to work.
+          - needs confirmation: script and TTS spend provider quota, and a
+            mis-click used to cost nothing. The caller re-sends with
+            `start_confirmed` once the operator has agreed.
+          - started: the job is queued exactly like any other run, so it gets
+            the same progress, retry and audit treatment.
+        """
+        plan = service.revision_action(target_tab)
+        if not plan["runnable"]:
+            return {**plan, "started": False, "job": None}
+        if plan["needs_confirmation"] and not confirmed:
+            return {**plan, "started": False, "job": None,
+                    "awaiting_confirmation": True}
+        record, created = self.app.submit_job(
+            ownership, plan["job_type"], params={}, submitted_by=actor,
+            run_request_id=f"revision-{target_tab}")
+        from .app import _job_view
+
+        return {**plan, "started": True, "created": bool(created),
+                "job": _job_view(record)}
+
     def _media(self, service, ownership, segments):
         if not segments:
             raise ApiError("validation_failed", detail="medya yolu verilmedi")

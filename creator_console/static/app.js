@@ -162,10 +162,13 @@ const state = {
   // the browser). Null until the Settings screen asks for it.
   diagnostics: null,
   diagnosticsBusy: false,
-  // Transcript editing drafts. UI-local and kept in state on purpose: the
+  // Transcript/script editing drafts. UI-local and kept in state on purpose: the
   // job poll re-renders every 1.5s and anything typed into a bare DOM node
   // would be wiped mid-sentence.
   transcriptDraft: null,
+  scriptDraft: null,
+  scriptDraftSource: null,
+  scriptNotesDraft: '',
   longFormStudio: null,
   turboStudio: null,
   turboDraft: null,
@@ -179,6 +182,7 @@ const state = {
   transcriptDraftOwner: null,
   transcriptFullDraftOwner: null,
   glossaryDraftOwner: null,
+  scriptDraftOwner: null,
   uploadRequest: null,
   uploadProgress: null,
   // Manual run parameters are UI-local (they are inputs), but every RESULT and
@@ -2608,6 +2612,41 @@ function draftOwner(slot) {
   return `${state.projectId || ''}::${slot === undefined || slot === null ? '' : slot}`;
 }
 
+function scriptDraftValue(data) {
+  const owner = draftOwner('script');
+  const source = String((data && data.script_text) || '');
+  if (state.scriptDraftOwner !== owner) {
+    state.scriptDraftOwner = owner;
+    state.scriptDraft = source;
+    state.scriptDraftSource = source;
+    state.scriptNotesDraft = '';
+  } else if (state.scriptDraft === null) {
+    state.scriptDraft = source;
+    state.scriptDraftSource = source;
+  } else if (state.scriptDraft === state.scriptDraftSource
+             && state.scriptDraftSource !== source) {
+    // A new generation may arrive while this screen is open. Replace only a
+    // clean draft; never destroy text the operator has already started editing.
+    state.scriptDraft = source;
+    state.scriptDraftSource = source;
+    state.scriptNotesDraft = '';
+  }
+  return state.scriptDraft;
+}
+
+function scriptDraftDirty(data) {
+  return scriptDraftValue(data).trim()
+    !== String((data && data.script_text) || '').trim();
+}
+
+function resetScriptDraft(data) {
+  const source = String((data && data.script_text) || '');
+  state.scriptDraftOwner = draftOwner('script');
+  state.scriptDraft = source;
+  state.scriptDraftSource = source;
+  state.scriptNotesDraft = '';
+}
+
 function transcriptDraft(t) {
   const owner = draftOwner(t && t.slot);
   if (!state.transcriptDraft || state.transcriptDraftOwner !== owner) {
@@ -3037,10 +3076,9 @@ function screenScript() {
 }
 
 
-/* The script, readable. Approving a SHA-256 for text you never saw is not a
- * review, so the content has to be on the page next to the approval panel.
- * Read-only by construction: there is no editor here, because editing would
- * invalidate the hash the approval is bound to. */
+/* The script, readable and editable. Saving is a real content revision: the
+ * server drops the script approval and archives voice/render descendants. The
+ * draft stays browser-local until save, just like the transcript editor. */
 function scriptReadingPanel() {
   const section = (state.project && state.project.script) || {};
   if (section.problem) {
@@ -3055,6 +3093,8 @@ function scriptReadingPanel() {
       el('div', { class: 'empty', 'data-testid': 'script-empty',
                   text: 'Henuz script uretilmedi.' }));
   }
+  const draft = scriptDraftValue(data);
+  const dirty = scriptDraftDirty(data);
   return el('div', { class: 'card' },
     el('div', { class: 'card__head' },
       el('h2', { text: 'Uretilen script' }),
@@ -3068,36 +3108,78 @@ function scriptReadingPanel() {
                     text: 'Model bu yanitta ayri bir hook cumlesi dondurmedi.' }),
     el('div', { class: 'script-body', 'data-testid': 'script-text',
                 text: data.script_text || '' }),
-    el('details', { class: 'script-editor', 'data-testid': 'script-editor' },
-      el('summary', { text: 'Script metnini duzenle' }),
+    el('section', { class: 'script-editor', 'data-testid': 'script-editor' },
+      el('div', { class: 'card__head' },
+        el('h3', { text: 'Script editoru' }),
+        badge(dirty ? 'review_required' : 'completed',
+              dirty ? 'kaydedilmedi' : 'kayitli')),
+      el('p', { class: 'dim',
+                text: 'Altyazi editorunde oldugu gibi metni dogrudan duzenle; '
+                      + 'taslagin kaydedene veya geri alana kadar korunur.' }),
       alertBox('warn', 'Bu bir icerik revizyonudur',
         'Kaydetmek script onayini kaldirir; mevcut seslendirme ve render revizyon '
         + 'arsivine tasinir. Script yeniden onaylandiktan sonra ses ve renderi yeniden uret.'),
       requiredLegend(),
       textareaField({ id: 'script-editor-text', label: 'Script metni', required: true,
-                      attrs: { maxlength: 20000, 'data-testid': 'script-editor-text',
-                               text: data.script_text || '' } }),
+                      value: draft,
+                      attrs: { maxlength: 20000, rows: 14,
+                               class: 'script-edit-input',
+                               'data-testid': 'script-editor-text',
+                               oninput: (event) => {
+                                 state.scriptDraft = event.currentTarget.value;
+                                 const counter = document.getElementById('script-editor-count');
+                                 if (counter) counter.textContent =
+                                   `${state.scriptDraft.length} / 20000 karakter`;
+                                 const status = document.getElementById('script-editor-dirty');
+                                 if (status) status.textContent = scriptDraftDirty(data)
+                                   ? 'Kaydedilmemis degisiklik var' : 'Kayitli metinle ayni';
+                               } } }),
+      el('div', { class: 'spread' },
+        el('span', { class: 'dim', id: 'script-editor-count',
+                     'data-testid': 'script-editor-count',
+                     text: `${draft.length} / 20000 karakter` }),
+        el('span', { class: 'dim', id: 'script-editor-dirty',
+                     'data-testid': 'script-editor-dirty',
+                     text: dirty ? 'Kaydedilmemis degisiklik var' : 'Kayitli metinle ayni' })),
       textareaField({ id: 'script-editor-notes', label: 'Revizyon notu',
+                      value: state.scriptNotesDraft,
                       attrs: { maxlength: 1000,
-                               placeholder: 'Neyi ve neden degistirdin?' } }),
-      el('button', {
-        class: 'btn btn--primary', 'data-testid': 'script-editor-save',
-        onclick: async (event) => {
-          const values = validateFields([
-            { id: 'script-editor-text', label: 'Script metni', required: true },
-            { id: 'script-editor-notes', label: 'Revizyon notu' },
-          ]);
-          if (!values) return;
-          event.currentTarget.disabled = true;
-          const saved = await guard(() => api.request(
-            'PATCH', `/api/projects/${state.projectId}/script`, {
-              body: { updated_by: projectActor(),
-                      script_text: values['script-editor-text'],
-                      notes: values['script-editor-notes'] || '' },
-            }), 'Script guncellendi; ses ve render yeniden uretilmeli');
-          if (saved) await refresh();
-        },
-      }, 'Script revizyonunu kaydet')),
+                               'data-testid': 'script-editor-notes',
+                               placeholder: 'Neyi ve neden degistirdin?',
+                               oninput: (event) => {
+                                 state.scriptNotesDraft = event.currentTarget.value;
+                               } } }),
+      el('div', { class: 'row' },
+        el('button', {
+          class: 'btn btn--primary', 'data-testid': 'script-editor-save',
+          onclick: (event) => withButton(event, async () => {
+            const values = validateFields([
+              { id: 'script-editor-text', label: 'Script metni', required: true },
+              { id: 'script-editor-notes', label: 'Revizyon notu' },
+            ]);
+            if (!values) return;
+            if (values['script-editor-text'].trim()
+                === String(data.script_text || '').trim()) {
+              pushAlert('info', 'Degisiklik yok',
+                        'Kaydedilecek bir script duzenlemesi bulunamadi.');
+              return;
+            }
+            const saved = await guard(() => api.request(
+              'PATCH', `/api/projects/${state.projectId}/script`, {
+                body: { updated_by: projectActor(),
+                        script_text: values['script-editor-text'],
+                        notes: values['script-editor-notes'] || '' },
+              }), 'Script guncellendi; ses ve render yeniden uretilmeli');
+            if (saved) {
+              resetScriptDraft(saved.script || data);
+              await refresh();
+            }
+          }),
+        }, 'Degisiklikleri kaydet'),
+        el('button', {
+          class: 'btn btn--sm', 'data-testid': 'script-editor-discard',
+          onclick: () => { resetScriptDraft(data); render(); },
+        }, 'Duzenlemeleri geri al'))),
     el('div', { class: 'grid grid--3', 'data-testid': 'script-meta' },
       techCell('Model', data.model),
       techCell('Saglayici', data.provider),
@@ -3178,6 +3260,7 @@ function screenVoice() {
     voiceTechnicalPanel(),
     voiceScriptPanel(),
     reviewChecklist('voice'),
+    revisionReportCard('voice'),
     reviewRevisionPanel('voice'),
     voiceRerunAction(),
     reviewApprovalSection('voice', 'Ses onayi', 'Sesi onayla', 'voiceover'));
@@ -3370,6 +3453,75 @@ function copyrightReviewCard() {
     reviewChecklist('copyright'));
 }
 
+/* What happened when the revision was started, and what still can be started.
+ * Rendered from the SERVER's plan (`revision_action`) so the browser never
+ * re-decides which phases are runnable or which ones cost quota. */
+function revisionRunCard(kind, open) {
+  const config = REVIEW_KINDS[kind];
+  const runnable = RUNNABLE_REVISION_TARGETS[open.target_tab];
+  if (!runnable) {
+    return alertBox('info', 'Bu duzeltme senin karariniz',
+      'Moment secmek veya plani degistirmek otomatik yapilamaz; '
+      + 'karari verdikten sonra ilgili faz yeniden calistirilir.',
+      `hedef: ${open.target_tab}`);
+  }
+  return el('div', { class: 'row' },
+    el('button', {
+      class: 'btn btn--primary', 'data-testid': config.testid('revision-run'),
+      onclick: async (event) => {
+        event.currentTarget.disabled = true;
+        await guard(() => api.post(
+          `/api/projects/${state.projectId}/${config.endpoint}`, {
+            action: 'request_revision', requested_by: projectActor(),
+            notes: open.notes, target_tab: open.target_tab,
+            start_confirmed: true,
+          }), 'Revizyon calismasi baslatildi');
+        await refresh();
+      },
+    }, `Duzeltmeyi baslat (${runnable})`));
+}
+
+/* Which targets the server can act on. Mirrors PipelineService.REVISION_JOBS;
+ * kept short and labelled so the button says WHAT it will run. */
+const RUNNABLE_REVISION_TARGETS = {
+  render: 'yeniden render',
+  voice: 'seslendirmeyi yenile',
+  script: 'scripti yeniden uret',
+};
+
+/* The report the reviewer asked for: what the revision actually changed.
+ * Shown only once the media really was replaced -- the server returns null
+ * while the digest still matches the one the revision was raised against. */
+function revisionReportCard(kind) {
+  const review = (state.project && state.project[REVIEW_KINDS[kind].viewKey]) || {};
+  const report = review.revision_report;
+  if (!report) return null;
+  const config = REVIEW_KINDS[kind];
+  return el('div', { class: 'card', 'data-testid': config.testid('revision-report') },
+    el('div', { class: 'card__head' },
+      el('h2', { text: 'Revizyon raporu' }),
+      badge(report.unchanged ? 'review_required' : 'completed',
+            report.unchanged ? 'raporlanan alan degismedi'
+                             : `${report.changes.length} alan degisti`)),
+    el('p', { class: 'dim',
+      text: `Istek: ${report.notes} — ${report.requested_by}` }),
+    el('div', { class: 'dim',
+      text: `${report.before_media_sha256_16}... -> ${report.after_media_sha256_16}...` }),
+    report.unchanged
+      ? alertBox('warn', 'Faz yeniden calisti ama raporlanan gercekler ayni',
+          'Dosya degisti; cozunurluk, sure, altyazi kaynagi gibi alanlarda fark yok. '
+          + 'Beklediğin degisiklik bu alanlarda degilse videoyu yeniden izle.')
+      : el('table', { class: 'table' },
+          el('thead', {}, el('tr', {},
+            el('th', {}, 'Alan'), el('th', {}, 'Once'), el('th', {}, 'Sonra'))),
+          el('tbody', {}, report.changes.map(change => el('tr', {
+            'data-testid': config.testid(`revision-change-${change.field}`),
+          },
+            el('td', {}, String(change.label)),
+            el('td', { class: 'dim' }, String(change.before)),
+            el('td', {}, String(change.after)))))));
+}
+
 function reviewChecklist(kind) {
   const config = REVIEW_KINDS[kind];
   const review = (state.project && state.project[config.viewKey]) || {};
@@ -3464,6 +3616,7 @@ function reviewRevisionPanel(kind) {
           alertBox('warn', 'Acik revizyon kaydi', open.notes,
                    `${open.requested_by} · ${String(open.requested_at).slice(0, 19)} · `
                    + `hedef: ${open.target_tab}`),
+          revisionRunCard(kind, open),
           el('div', { class: 'row' },
             el('button', {
               class: 'btn btn--primary', 'data-testid': config.testid('revision-goto'),
@@ -3501,15 +3654,31 @@ function reviewRevisionPanel(kind) {
                 { id: notesId, label: 'Revizyon notu', required: true },
               ]);
               if (!values) return;
-              event.currentTarget.disabled = true;
-              await guard(() => api.post(
+              const button = event.currentTarget;
+              button.disabled = true;
+              const target = document.getElementById(
+                `${config.testid('revision')}-target`).value;
+              const send = (confirmed) => api.post(
                 `/api/projects/${state.projectId}/${config.endpoint}`, {
                   action: 'request_revision',
                   requested_by: projectActor(),
                   notes: values[notesId],
-                  target_tab: document.getElementById(
-                    `${config.testid('revision')}-target`).value,
-                }), 'Revizyon kaydedildi');
+                  target_tab: target,
+                  start_confirmed: Boolean(confirmed),
+                });
+              let result = await guard(() => send(false), 'Revizyon kaydedildi');
+              const run = result && result.revision_run;
+              // The note is already saved at this point. A quota-spending phase
+              // asks first: this used to be a free click and must not silently
+              // start costing a daily allowance of 20 requests.
+              if (run && run.awaiting_confirmation) {
+                const go = window.confirm(
+                  `${run.reason}\n\nSimdi baslatilsin mi?`);
+                if (go) {
+                  result = await guard(() => send(true), 'Revizyon calismasi baslatildi');
+                }
+              }
+              button.disabled = false;
               await refresh();
             },
           }, 'Revizyon iste')));
@@ -3579,7 +3748,8 @@ function renderRevisionPanel() {
   // The note panel records WHY; the studio below acts on it by moving the
   // invalidated stage out of the way. Kept adjacent so the two are
   // obviously one workflow rather than two competing buttons.
-  return el('div', {}, reviewRevisionPanel('render'), revisionStudioPanel());
+  return el('div', {}, revisionReportCard('render'),
+            reviewRevisionPanel('render'), revisionStudioPanel());
 }
 
 /* Revizyon istasyonu.

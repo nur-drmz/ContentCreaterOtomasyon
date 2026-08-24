@@ -543,6 +543,7 @@ def build_processing_plan(assessment: dict, selected_mode: str, selected_by: str
                           output_count: int | None = None,
                           target_duration_sec: int | None = None,
                           moment_ranks=None, theory_angle: str = "",
+                          theory_angle_auto: bool = False,
                           content_language: str | None = None,
                           narration_preset: str | None = None,
                           render_config: dict | None = None,
@@ -592,11 +593,21 @@ def build_processing_plan(assessment: dict, selected_mode: str, selected_by: str
         )
 
     angle = str(theory_angle or "").strip()
+    auto_angle = bool(theory_angle_auto)
     if selected_mode == MODE_NARRATED_THEORY:
-        if len(angle) < MIN_THEORY_ANGLE_CHARS:
+        # The plan is approved BEFORE the analysis runs, so at this point nobody
+        # -- human or model -- has seen the moment the theory will be about.
+        # `theory_angle_auto` defers the angle to script generation, where the
+        # moment's own transcript is finally available. It is an explicit flag,
+        # not an empty string or a magic value, so "I have not decided yet" can
+        # never be confused with "I forgot to type it".
+        if auto_angle and angle:
+            raise ValueError(
+                "teori acisi ya elle yazilir ya da otomatik turetilir; ikisi birden olmaz")
+        if not auto_angle and len(angle) < MIN_THEORY_ANGLE_CHARS:
             raise ValueError(
                 f"narrated_theory icin teori/yorum acisi en az {MIN_THEORY_ANGLE_CHARS} karakter "
-                "olmali; script bu aciya gore uretilir"
+                "olmali; script bu aciya gore uretilir (veya otomatik turetmeyi sec)"
             )
         if resolved_count != 1:
             raise ValueError(
@@ -620,6 +631,7 @@ def build_processing_plan(assessment: dict, selected_mode: str, selected_by: str
         "target_duration_sec": resolved_duration,
         "moment_ranks": ranks,
         "theory_angle": angle or None,
+        "theory_angle_auto": auto_angle,
         # Part of the DECISION, so changing it changes the plan's approval hash
         # and invalidates every downstream approval -- which is exactly right:
         # a script approved in one language does not authorise another.
@@ -722,7 +734,8 @@ def validate_processing_plan(plan, assessment=None, source_fingerprint: str | No
                 errors.append(
                     f"anlatim sesi on ayarla uyusmuyor: {narration.get('voice')!r} "
                     f"!= {NARRATION_PRESETS[preset]['voice']!r}")
-        if mode == MODE_NARRATED_THEORY and not decision.get("theory_angle"):
+        if (mode == MODE_NARRATED_THEORY and not decision.get("theory_angle")
+                and not decision.get("theory_angle_auto")):
             errors.append("narrated_theory plani teori acisi icermiyor")
         if mode == MODE_DIRECT_CLIP_SERIES and decision.get("theory_angle"):
             errors.append("direct_clip_series plani teori acisi tasiyamaz")
@@ -920,7 +933,10 @@ def format_plan_panel(plan: dict) -> str:
         f"Icerik dili       : {_fmt(decision.get('content_language'))}",
         f"Anlatim on ayari  : {_fmt((decision.get('narration') or {}).get('preset'))}"
         f" (ses: {_fmt((decision.get('narration') or {}).get('voice'))})",
-        f"Teori acisi       : {_fmt(decision.get('theory_angle'))}",
+        f"Teori acisi       : "
+        + ("secilen momentten OTOMATIK turetilecek"
+           if decision.get("theory_angle_auto")
+           else _fmt(decision.get("theory_angle"))),
         f"Secen kisi        : {plan.get('selected_by')}",
         f"Oneriye uyuldu mu : {plan.get('followed_recommendation')} "
         f"(oneri={plan.get('recommended_mode')})",

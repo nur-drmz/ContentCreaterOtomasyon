@@ -163,7 +163,8 @@ def items_for_language(content_language: str | None) -> tuple:
 
 def evaluate(review: dict | None, audio_sha256: str | None, ownership,
              content_language: str | None = None,
-             narration_preset: str | None = None) -> dict:
+             narration_preset: str | None = None,
+             current_snapshot: dict | None = None) -> dict:
     spec = SPEC
     if content_language or narration_preset:
         # Same keys, same rules, different wording -- so a language or preset
@@ -171,7 +172,8 @@ def evaluate(review: dict | None, audio_sha256: str | None, ownership,
         spec = media_review.ReviewSpec(
             **{**SPEC.__dict__,
                "items": items_for(content_language, narration_preset)})
-    state = media_review.evaluate(spec, review, audio_sha256, ownership)
+    state = media_review.evaluate(spec, review, audio_sha256, ownership,
+                                  current_snapshot=current_snapshot)
     state["content_language"] = content_language
     state["narration_preset"] = narration_preset
     return state
@@ -185,10 +187,11 @@ def set_item(review: dict, key: str, *, checked: bool, audio_sha256: str,
 
 
 def request_revision(review: dict, *, audio_sha256: str, requested_by: str,
-                     notes: str, target_tab: str = "voice") -> dict:
+                     notes: str, target_tab: str = "voice",
+                     before: dict | None = None) -> dict:
     return media_review.request_revision(
         SPEC, review, media_sha256=audio_sha256, requested_by=requested_by,
-        notes=notes, target_tab=target_tab)
+        notes=notes, target_tab=target_tab, before=before)
 
 
 def clear_revision(review: dict, *, audio_sha256: str, resolved_by: str) -> dict:

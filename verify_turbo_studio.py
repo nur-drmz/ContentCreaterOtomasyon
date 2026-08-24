@@ -1404,6 +1404,101 @@ def test_image_clips_and_ken_burns():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_source_moment_anchor():
+    section("N. Kaynak moment Turbo'ya klip olarak besleniyor")
+    from creator_console import fixtures as fx
+    from creator_console.api import ConsoleApi
+
+    # Without an approved moment the anchor must refuse, and say what is missing.
+    root = Path(tempfile.mkdtemp(prefix="turbo_anchor_none_"))
+    try:
+        client = FakeGoogle(beats=3)
+        _app, _api, _pid, studio = seeded_turbo(root, client, use_source_moment=True)
+        check(studio.brief().get("use_source_moment") is True,
+              "brief-kaynak-moment-bayragini-tasiyor")
+        studio.run_script()
+        studio.approve_stage("script_review")
+        try:
+            studio.run_media_plan()
+            check(False, "momentsiz-kaynak-ankraji-REDDEDILIR", "plan olustu")
+        except turbo.TurboError as exc:
+            check("moment sec" in str(exc), "momentsiz-kaynak-ankraji-REDDEDILIR",
+                  str(exc)[:70])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # With one, it leads the plan and never enters the stock search.
+    root = Path(tempfile.mkdtemp(prefix="turbo_anchor_"))
+    try:
+        client = FakeGoogle(beats=3)
+        app = turbo_app(root, client)
+        api = ConsoleApi(app)
+        pid = fx.seed_demo_project(app, title="Kaynak momentli")["project_id"]
+        svc = app.service(app.ownership(pid))
+        call(api, "POST", f"/api/projects/{pid}/plan", {
+            "mode": "direct_clip_series", "selected_by": "verify", "output_count": 1,
+            "render_config": {"render_mode": "blurred_background",
+                              "preview_mode": True,
+                              "caption_style": "active_word_yellow",
+                              "caption_theme": "auto"}})
+        digest = svc.describe_plan_review()["review"]["content_sha256"]
+        call(api, "POST", f"/api/projects/{pid}/approvals/processing_plan",
+             {"reviewed_sha256": digest, "approved_by": "verify"})
+        call(api, "POST", f"/api/projects/{pid}/jobs", {
+            "job_type": "video_analysis",
+            "params": {"whisper_model_size": "tiny", "clip_duration_sec": 4,
+                       "top_n": 2}})
+        hot = svc.load_artifact("hot_moments")["data"]
+        svc.record_moment_selection(selected_rank=hot["hot_moments"][0]["rank"],
+                                    reviewed_by="verify", require_preview=False)
+        selection = svc.load_artifact("moment_selection")["data"]
+        # The analysis ranks candidates, so rank 1 is a recommendation whether
+        # or not anyone says so. Recording it makes "the system suggested this"
+        # auditable instead of implicit.
+        check(selection.get("recommended_moment_rank") == 1,
+              "moment-ONERISI-kayitli", str(selection.get("recommended_moment_rank")))
+        check(selection.get("followed_recommendation") is True,
+              "onerinin-takip-edilip-edilmedigi-kayitli")
+
+        call(api, "POST", f"/api/projects/{pid}/turbo/brief", {
+            "topic": "Bu sahnedeki kararin sezonu degistirdigi teorisi",
+            "duration_sec": 30, "aspect_ratio": "9:16",
+            "clip_duration_sec": 5.0, "use_source_moment": True})
+        studio = svc.turbo_studio()
+        studio.run_script()
+        studio.approve_stage("script_review")
+        plan = studio.run_media_plan()
+        slots = plan["slots"]
+        anchor = slots[0]
+        check(anchor["id"] == studio.SOURCE_MOMENT_SLOT_ID, "kaynak-moment-ILK-slot",
+              anchor["id"])
+        check(anchor["provider"] == "source_moment",
+              "kaynak-moment-stok-saglayici-DEGIL", str(anchor["provider"]))
+        check(anchor["status"] == "downloaded" and bool(anchor["download"]),
+              "kaynak-moment-INDIRILMIS-geliyor", anchor["status"])
+        check(not anchor["query"] and not anchor["candidates"],
+              "kaynak-moment-STOK-ARAMASINA-girmiyor",
+              f"query={anchor['query']!r} adaylar={len(anchor['candidates'])}")
+        # No attribution is invented for the operator's own footage.
+        check("kendi kaynak" in anchor["selected"]["attribution"].lower(),
+              "kendi-goruntusune-UYDURMA-atif-YOK",
+              anchor["selected"]["attribution"])
+        clip = studio._path(anchor["download"]["relative_path"])
+        check(clip.is_file() and clip.stat().st_size > 0, "ankraj-klibi-diskte",
+              f"{clip.stat().st_size / 1024:.0f} KB" if clip.is_file() else "yok")
+        # Cut from the ORIGINAL source, not the low-resolution preview.
+        check("moment_previews" not in str(clip), "onizlemeden-DEGIL-kaynaktan-kesilmis",
+              str(clip.name))
+        # Beat 1 is spoken over the anchor, so it needs no stock slot of its own.
+        beat_ids = [s["id"] for s in slots[1:]]
+        check(len(slots) == 3 and all(s["provider"] is None for s in slots[1:]),
+              "kalan-sahneler-STOKTAN-gelecek", str(beat_ids))
+        check(studio.SOURCE_MOMENT_SLOT_ID not in beat_ids,
+              "ankraj-bir-kez-eklenmis")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_cross_provider_text():
     section("L. Capraz saglayici metin zinciri (sahte transport)")
     from local_pipeline import provider_adapters as pa
@@ -1478,9 +1573,52 @@ def test_cross_provider_text():
           str(nothing["provider_attempts"]))
     check(not calls, "anahtarsizken-HTTP-cagrisi-YOK", str(calls))
 
+    # --- NVIDIA NIM is the same envelope, so the router needs no special case
+    nv_calls = []
+
+    def nvidia_transport(method, url, headers=None, json_body=None, **_kw):
+        nv_calls.append((url, headers.get("Authorization", ""), json_body))
+        return 200, {"choices": [{"message": {"content": "NVIDIA METNI"}}],
+                     "usage": {"total_tokens": 7}}
+
+    nv_secrets = lambda name: {"NVIDIA_API_KEY": "FAKE-NV-" + "0" * 10}.get(name)
+    nv = pa.call_nvidia_text("prompt", secret_getter=nv_secrets,
+                             transport=nvidia_transport)
+    check(nv["ok"] and nv["output"] == "NVIDIA METNI", "nvidia-metin-uretiyor",
+          str(nv.get("status")))
+    check(nv["provider"] == "nvidia", "nvidia-saglayici-adi-dogru")
+    check(nv_calls[0][0] == pa.NVIDIA_CHAT_URL, "nvidia-dogru-ucnokta",
+          nv_calls[0][0])
+    check(nv_calls[0][1].startswith("Bearer "), "nvidia-Bearer-basligi")
+    # Like Groq and unlike Pixabay, the key never travels in the URL.
+    check("FAKE-NV" not in nv_calls[0][0], "nvidia-anahtari-URLe-YAZILMIYOR",
+          nv_calls[0][0])
+    check("FAKE-NV" not in json.dumps(nv), "nvidia-secret-not-returned")
+    skipped_nv = pa.call_nvidia_text("prompt", secret_getter=lambda name: None,
+                                     transport=nvidia_transport)
+    check(skipped_nv["skipped"] and not skipped_nv["ok"],
+          "nvidia-anahtarsiz-TEMIZ-atlanir", str(skipped_nv.get("error"))[:50])
+    check(len(nv_calls) == 1, "anahtarsizken-nvidia-HTTP-cagrisi-YOK",
+          f"{len(nv_calls)} cagri")
+
+    # It is reachable through the chain, not just callable on its own.
+    chain = [name for name, _ in pa.CROSS_PROVIDER_ROUTES["high_quality_text"]]
+    check("nvidia" in chain, "nvidia-ZINCIRDE", str(chain))
+    check(pa.CROSS_PROVIDER_TEXT_CALLS.get("nvidia") is pa.call_nvidia_text,
+          "nvidia-adaptoru-KAYITLI")
+    check(chain.index("nvidia") > chain.index("google"),
+          "nvidia-GOOGLE-DAN-SONRA", str(chain))
+    for name, _model in pa.CROSS_PROVIDER_ROUTES["high_quality_text"]:
+        if name == "google":
+            continue
+        check(name in pa.CROSS_PROVIDER_TEXT_CALLS,
+              f"zincirdeki-{name}-cagrilabilir",
+              "rotada adi gecen her saglayici bir adaptore cozulmeli")
+
     # And no secret reaches the record.
-    blob = json.dumps(switched) + json.dumps(nothing)
-    check("FAKE-GROQ" not in blob and "FAKE-TOKEN" not in blob,
+    blob = json.dumps(switched) + json.dumps(nothing) + json.dumps(nv)
+    check("FAKE-GROQ" not in blob and "FAKE-TOKEN" not in blob
+          and "FAKE-NV" not in blob,
           "capraz-saglayici-kaydinda-SIR-YOK")
 
 
@@ -1905,6 +2043,7 @@ def main():
     test_timeline_revisions()
     test_real_render()
     test_image_clips_and_ken_burns()
+    test_source_moment_anchor()
     test_cross_provider_text()
     test_music_licensing()
     test_render_gating()

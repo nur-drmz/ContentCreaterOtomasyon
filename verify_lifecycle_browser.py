@@ -77,10 +77,30 @@ with tempfile.TemporaryDirectory(prefix="lifecycle_browser_") as temp:
                   "lifecycle-panel-visible")
             check(page.locator("[data-testid=script-editor]").count() == 1,
                   "script-editor-visible")
-            page.locator("[data-testid=script-editor] > summary").click()
+            check(page.locator("[data-testid=script-editor]").is_visible(),
+                  "script-editor-open-by-default")
             check(page.locator("[data-testid=script-editor-text]").input_value()
                   == "Editable script", "script-editor-prefilled")
+            page.fill("[data-testid=script-editor-text]", "Unsaved browser draft")
+            page.fill("[data-testid=script-editor-notes]", "Unsaved note")
+            # Hash navigation forces the app's normal refresh/render cycle
+            # without reloading the JS runtime that owns the local draft.
+            page.evaluate("location.hash = '#jobs'")
+            page.wait_for_timeout(250)
+            page.evaluate("location.hash = '#script'")
+            page.wait_for_timeout(500)
+            check(page.locator("[data-testid=script-editor-text]").input_value()
+                  == "Unsaved browser draft", "script-draft-survives-refresh")
+            check(page.locator("[data-testid=script-editor-notes]").input_value()
+                  == "Unsaved note", "script-note-survives-refresh")
+            check("Kaydedilmemis" in
+                  page.locator("[data-testid=script-editor-dirty]").inner_text(),
+                  "script-dirty-state-visible")
+            page.click("[data-testid=script-editor-discard]")
+            check(page.locator("[data-testid=script-editor-text]").input_value()
+                  == "Editable script", "script-discard-restores-source")
             page.fill("[data-testid=script-editor-text]", "Browser revised script")
+            page.fill("[data-testid=script-editor-notes]", "Browser edit")
             page.click("[data-testid=script-editor-save]")
             page.wait_for_timeout(700)
             check(service.load_artifact("selected_script")["data"]["script_text"]

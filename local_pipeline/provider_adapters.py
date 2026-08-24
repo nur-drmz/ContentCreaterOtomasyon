@@ -34,6 +34,7 @@ from .google_ai import (
 #: Colab Secret names these adapters look for. All optional.
 PROVIDER_SECRETS = {
     "groq": ("groq",),
+    "nvidia": ("nvidia",),
     "cloudflare": ("cloudflare_account_id", "cloudflare_auth_token"),
     "azure_speech": ("azure_speech_key", "azure_speech_region"),
 }
@@ -44,11 +45,13 @@ CROSS_PROVIDER_ROUTES = {
     "high_quality_text": (
         ("google", None),
         ("groq", "openai/gpt-oss-120b"),
+        ("nvidia", "meta/llama-3.3-70b-instruct"),
         ("cloudflare", "@cf/openai/gpt-oss-120b"),
     ),
     "high_volume_text": (
         ("google", None),
         ("groq", "qwen/qwen3.6-27b"),
+        ("nvidia", "meta/llama-3.1-8b-instruct"),
         ("cloudflare", "@cf/qwen/qwen3-30b-a3b-fp8"),
     ),
     "embeddings": (
@@ -155,6 +158,15 @@ def _require_transport(transport):
 # Groq
 # ---------------------------------------------------------------------------
 
+#: NVIDIA's hosted inference (build.nvidia.com / NIM) speaks the OpenAI chat
+#: protocol, so this adapter is the Groq one with a different host and default
+#: model rather than a second way of doing the same thing.
+NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+#: Model ids come from build.nvidia.com. NOT verified by a live call in this
+#: repo -- a wrong id surfaces as a clean provider failure that the router
+#: falls through, never as a silent wrong answer.
+NVIDIA_DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
+
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
@@ -260,6 +272,40 @@ def continue_text_route(google_result: dict, prompt: str, *,
         (result.get("status_reason") or "")
         + f" | capraz saglayici zinciri de uretemedi ({tried})").strip(" |")
     return result
+
+
+def call_nvidia_text(prompt: str, *, model: str = NVIDIA_DEFAULT_MODEL,
+                     secret_getter=None, transport=None,
+                     capability: str = "high_quality_text",
+                     max_tokens: int = 1024) -> dict:
+    """OpenAI-compatible chat completion on NVIDIA NIM. Skips cleanly with no key.
+
+    Same envelope as every other adapter here, so `continue_text_route` can walk
+    it without knowing which provider it is talking to.
+    """
+    state = resolve_provider_credentials("nvidia", secret_getter)
+    if not state["available"]:
+        return _skipped("nvidia", state["reason"], capability)
+    credential: CredentialRef = state["credentials"]["nvidia"]
+    send = _require_transport(transport)
+    try:
+        status, payload = send(
+            "POST", NVIDIA_CHAT_URL,
+            headers={"Authorization": f"Bearer {credential.value}",
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"},
+            json_body={"model": model, "max_tokens": max_tokens,
+                       "messages": [{"role": "user", "content": prompt}]},
+        )
+        if status != 200:
+            raise RuntimeError(f"HTTP {status}: {str(payload)[:200]}")
+        text = payload["choices"][0]["message"]["content"]
+        return {"provider": "nvidia", "capability": capability, "model": model,
+                "ok": True, "skipped": False, "status": "ok", "output": text,
+                "error": None, "usage_metadata": payload.get("usage"),
+                "created_at": datetime.now(timezone.utc).isoformat()}
+    except Exception as exc:
+        return _failed("nvidia", capability, model, exc, credential)
 
 
 def call_groq_transcription(audio_bytes: bytes, *, model: str = "whisper-large-v3-turbo",
@@ -421,6 +467,7 @@ def call_azure_tts(script_text: str, out_path, *, voice: str = "tr-TR-AhmetNeura
 #: text capability must resolve to a callable below.
 CROSS_PROVIDER_TEXT_CALLS.update({
     "groq": call_groq_text,
+    "nvidia": call_nvidia_text,
     "cloudflare": call_cloudflare_text,
 })
 

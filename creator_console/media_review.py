@@ -70,7 +70,7 @@ def new_review(spec: ReviewSpec, ownership, media_sha256: str | None = None) -> 
 
 
 def evaluate(spec: ReviewSpec, review: dict | None, media_sha256: str | None,
-             ownership) -> dict:
+             ownership, current_snapshot: dict | None = None) -> dict:
     """Current checklist state for THIS media.
 
     An entry recorded against a different digest is reported as `stale` and does
@@ -120,7 +120,70 @@ def evaluate(spec: ReviewSpec, review: dict | None, media_sha256: str | None,
                     VERDICT_PASS if done == total else VERDICT_PENDING),
         "open_revision": open_revision,
         "revision_history": list(review.get("revision_requests") or [])[:20],
+        # What the last revision changed, once the fix has actually landed.
+        "revision_report": revision_report(review, current_snapshot, media_sha256),
         "blocker": _blocker(spec, done, total, stale, open_revision, media_sha256),
+    }
+
+
+#: Fields worth reporting on, in the order a reviewer reads them. Anything not
+#: listed is ignored rather than dumped: a diff of every key would bury the two
+#: lines that matter under timestamps and hashes nobody reads.
+REPORTABLE_FIELDS = (
+    ("resolution", "Cozunurluk"),
+    ("duration_sec", "Sure (sn)"),
+    ("video_codec", "Video codec"),
+    ("audio_present", "Ses akisi"),
+    ("subtitle_source", "Altyazi kaynagi"),
+    ("caption_theme", "Altyazi temasi"),
+    ("word_count", "Kelime sayisi"),
+    ("voice", "Ses"),
+    ("preset", "Anlatim onayari"),
+    ("status", "Durum"),
+)
+
+
+def revision_report(review: dict, current: dict | None,
+                    media_sha256: str | None) -> dict | None:
+    """What the last revision actually changed, or None when there is nothing
+    to report yet.
+
+    Reported only once the media has genuinely been replaced: while the digest
+    still matches the one the revision was raised against, no fix has landed and
+    claiming otherwise would be worse than saying nothing.
+    """
+    entries = review.get("revision_requests") or []
+    if not entries:
+        return None
+    entry = entries[0]
+    before = entry.get("before") or {}
+    if not before or not media_sha256:
+        return None
+    if entry.get("media_sha256") == media_sha256:
+        return None  # nothing re-ran yet; the reviewer is looking at the same file
+
+    now = dict(current or {})
+    changes = []
+    for key, label in REPORTABLE_FIELDS:
+        if key not in before and key not in now:
+            continue
+        was, became = before.get(key), now.get(key)
+        if was != became:
+            changes.append({"field": key, "label": label,
+                            "before": was, "after": became})
+    return {
+        "notes": entry.get("notes"),
+        "requested_by": entry.get("requested_by"),
+        "requested_at": entry.get("requested_at"),
+        "target_tab": entry.get("target_tab"),
+        "resolved": bool(entry.get("resolved")),
+        "changes": changes,
+        # An empty list is a RESULT, not a missing report: the phase re-ran and
+        # produced something byte-different whose reportable facts are identical.
+        # Saying so is more useful than an empty card.
+        "unchanged": not changes,
+        "before_media_sha256_16": (entry.get("media_sha256") or "")[:16],
+        "after_media_sha256_16": (media_sha256 or "")[:16],
     }
 
 
@@ -181,8 +244,15 @@ def set_item(spec: ReviewSpec, review: dict, key: str, *, checked: bool,
 
 
 def request_revision(spec: ReviewSpec, review: dict, *, media_sha256: str,
-                     requested_by: str, notes: str, target_tab: str) -> dict:
-    """Record 'needs revision'. Changes NOTHING about the media or any artifact."""
+                     requested_by: str, notes: str, target_tab: str,
+                     before: dict | None = None) -> dict:
+    """Record 'needs revision', and remember what the media looked like.
+
+    This module still changes nothing about the media. `before` is a snapshot
+    the CALLER took, kept so that once the fix has run the console can say what
+    actually changed instead of leaving the reviewer to compare two videos from
+    memory. A revision nobody can verify is a note, not a fix.
+    """
     if not str(requested_by or "").strip():
         raise ValueError("revizyon isteyen kisi zorunlu")
     if not str(notes or "").strip():
@@ -197,6 +267,7 @@ def request_revision(spec: ReviewSpec, review: dict, *, media_sha256: str,
         "target_tab": target_tab,
         "requested_at": _now(),
         "resolved": False,
+        "before": dict(before or {}),
     }
     review.setdefault("revision_requests", []).insert(0, entry)
     review["updated_at"] = _now()

@@ -394,6 +394,12 @@ def section_frontend_contract():
           "script okuma paneli yok")
     check("data-testid': 'script-text'" in js or 'data-testid\': `script-text' in js
           or "script-text" in js, "script-text-rendered", "script metni cizilmiyor")
+    check("function scriptDraftValue(data)" in js and "scriptDraftOwner" in js,
+          "script-draft-owned", "script taslagi projeye bagli state'te korunmuyor")
+    check("script-editor-discard" in js and "script-editor-save" in js,
+          "script-editor-actions", "script editoru kaydet/geri al eylemlerini sunmuyor")
+    check("el('details', { class: 'script-editor'" not in js,
+          "script-editor-visible", "script editoru kapali ayrinti alanina saklanmis")
     check("script-hook-missing" in js, "hook-absence-stated",
           "hook yoklugu sessizce gizleniyor")
     check("pbar--inner" in js and "pbar--inner" in css, "inner-bar",
