@@ -1,0 +1,1 @@
+"""Binary object storage adapters."""
