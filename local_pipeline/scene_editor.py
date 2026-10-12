@@ -117,6 +117,8 @@ class EDL:
     render_mode: str = "center_crop"  # center_crop, blurred_background
     clips: list[EDLClip] = field(default_factory=list)
     music_track: str | None = None
+    revision_notes: str = ""
+    revision_requested_by: str = ""
     created_at: str = ""
     version: int = 1
 
