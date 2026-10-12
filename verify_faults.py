@@ -234,7 +234,7 @@ _video.write_bytes(b"")
 probe("0 baytlik MP4",
       "kullanilamaz + medya uc noktasi 422",
       f"usable={_svc.outputs()[0]['video']['usable']}, "
-      f"HTTP {call(_app, 'GET', f'/api/projects/{_pid}/media/{_svc.outputs()[0]['video']['relative_path']}')[0]}",
+      f"HTTP {call(_app, 'GET', '/api/projects/{}/media/{}'.format(_pid, _svc.outputs()[0]['video']['relative_path']))[0]}",
       not _svc.outputs()[0]["video"]["usable"])
 
 _video.write_bytes(_video_backup[:512])  # truncated MP4

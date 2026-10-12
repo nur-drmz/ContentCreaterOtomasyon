@@ -16,7 +16,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_ROOT / ".local_runtime" / "creator_console_colab.zip"
-INCLUDE_ROOTS = ("creator_console", "local_pipeline")
+#: `creator_console` imports `infrastructure` (the object-store adapter is chosen
+#: by the composition root in `app.py`), and `infrastructure` in turn is what a
+#: future backend swap replaces, so both packages must ship or the extracted
+#: bundle fails to import. `application` carries the ports those adapters satisfy.
+INCLUDE_ROOTS = ("creator_console", "local_pipeline", "application", "infrastructure")
 INCLUDE_SUFFIXES = {".py", ".html", ".css", ".js"}
 FIXED_ZIP_TIME = (2026, 1, 1, 0, 0, 0)
 

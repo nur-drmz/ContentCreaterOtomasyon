@@ -165,11 +165,24 @@ class FaultingStorage(StorageAdapter):
         return self.inner.read_json(ownership, relative, **kwargs)
 
 
-#: Modules that did `from .storage import atomic_write_json`. Rebinding only the
-#: definition in `storage` would NOT affect them -- the name was already bound at
-#: import time -- so every holder must be patched. Miss one and the fault
-#: silently does not fire, which is worse than no test at all.
-_ATOMIC_WRITE_HOLDERS = ("storage", "jobs", "pipeline_service")
+#: Modules that did `from creator_console.storage import atomic_write_json` (or
+#: the relative equivalent). Rebinding only the definition in `storage` would
+#: NOT affect them -- the name was already bound at import time -- so every
+#: holder must be patched. Miss one and the fault silently does not fire, which
+#: is worse than no test at all.
+_ATOMIC_WRITE_HOLDERS = (
+    "creator_console.storage",
+    "creator_console.jobs",
+    "creator_console.pipeline_service",
+    # Artifact writes moved here in the EditorService extraction; without this
+    # entry `write_artifact` would bypass injected write faults entirely.
+    "infrastructure.persistence.local.artifact_repository",
+    # Revision-manifest writes moved here in the MomentService extraction
+    # (`LocalRevisionArchive`). Without this entry, archiving a clip-bounds or
+    # rewind snapshot could succeed while the fault injector believes it
+    # failed -- and vice versa.
+    "infrastructure.persistence.local.revision_archive",
+)
 
 
 def patch_atomic_write(*, exception=None, partial_bytes=None, match=None):
@@ -190,7 +203,7 @@ def patch_atomic_write(*, exception=None, partial_bytes=None, match=None):
     def _patch():
         modules = []
         for name in _ATOMIC_WRITE_HOLDERS:
-            module = importlib.import_module(f".{name}", package=__package__)
+            module = importlib.import_module(name)
             if hasattr(module, "atomic_write_json"):
                 modules.append((module, module.atomic_write_json))
         original = modules[0][1] if modules else None

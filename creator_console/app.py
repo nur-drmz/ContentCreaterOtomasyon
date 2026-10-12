@@ -44,6 +44,16 @@ from .jobs import (
     ThreadJobRunner,
 )
 from .pipeline_service import ArtifactProblem, PipelineService, PipelineServiceError
+from application.media_binaries import MediaBinaries
+from application.services import (
+    AnalysisService, ApprovalService, EditorService, MomentService,
+    PublishService, ScriptService, SourceService, TranscriptService,
+    VideoAnalysisService, WorkflowGate)
+from infrastructure.persistence.local import (
+    LocalArtifactRepository, LocalRevisionArchive)
+from infrastructure.progress.local import LocalProgressFactory
+from infrastructure.review.local import LocalReviewGate
+from infrastructure.storage.local import LocalObjectStore
 from .secrets_ref import CONSOLE_SECRET_ALIASES, SecretResolver
 from .progress import ACTIVITIES as PROGRESS_ACTIVITIES
 from .progress import (
@@ -191,11 +201,61 @@ def scrub_host_paths(value, storage, ownership):
 
 
 class ConsoleApp:
-    """Everything the HTTP layer needs, with no HTTP knowledge of its own."""
+    """Everything the HTTP layer needs, with no HTTP knowledge of its own.
+
+    This class is also the COMPOSITION ROOT: it is the single place that decides
+    which persistence adapters the rest of the console uses. The attributes below
+    name those adapters so a different backend can be substituted by a subclass
+    or a test without editing call sites. They default to the local filesystem
+    implementations, which is the only backend that exists today.
+
+    See `application/ports/` for the contracts these adapters satisfy.
+    """
+
+    #: Namespace resolution + project lifecycle (`ports.ProjectNamespaceStore`).
+    namespace_store_cls = LocalFilesystemStorage
+    #: JSON artifact persistence (`ports.ArtifactRepository`).
+    artifact_repository_cls = LocalArtifactRepository
+    #: Durable job state (`ports.JobRepository`).
+    job_repository_cls = JobStore
+    #: Append-only audit trail (`ports.AuditSink`).
+    audit_sink_cls = AuditLog
+    #: Binary object storage (`ports.ObjectStore`).
+    object_store_cls = LocalObjectStore
+    #: EDL/editor use cases (`application.services`).
+    editor_service_cls = EditorService
+    #: Source media lifecycle + `ports.SourceQuery` (`application.services`).
+    source_service_cls = SourceService
+    #: Phase 0 assessment + processing plan (`application.services`).
+    analysis_service_cls = AnalysisService
+    #: Content-approval lifecycle (`application.services`).
+    approval_service_cls = ApprovalService
+    #: Publication orchestration + private-first upload (`application.services`).
+    publish_service_cls = PublishService
+    #: Phase 1 video analysis + `hot_moments` ownership (`application.services`).
+    video_analysis_service_cls = VideoAnalysisService
+    #: Phase 2 moment selection + clip-bounds ownership (`application.services`).
+    moment_service_cls = MomentService
+    #: Transcript lifecycle ownership (`application.services`).
+    transcript_service_cls = TranscriptService
+    #: Narrated-mode script lifecycle ownership (`application.services`).
+    script_service_cls = ScriptService
+    #: Recoverable `.revisions/` snapshots (`ports.RevisionArchiver`).
+    revision_archive_cls = LocalRevisionArchive
+    #: Plan-derived workflow eligibility (`ports.WorkflowGateQuery`).
+    workflow_gate_cls = WorkflowGate
+    #: Human-review preconditions behind approval (`ports.ReviewGate`).
+    review_gate_cls = LocalReviewGate
+    #: Progress reporting (`ports.ProgressFactory`).
+    progress_factory_cls = LocalProgressFactory
 
     def __init__(self, config: ConsoleConfig):
         self.config = config
-        self.storage = LocalFilesystemStorage(config.storage_root)
+        self.storage = self.namespace_store_cls(config.storage_root)
+        self.object_store = self.object_store_cls(self.storage)
+        # One ffmpeg/ffprobe resolution for the whole process: every service
+        # built below shares this cache instead of probing the PATH again.
+        self.media_binaries = MediaBinaries(config.ffmpeg_bin, config.ffprobe_bin)
         self.secrets = SecretResolver(config.secret_getter)
         self._runtime_log_lock = threading.Lock()
         runner_cls = InlineJobRunner if config.inline_jobs else ThreadJobRunner
@@ -210,6 +270,12 @@ class ConsoleApp:
         return Ownership(self.config.user_id, self.config.workspace_id, project_id)
 
     def service(self, ownership: Ownership) -> PipelineService:
+        # Composition root: the façade and its application service share one
+        # audit sink and one artifact repository per project, both built from
+        # the adapter seams above.
+        audit = self.audit_sink(ownership)
+        artifacts = self.artifact_repository_cls(self.storage, ownership, audit)
+        progress = self.progress_factory_cls(self.storage, ownership)
         return PipelineService(
             self.storage, ownership, self.secrets,
             google_client_factory=self.config.google_client_factory,
@@ -219,6 +285,23 @@ class ConsoleApp:
             probe_fn=self.config.probe_fn,
             ffmpeg_bin=self.config.ffmpeg_bin, ffprobe_bin=self.config.ffprobe_bin,
             music_root=self.config.music_root,
+            audit=audit,
+            artifacts=artifacts,
+            binaries=self.media_binaries,
+            progress=progress,
+            source_cls=self.source_service_cls,
+            editor_cls=self.editor_service_cls,
+            analysis_cls=self.analysis_service_cls,
+            approval_cls=self.approval_service_cls,
+            publish_cls=self.publish_service_cls,
+            review_gate_cls=self.review_gate_cls,
+            workflow_cls=self.workflow_gate_cls,
+            video_analysis_cls=self.video_analysis_service_cls,
+            moment_cls=self.moment_service_cls,
+            transcript_cls=self.transcript_service_cls,
+            script_cls=self.script_service_cls,
+            revision_archive=self.revision_archive_cls(
+                namespace=self.storage, ownership=ownership),
         )
 
     def save_local_secret(self, *, kind: str, value: str) -> dict:
@@ -249,7 +332,11 @@ class ConsoleApp:
         return {"saved": summary["saved"], "secret": reference, "restart_required": False}
 
     def job_store(self, ownership: Ownership) -> JobStore:
-        return JobStore(self.storage, ownership)
+        return self.job_repository_cls(self.storage, ownership)
+
+    def audit_sink(self, ownership: Ownership) -> AuditLog:
+        """The audit trail for one namespace, built through the adapter seam."""
+        return self.audit_sink_cls(self.storage, ownership)
 
     def automation(self, ownership: Ownership) -> AutomationEngine:
         """The PERSISTED automatic flow for one project.
@@ -590,7 +677,7 @@ class ConsoleApp:
             ownership, job_type, params, run_request_id=run_request_id)
         record, created = store.submit(job_type, idempotency_key=key, params=params,
                                         submitted_by=submitted_by)
-        audit = AuditLog(self.storage, ownership)
+        audit = self.audit_sink(ownership)
         audit.record("job.submitted" if created else "job.deduplicated",
                      actor=submitted_by, job_id=record["job_id"],
                      detail={"job_type": job_type, "idempotency_key": key,
@@ -878,7 +965,7 @@ class ConsoleApp:
     def _execute_job(self, store: JobStore, job_id: str, worker_id: str = "worker") -> None:
         record = store.get(job_id)
         ownership = Ownership(record["user_id"], record["workspace_id"], record["project_id"])
-        audit = AuditLog(self.storage, ownership)
+        audit = self.audit_sink(ownership)
         audit.record("job.started", job_id=job_id, actor=record.get("submitted_by", "console"),
                      detail={"job_type": record["job_type"], "attempt": record.get("attempts")})
         service = self.service(ownership)
@@ -974,7 +1061,7 @@ class ConsoleApp:
             tracker = ProgressTracker(self.storage, ownership, activity, job_id=job_id,
                                        attempt=int(record.get("attempts") or 1) + 1)
             tracker.start(f"{int(record.get('attempts') or 1) + 1}. deneme kuyruga alindi")
-        AuditLog(self.storage, ownership).record(
+        self.audit_sink(ownership).record(
             "job.retry_requested", actor=requested_by, job_id=job_id,
             detail={"attempt": record.get("attempts")})
         self.runner.submit(store, job_id)
@@ -994,7 +1081,7 @@ class ConsoleApp:
                 # The worker still owns the process until its next checkpoint.
                 # Keep the state running and say exactly what is happening.
                 tracker.note("Durdurma istegi alindi; guvenli cikis bekleniyor.")
-        AuditLog(self.storage, ownership).record(
+        self.audit_sink(ownership).record(
             "job.cancel_requested", actor=requested_by, job_id=job_id,
             detail={"job_type": activity, "status": record.get("status")})
         return store.get(job_id)
@@ -1020,7 +1107,7 @@ class ConsoleApp:
                     if record.get("job_type") in PROGRESS_ACTIVITIES:
                         mark_interrupted(self.storage, ownership, record["job_type"],
                                           reason="is kurtarma sirasinda calisir bulundu")
-                    AuditLog(self.storage, ownership).record(
+                    self.audit_sink(ownership).record(
                         "job.recovered", job_id=record["job_id"],
                         detail={"job_type": record.get("job_type"),
                                  "recoverable": record.get("recoverable")})
@@ -1204,7 +1291,7 @@ class ConsoleApp:
             # same artifacts and approval chain the queue uses, so the board can
             # never offer an action the pipeline would refuse.
             "batch": service.batch_state(),
-            "audit": AuditLog(self.storage, ownership).events(limit=40),
+            "audit": self.audit_sink(ownership).events(limit=40),
             "secrets": self.secrets.public_state(),
             "planned_not_implemented": [dict(item) for item in PLANNED_NOT_IMPLEMENTED],
             "not_uploaded": True,

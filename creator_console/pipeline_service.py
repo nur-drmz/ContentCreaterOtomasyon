@@ -18,7 +18,6 @@ here exactly once, so:
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import shutil
@@ -29,22 +28,33 @@ from local_pipeline import (
     approval,
     glossary as glossary_module,
     google_ai,
-    metadata_studio,
     publish as publish_module,
-    publish_youtube,
     render_utils,
     scene_editor,
     script_generation,
     source_strategy,
     subtitle_edit,
-    transcript_edit,
     trend_ingest,
     tts as tts_module,
     video_analysis,
 )
 
+from application import artifact_catalog, project_record
+from application.approval_catalog import APPROVAL_ARTIFACTS as _APPROVAL_ARTIFACTS
+from application.errors import ArtifactProblem, PipelineServiceError
+from application.media_binaries import MediaBinaries
+from application.services import (
+    AnalysisService, ApprovalService, EditorService, MomentService,
+    PublishService, ScriptService, SourceService, TranscriptService,
+    VideoAnalysisService, WorkflowGate)
+from application.services.video_analysis_service import (
+    FULL_SOURCE_ANALYSIS_STAGES)
+from infrastructure.persistence.local import (
+    LocalArtifactRepository, LocalRevisionArchive)
+from infrastructure.progress.local import LocalProgressFactory
+from infrastructure.review.local import LocalReviewGate
+
 from .audit import AuditLog
-from . import progress as progress_module
 from . import copyright_review as copyright_review_module
 from . import render_profile as render_profile_module
 from . import render_review as render_review_module
@@ -52,57 +62,25 @@ from . import voice_review as voice_review_module
 from .ids import Ownership, new_id, safe_filename
 from .storage import StorageViolation, atomic_write_json
 
-#: Artifact names inside a project namespace. Relative on purpose: an absolute
-#: host path must never reach the browser or an artifact field.
-ARTIFACTS = {
-    "project": "project.json",
-    "source_candidates": "results/source_candidates.json",
-    "rights_decision": "results/rights_decision.json",
-    "ingest_manifest": "results/ingest_manifest.json",
-    "publication_metadata": "results/publication_metadata.json",
-    "publish_intent": "results/publish_intent.json",
-    "publish_manifest": "results/publish_manifest.json",
-    "edl": "results/edl/edl.json",
-    "source_assessment": "results/source_assessment.json",
-    "processing_plan": "results/processing_plan.json",
-    "hot_moments": "results/hot_moments.json",
-    "moment_selection": "results/moment_selection.json",
-    "selected_script": "results/selected_script.json",
-    "selected_voiceover": "results/selected_voiceover.json",
-    "subtitle_track": "results/subtitle_track.json",
-    "moment_transcript": "results/moment_transcript.json",
-    "glossary": "results/glossary.json",
-    "long_form_plan": "results/long_form_plan.json",
-    "turbo_brief": "results/turbo/brief.json",
-    "turbo_workflow": "results/turbo/workflow.json",
-    "turbo_timeline": "results/turbo/timeline.json",
-    "render_manifest": "results/render/render_manifest.json",
-}
+# The artifact catalog (names, paths, required fields, schema versions and the
+# per-slot layout policy) lives in `application.artifact_catalog` so the local
+# artifact repository can share it without depending on this facade. These
+# re-exports keep `pipeline_service.ARTIFACTS` and friends working for every
+# existing caller and verify script.
+ARTIFACTS = artifact_catalog.ARTIFACTS
+PER_SLOT_ARTIFACTS = artifact_catalog.PER_SLOT_ARTIFACTS
+REQUIRED_FIELDS = artifact_catalog.REQUIRED_FIELDS
+SUPPORTED_SCHEMA_VERSIONS = artifact_catalog.SUPPORTED_SCHEMA_VERSIONS
+PRODUCTION_READY_ALLOWED = artifact_catalog.PRODUCTION_READY_ALLOWED
+RESULTS_DIRNAME = artifact_catalog.RESULTS_DIRNAME
 
-#: Artifacts a batch produces once PER SHORT. Everything else in ARTIFACTS
-#: describes the project as a whole and is shared by every slot: the source
-#: assessment, the approved plan and the analysis are the common ground all the
-#: Shorts of one project are cut from, and duplicating them per slot would let
-#: two Shorts of the same project disagree about their own source.
-#:
-#: Narration artifacts are absent on purpose: `build_processing_plan` refuses a
-#: `narrated_theory` plan with output_count != 1, so a narrated project has
-#: exactly one slot and its script/voiceover cannot be ambiguous.
-PER_SLOT_ARTIFACTS = frozenset({"moment_selection", "moment_transcript", "render_manifest"})
+# `FULL_SOURCE_ANALYSIS_STAGES` moved into
+# `application.services.video_analysis_service` with the analysis ownership;
+# the import above keeps `pipeline_service.FULL_SOURCE_ANALYSIS_STAGES`
+# resolving for every existing caller.
 
-#: A full-source scan does not run the window pipeline's stages, so it declares
-#: its own. Showing a window run's "Whisper transkript" stage during a scan that
-#: transcribes several regions would describe work that is not happening.
-FULL_SOURCE_ANALYSIS_STAGES = (
-    {"key": "full_scan", "label": "Tum kaynak taraniyor"},
-    {"key": "region_analysis", "label": "Aday bolgeler inceleniyor"},
-    {"key": "scoring", "label": "Film geneli siralama"},
-    {"key": "previews", "label": "Onizleme klipleri"},
-)
-
-SOURCE_DIRNAME = "source_videos"
-RESULTS_DIRNAME = "results"
-RUNTIME_DIRNAME = ".runtime"
+SOURCE_DIRNAME = artifact_catalog.SOURCE_DIRNAME
+RUNTIME_DIRNAME = artifact_catalog.RUNTIME_DIRNAME
 
 # Keep upload validation on the exact same allow-list used by the analysis
 # resolver.  MKV is a source container: browsers do not reliably play it, but
@@ -117,144 +95,12 @@ def is_supported_source_video_filename(filename: str) -> bool:
     display = safe_filename(filename, default="source")
     return Path(display).suffix.lower() in SUPPORTED_SOURCE_VIDEO_EXTENSIONS
 
-#: Artifact kind -> the schema fields that must exist for it to be usable at all.
-REQUIRED_FIELDS = {
-    "source_candidates": ("status", "candidates", "requires_rights_decision"),
-    "rights_decision": ("artifact_kind", "status", "decision", "decision_sha256"),
-    "ingest_manifest": ("artifact_kind", "status", "candidate_url", "rights"),
-    "publication_metadata": ("artifact_kind", "status", "title_variants"),
-    "publish_intent": ("artifact_kind", "status", "decision", "decision_sha256"),
-    "publish_manifest": ("artifact_kind", "status", "platform", "upload"),
-    "edl": ("artifact_type", "status", "title", "width", "height", "clips"),
-    "source_assessment": ("artifact_type", "status", "source", "mode_scores"),
-    "processing_plan": ("artifact_type", "status", "decision", "phase_gates"),
-    "hot_moments": ("status", "hot_moments"),
-    "moment_selection": ("artifact_type", "status", "selected_moment_rank"),
-    "selected_script": ("status", "provider_attempts"),
-    "selected_voiceover": ("status",),
-    "subtitle_track": ("artifact_type", "status", "cues"),
-    "moment_transcript": ("artifact_type", "status", "words", "cues"),
-    "glossary": ("artifact_type", "status", "terms"),
-    "long_form_plan": ("artifact_type", "status", "topic", "content_type",
-                       "target_duration_min", "chapter_count"),
-    "turbo_brief": ("artifact_type", "topic", "duration_sec", "aspect_ratio",
-                    "brief_sha256"),
-    "turbo_workflow": ("artifact_type", "status", "stages"),
-    "turbo_timeline": ("artifact_type", "status", "clips", "video", "audio",
-                       "duration_sec"),
-    "render_manifest": ("status", "output", "approval"),
-}
-
-#: v2 adds the transcript's raw-ASR copy and revision history. Both versions
-#: stay readable: a project written before revisions existed is upgraded in
-#: memory on read and only rewritten when its owner actually edits it.
-SUPPORTED_SCHEMA_VERSIONS = {1, 2}
-
-#: `production_ready` is normally proof that a file was hand-edited, because no
-#: phase in this project may promote itself. The publish manifest is the ONE
-#: exception: a video that a human approved for public visibility and that the
-#: platform confirmed as public genuinely IS live, and calling that
-#: `review_required` would be the dishonest option.
-PRODUCTION_READY_ALLOWED = frozenset({"publish_manifest"})
-
-# Rewinding never deletes user work.  The selected stage and everything after
-# it is moved into `.revisions/<id>/...`, while upstream inputs remain live.
-REWIND_PATHS = {
-    "assessment": (
-        "results/source_assessment.json", "results/processing_plan.json",
-        "results/hot_moments.json", "results/moment_previews",
-        "results/moment_selection.json", "results/selected_script.json",
-        "results/selected_voiceover.json", "results/tts", "results/voice_review.json",
-        "results/render", "results/render_review.json", "results/automation.json",
-        "progress",
-    ),
-    "plan": (
-        "results/processing_plan.json", "results/hot_moments.json",
-        "results/moment_previews", "results/moment_selection.json",
-        "results/selected_script.json", "results/selected_voiceover.json",
-        "results/tts", "results/voice_review.json", "results/render",
-        "results/render_review.json", "results/automation.json", "progress",
-    ),
-    "analysis": (
-        "results/hot_moments.json", "results/moment_previews",
-        "results/moment_selection.json", "results/selected_script.json",
-        "results/selected_voiceover.json", "results/tts", "results/voice_review.json",
-        "results/render", "results/render_review.json", "results/automation.json",
-        "progress",
-    ),
-    "moment": (
-        "results/moment_selection.json", "results/selected_script.json",
-        "results/selected_voiceover.json", "results/tts", "results/voice_review.json",
-        "results/render", "results/render_review.json", "results/automation.json",
-        "progress",
-    ),
-    "script": (
-        "results/selected_script.json", "results/selected_voiceover.json",
-        "results/tts", "results/voice_review.json", "results/render",
-        "results/render_review.json", "results/automation.json", "progress",
-    ),
-    "voice": (
-        "results/selected_voiceover.json", "results/tts", "results/voice_review.json",
-        "results/render", "results/render_review.json", "results/automation.json",
-        "progress",
-    ),
-    "render": (
-        "results/render", "results/render_review.json", "results/automation.json",
-        "progress",
-    ),
-}
-
-#: The caption transcript was missing from EVERY stage, so rewinding to the
-#: analysis or the moment left the previous moment's transcript in place and the
-#: next run silently reused it. Slots 2+ keep theirs under `results/render/...`
-#: and were already covered; only slot 1's historical path was orphaned.
-#:
-#: It stops at `script` because in `direct_clip_series` the transcript IS that
-#: stage's artifact. Rewinding to `voice` or `render` must NOT discard it -- the
-#: transcript is upstream of both, and throwing away a reviewed caption to redo
-#: an encode would destroy human work for no reason.
-#:
-#: `results/glossary.json` is deliberately absent from all of them: proper names
-#: are knowledge about the SOURCE, not output of a stage, and a reviewer who
-#: taught the system "Sheepstealer" should not have to teach it again because
-#: they re-ran the analysis.
-REWIND_PATHS = {
-    stage: (paths + ("results/moment_transcript.json",)
-            if stage in ("assessment", "plan", "analysis", "moment", "script")
-            else paths)
-    for stage, paths in REWIND_PATHS.items()
-}
-
-# Narrated subtitles are derived from the approved voice. Preserve manual text
-# edits across a plain re-render, but archive them when the plan, moment, script
-# or voice changes because their timings/text basis is then stale.
-REWIND_PATHS = {
-    stage: (paths + ("results/subtitle_track.json",)
-            if stage in ("assessment", "plan", "analysis", "moment", "script", "voice")
-            else paths)
-    for stage, paths in REWIND_PATHS.items()
-}
-
-# Framing adjustments belong to the selected moment. Re-encoding the same
-# moment preserves them; selecting a different moment archives them so an old
-# face focus cannot silently carry onto a new shot.
-REWIND_PATHS = {
-    stage: (paths + ("results/render_adjustments",)
-            if stage in ("assessment", "plan", "analysis", "moment")
-            else paths)
-    for stage, paths in REWIND_PATHS.items()
-}
-
-#: A publish INTENT authorizes ONE upload of ONE exact video hash, so rewinding
-#: to any stage at or above the render invalidates it and it is archived with the
-#: rest. `publish_manifest.json` is deliberately NOT archived: it is the
-#: permanent record of what actually went live, and rewinding a local project
-#: cannot un-publish a video that already exists on a platform.
-REWIND_PATHS = {
-    stage: (paths + ("results/publish_intent.json",)
-            if "results/render" in paths else paths)
-    for stage, paths in REWIND_PATHS.items()
-}
+#: Rewind path policy lives in the neutral `application.artifact_catalog`
+#: so the façade, `ScriptService` (whose human edit archives the `voice`
+#: stage) and the subtitle path share ONE definition without an import
+#: edge between them. Re-exported here: `pipeline_service.REWIND_PATHS`
+#: is a compatibility surface (`verify_revision_flow.py` imports it).
+REWIND_PATHS = artifact_catalog.REWIND_PATHS
 
 REWIND_LABELS = {
     "assessment": "Faz 0 degerlendirme",
@@ -267,29 +113,6 @@ REWIND_LABELS = {
 }
 
 
-def _contiguous_runs(indices) -> list:
-    """Group sorted indices into runs of consecutive values.
-
-    `[0, 1, 4]` -> `[[0, 1], [4]]`. Used so two adjacent corrected words are
-    read as one multi-word name instead of two unrelated ones.
-    """
-    runs: list = []
-    for index in indices:
-        if runs and index == runs[-1][-1] + 1:
-            runs[-1].append(index)
-        else:
-            runs.append([index])
-    return runs
-
-
-class PipelineServiceError(RuntimeError):
-    pass
-
-
-class ArtifactProblem(PipelineServiceError):
-    """An artifact exists but cannot be trusted. Never downgraded to a default."""
-
-
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -299,17 +122,201 @@ def _sha256_bytes(payload: bytes) -> str:
 
 
 class PipelineService:
-    """Ownership-scoped facade over the canonical pipeline modules."""
+    """Ownership-scoped facade over the canonical pipeline modules.
+
+    The EDL/editor use cases live in `application.services.EditorService`; the
+    matching public methods below are thin delegates so every existing caller
+    keeps working unchanged.
+    """
 
     def __init__(self, storage, ownership: Ownership, secret_resolver, *,
                  google_client_factory=None, openai_client_factory=None,
                  anthropic_client_factory=None, elevenlabs_client_factory=None,
                  probe_fn=None, ffmpeg_bin=None, ffprobe_bin=None, audit: AuditLog | None = None,
-                 youtube_provider=None, music_root=None):
+                 youtube_provider=None, music_root=None,
+                 artifacts=None, editor=None, editor_cls=None,
+                 source=None, source_cls=None, binaries=None,
+                 analysis=None, analysis_cls=None, progress=None,
+                 approval=None, approval_cls=None,
+                 review_gate=None, review_gate_cls=None,
+                 publish=None, publish_cls=None,
+                 workflow=None, workflow_cls=None,
+                 video_analysis=None, video_analysis_cls=None,
+                 moment=None, moment_cls=None, revision_archive=None,
+                 transcript=None, transcript_cls=None,
+                 script=None, script_cls=None):
         self.storage = storage
         self.ownership = ownership
         self.secrets = secret_resolver
         self.audit = audit or AuditLog(storage, ownership)
+        self._cancel_check = None
+        # Progress reporting. Independently constructed (it needs only storage +
+        # ownership), so application services depend on the port rather than on
+        # a facade-owned tracker callable. The job runtime binds the cancel
+        # signal into it via `bind_cancel_check`.
+        self._progress = progress or LocalProgressFactory(storage, ownership)
+        # Persistence/application adapters. The composition root (`ConsoleApp`)
+        # normally injects these; the defaults keep
+        # `PipelineService(storage, ownership, secrets)` constructible on its
+        # own for tests and notebooks. The local artifact repository is the
+        # real implementation -- the artifact methods below delegate to it --
+        # so the dependency runs facade -> service -> adapter, never back.
+        if artifacts is None:
+            artifacts = LocalArtifactRepository(storage, ownership, self.audit)
+        self._artifacts = artifacts
+        # One shared binary resolver: the facade's `binaries()` and the source
+        # service must agree, and resolution must happen at most once.
+        self._binaries = binaries or MediaBinaries(ffmpeg_bin, ffprobe_bin)
+        # Workflow eligibility + slot scope -- the read-only interpreter of
+        # `processing_plan`. Built early because it depends on nothing but the
+        # artifact repository; future production services receive it through
+        # `ports.WorkflowGateQuery`, never through this facade.
+        self.workflow_gate = workflow or (workflow_cls or WorkflowGate)(
+            artifacts=self._artifacts)
+        if source is None:
+            source = (source_cls or SourceService)(
+                artifacts=self._artifacts,
+                audit=self.audit,
+                namespace=storage,
+                ownership=ownership,
+                binaries=self._binaries,
+                safe_filename=safe_filename,
+                new_id=new_id,
+                progress=self._progress,
+            )
+        self.source = source
+        # Human-review preconditions (rights + checklists) are read through the
+        # review gate -- an infrastructure adapter, because it wraps the console
+        # review modules. ApprovalService consults it; the checklist-mutation
+        # methods below reuse it too, so "bound to the current digest" has one
+        # definition.
+        self._review_gate = review_gate or (review_gate_cls or LocalReviewGate)(
+            artifacts=self._artifacts,
+            ownership=ownership,
+            source=self.source,
+        )
+        if approval is None:
+            approval = (approval_cls or ApprovalService)(
+                artifacts=self._artifacts,
+                audit=self.audit,
+                ownership=ownership,
+                review_gate=self._review_gate,
+            )
+        self.approval = approval
+        if analysis is None:
+            analysis = (analysis_cls or AnalysisService)(
+                artifacts=self._artifacts,
+                audit=self.audit,
+                namespace=storage,
+                ownership=ownership,
+                source=self.source,
+                binaries=self._binaries,
+                progress=self._progress,
+                secrets=secret_resolver,
+                approvals=self.approval,
+                probe_fn=probe_fn,
+            )
+        self.analysis = analysis
+        if editor is None:
+            # The editor receives the narrow read-only source contract, never
+            # this facade: `ports.SourceQuery`, satisfied by `SourceService`.
+            editor = (editor_cls or EditorService)(
+                artifacts=self._artifacts,
+                audit=self.audit,
+                namespace=storage,
+                ownership=ownership,
+                source=self.source,
+            )
+        self.editor = editor
+        if publish is None:
+            # Publication orchestration. The provider is INJECTED (an already
+            # built PublishProvider) or constructed lazily inside the service
+            # from the namespace's OAuth token path -- never a facade-owned
+            # callable. `approvals` is the read-only `ports.ApprovalQuery` view
+            # the publish gate consults; ApprovalService satisfies it.
+            publish = (publish_cls or PublishService)(
+                artifacts=self._artifacts,
+                audit=self.audit,
+                namespace=storage,
+                ownership=ownership,
+                progress=self._progress,
+                approvals=self.approval,
+                secrets=secret_resolver,
+                provider=youtube_provider,
+                google_client_factory=google_client_factory,
+            )
+        self.publish = publish
+        if video_analysis is None:
+            # Phase 1 analysis orchestration. The gate arrives through
+            # `ports.WorkflowGateQuery`, the source through `ports.SourceQuery`
+            # -- never as callbacks bound to this facade.
+            video_analysis = (video_analysis_cls or VideoAnalysisService)(
+                artifacts=self._artifacts,
+                namespace=storage,
+                ownership=ownership,
+                source=self.source,
+                binaries=self._binaries,
+                progress=self._progress,
+                workflow=self.workflow_gate,
+            )
+        self.video_analysis = video_analysis
+        # `.revisions/` snapshot mechanics -- the shared invalidation primitive
+        # used by rewind, render-profile edits, review flows and clip-bounds
+        # changes. One implementation behind `ports.RevisionArchiver`; the
+        # facade's `_archive_revision`/`_render_slot_archive_paths` delegate to
+        # it so MomentService never receives a facade-owned callable.
+        self.revision_archive = revision_archive or LocalRevisionArchive(
+            namespace=storage, ownership=ownership)
+        if moment is None:
+            # Phase 2 moment selection + clip-bounds ownership. The gate arrives
+            # through `ports.WorkflowGateQuery`, the source through
+            # `ports.SourceQuery`, the invalidation through
+            # `ports.RevisionArchiver` -- never as facade callbacks.
+            moment = (moment_cls or MomentService)(
+                artifacts=self._artifacts,
+                source=self.source,
+                workflow=self.workflow_gate,
+                archiver=self.revision_archive,
+                audit=self.audit,
+            )
+        self.moment = moment
+        if transcript is None:
+            # Transcript lifecycle ownership. The gate arrives through
+            # `ports.WorkflowGateQuery`, approval reads through the read-only
+            # `ports.ApprovalQuery`, the replacement archive through
+            # `ports.RevisionArchiver` and progress through
+            # `ports.ProgressFactory` -- never as facade callbacks.
+            transcript = (transcript_cls or TranscriptService)(
+                artifacts=self._artifacts,
+                source=self.source,
+                workflow=self.workflow_gate,
+                approvals=self.approval,
+                archiver=self.revision_archive,
+                progress=self._progress,
+                namespace=storage,
+                ownership=ownership,
+                audit=self.audit,
+            )
+        self.transcript = transcript
+        if script is None:
+            # Narrated-mode script lifecycle. The gate arrives through
+            # `ports.WorkflowGateQuery`, the downstream invalidation through
+            # `ports.RevisionArchiver`, progress through
+            # `ports.ProgressFactory`; the provider clients arrive as the
+            # same injected factories this facade received -- never as a
+            # facade-owned lambda.
+            script = (script_cls or ScriptService)(
+                artifacts=self._artifacts,
+                workflow=self.workflow_gate,
+                archiver=self.revision_archive,
+                progress=self._progress,
+                audit=self.audit,
+                secrets=secret_resolver,
+                google_client_factory=google_client_factory,
+                openai_client_factory=openai_client_factory,
+                anthropic_client_factory=anthropic_client_factory,
+            )
+        self.script = script
         # Injected factories: nothing in this class constructs a real SDK client
         # on its own, so a test can guarantee zero network access.
         self._google_client_factory = google_client_factory
@@ -317,67 +324,51 @@ class PipelineService:
         self._anthropic_client_factory = anthropic_client_factory
         self._elevenlabs_client_factory = elevenlabs_client_factory
         self._probe_fn = probe_fn
-        self._ffmpeg_bin = ffmpeg_bin
-        self._ffprobe_bin = ffprobe_bin
-        self._cancel_check = None
         # Injected like every other environment fact, rather than read
         # from a global config: this class must stay constructible in a
         # test without an app around it.
         self.music_root = music_root
-        # Publication provider: injectable for the same reason, and lazily built
-        # so merely constructing the service never touches the OAuth token file.
-        self._youtube_provider = youtube_provider
 
     def bind_cancel_check(self, callback) -> None:
-        """Bind the current job's ownership-scoped cooperative stop signal."""
+        """Bind the current job's ownership-scoped cooperative stop signal.
+
+        Forwarded to the progress factory so trackers built by application
+        services observe the same signal: cancellation must not depend on which
+        layer created the tracker.
+        """
         self._cancel_check = callback
+        binder = getattr(self._progress, "bind_cancel_check", None)
+        if callable(binder):
+            binder(callback)
 
     # ------------------------------------------------------------------ paths
     def tracker(self, activity: str, *, job_id=None, attempt: int = 1, stages=None):
         """A progress writer for one activity.
 
-        Separate from the audit log on purpose: the audit log records what
-        HAPPENED (append-only, for accountability), progress records what is
-        happening RIGHT NOW (overwritten, for the UI).
+        Kept public for the many façade phases that still report progress
+        directly; the real implementation is the injected `ports.ProgressFactory`.
         """
-        return progress_module.ProgressTracker(
-            self.storage, self.ownership, activity,
-            job_id=job_id, attempt=attempt, stages=stages,
-            cancel_check=self._cancel_check)
+        return self._progress.create(activity, job_id=job_id, attempt=attempt,
+                                     stages=stages)
 
     def artifact_relative(self, key: str, slot: int = 1) -> str:
-        """Namespace-relative path of an artifact FOR ONE OUTPUT SLOT.
-
-        Only the artifacts a batch produces once per Short are slot-scoped. The
-        source assessment, the plan and the analysis describe the project as a
-        whole and are deliberately shared: re-deriving them per slot would let
-        two Shorts of the same project disagree about the source they came from.
-
-        Slot 1 resolves to the historical path, so every existing project,
-        artifact and test keeps working unchanged.
-        """
-        relative = ARTIFACTS[key]
-        index = int(slot or 1)
-        if index < 1:
-            raise PipelineServiceError(f"gecersiz cikti yuvasi: {slot!r}")
-        if index == 1 or key not in PER_SLOT_ARTIFACTS:
-            return relative
-        name = relative.rsplit("/", 1)[-1]
-        return f"{RESULTS_DIRNAME}/render/output_{index:02d}/{name}"
+        """Namespace-relative path of an artifact FOR ONE OUTPUT SLOT."""
+        return self._artifacts.artifact_relative(key, slot)
 
     def path(self, key: str, slot: int = 1) -> Path:
-        return self.storage.resolve(self.ownership, self.artifact_relative(key, slot),
-                                     create_parent=True)
+        return self._artifacts.path(key, slot)
 
     def relative(self, path) -> str:
-        return self.storage.relative_to_namespace(self.ownership, path)
+        return self._artifacts.relative(path)
 
     def binaries(self):
-        if self._ffmpeg_bin is None or self._ffprobe_bin is None:
-            self._ffmpeg_bin, self._ffprobe_bin = render_utils.resolve_ffmpeg_binaries()
-        return self._ffmpeg_bin, self._ffprobe_bin
+        """The ffmpeg/ffprobe pair, resolved lazily and cached once."""
+        return self._binaries.resolve()
 
     # -------------------------------------------------------------- artifacts
+    # The real implementation is `LocalArtifactRepository` (injected as
+    # `self._artifacts`); these methods stay so every existing caller keeps
+    # working. See `docs/architecture/APPLICATION_SERVICES.md`.
     def load_artifact(self, key: str, *, required: bool = False, slot: int = 1) -> dict:
         """Read one artifact and REPORT its trustworthiness.
 
@@ -385,111 +376,34 @@ class PipelineService:
         incompatible artifact yields `data=None` and a human-actionable
         `problem` -- it is never repaired, guessed at, or replaced by a default.
         """
-        relative = self.artifact_relative(key, slot)
-        info = {"key": key, "slot": int(slot or 1), "present": False, "data": None,
-                "problem": None, "relative_path": relative}
-        try:
-            path = self.storage.resolve(self.ownership, relative)
-        except StorageViolation as exc:
-            info["problem"] = f"gecersiz artefakt yolu: {exc}"
-            return info
-        if not path.is_file():
-            if required:
-                info["problem"] = f"{relative} bulunamadi"
-            return info
-        info["present"] = True
-
-        raw = path.read_bytes()
-        if not raw.strip():
-            info["problem"] = f"{relative} BOS (0 bayt); artefakt kullanilamaz"
-            return info
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except UnicodeDecodeError:
-            info["problem"] = f"{relative} UTF-8 olarak okunamadi (bozuk dosya)"
-            return info
-        except json.JSONDecodeError as exc:
-            info["problem"] = (
-                f"{relative} gecerli JSON degil (satir {exc.lineno}, sutun {exc.colno}); "
-                "dosya yarim yazilmis veya bozulmus olabilir"
-            )
-            return info
-        if not isinstance(data, dict):
-            info["problem"] = f"{relative} beklenen JSON nesnesi degil ({type(data).__name__})"
-            return info
-
-        version = data.get("schema_version")
-        if version is not None and version not in SUPPORTED_SCHEMA_VERSIONS:
-            info["problem"] = (
-                f"{relative} desteklenmeyen schema_version={version!r} "
-                f"(desteklenen: {sorted(SUPPORTED_SCHEMA_VERSIONS)}); artefakt yeniden uretilmeli"
-            )
-            return info
-        missing = [f for f in REQUIRED_FIELDS.get(key, ()) if f not in data]
-        if missing:
-            info["problem"] = f"{relative} zorunlu alanlari eksik: {missing}"
-            return info
-        if data.get("status") == "production_ready" and key not in PRODUCTION_READY_ALLOWED:
-            info["problem"] = (
-                f"{relative} 'production_ready' iceriyor; bu proje hicbir artefakti "
-                "otomatik olarak production_ready yapmaz, dosya elle degistirilmis olabilir"
-            )
-            return info
-
-        info["data"] = data
-        return info
+        return self._artifacts.load_artifact(key, required=required, slot=slot)
 
     def load_artifact_path(self, relative: str):
-        """Read one JSON artifact by RELATIVE path (not a registered key).
-
-        Used by the automation engine for its own state file. Returns None when
-        absent and None when unreadable -- a corrupt automation file must not
-        wedge the console; the engine simply starts from a fresh idle state.
-        """
-        try:
-            path = self.storage.resolve(self.ownership, relative)
-        except StorageViolation:
-            return None
-        if not path.is_file():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            return None
-        return data if isinstance(data, dict) else None
+        """Read one JSON artifact by RELATIVE path (not a registered key)."""
+        return self._artifacts.load_artifact_path(relative)
 
     def write_artifact(self, key: str, data, *, job_id=None, actor="console", slot: int = 1) -> str:
-        path = self.path(key, slot)
-        atomic_write_json(path, data)
-        relative = self.relative(path)
-        self.audit.record("artifact.written", actor=actor, job_id=job_id, artifact=relative,
-                          detail={"status": data.get("status")})
-        return relative
+        return self._artifacts.write_artifact(key, data, job_id=job_id,
+                                              actor=actor, slot=slot)
+
+    def write_artifact_path(self, relative: str, data) -> str:
+        """Atomically write a non-catalog JSON document by relative path.
+
+        The clip_bounds files moved behind MomentService use this primitive;
+        the delegate keeps `PipelineService` satisfying `ports.ArtifactRepository`.
+        """
+        return self._artifacts.write_artifact_path(relative, data)
 
     # ---------------------------------------------------------------- project
     def create_project(self, *, title: str, created_by: str,
                        operator_name: str | None = None) -> dict:
-        operator = str(operator_name or created_by or "console").strip()[:120]
-        record = {
-            "schema_version": 1,
-            "artifact_type": "console_project",
-            **self.ownership.to_dict(),
-            "title": str(title or "Isimsiz proje").strip()[:200],
-            "notes": "",
-            "created_by": str(created_by or "console")[:120],
-            "operator_name": operator,
-            "created_at": _now_iso(),
-            "updated_at": _now_iso(),
-            "status": "review_required",
-            "status_reason": "proje olusturuldu; kaynak video ve Faz 0 plani bekleniyor",
-            "source": None,
-            "not_uploaded": True,
-        }
-        self.storage.ensure_namespace(self.ownership)
-        self.write_artifact("project", record, actor=created_by)
-        self.audit.record("project.created", actor=created_by,
-                          detail={"title": record["title"]})
-        return record
+        # Shared with `SourceService`, which must bootstrap a project when an
+        # upload arrives before one exists. One implementation, so the record
+        # shape and the `project.created` event cannot drift apart.
+        return project_record.create_project(
+            artifacts=self._artifacts, audit=self.audit, namespace=self.storage,
+            ownership=self.ownership, title=title, created_by=created_by,
+            operator_name=operator_name)
 
     def project_actor(self) -> str:
         """Return the one persisted human name used throughout this project.
@@ -653,45 +567,13 @@ class PipelineService:
     # ------------------------------------------------------- project lifecycle
     def _archive_revision(self, paths, *, action: str, actor: str,
                           target: str | None = None) -> dict:
-        """Move exact namespace-relative paths into a recoverable snapshot."""
-        revision_id = new_id("revision")
-        moved = []
-        # Parents replace their children; accepting both would make the second
-        # move look like missing data.  Shortest paths first makes this explicit.
-        selected = []
-        for relative in sorted(set(paths), key=lambda value: (value.count("/"), value)):
-            if any(relative == parent or relative.startswith(parent + "/")
-                   for parent in selected):
-                continue
-            selected.append(relative)
-        for relative in selected:
-            source = self.storage.resolve(self.ownership, relative)
-            if not source.exists():
-                continue
-            destination = self.storage.resolve(
-                self.ownership, ".revisions", revision_id, relative,
-                create_parent=True)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(source, destination)
-            moved.append(relative)
-        manifest = {
-            "schema_version": 1,
-            "artifact_type": "project_revision",
-            **self.ownership.to_dict(),
-            "revision_id": revision_id,
-            "action": action,
-            "target": target,
-            "created_by": str(actor or "console")[:120],
-            "created_at": _now_iso(),
-            "moved_paths": moved,
-            "recoverable": True,
-            "not_uploaded": True,
-        }
-        manifest_path = self.storage.resolve(
-            self.ownership, ".revisions", revision_id, "manifest.json",
-            create_parent=True)
-        atomic_write_json(manifest_path, manifest)
-        return manifest
+        """Move exact namespace-relative paths into a recoverable snapshot.
+
+        The mechanics live in `LocalRevisionArchive` (`ports.RevisionArchiver`)
+        so `MomentService` shares one implementation without a facade callback.
+        """
+        return self.revision_archive.archive_revision(
+            paths, action=action, actor=actor, target=target)
 
     def revisions(self, *, limit: int = 20) -> list:
         root = self.storage.resolve(self.ownership, ".revisions")
@@ -831,8 +713,7 @@ class PipelineService:
         return f"results/render_profiles/output_{index:02d}.json"
 
     def plan_decision(self) -> dict:
-        return ((self.load_artifact("processing_plan")["data"] or {})
-                .get("decision") or {})
+        return self.workflow_gate.plan_decision()
 
     def render_profile(self, slot: int = 1) -> dict:
         """The saved profile, or Phase 0's decision expressed as one.
@@ -933,36 +814,13 @@ class PipelineService:
         `preserve` names files to keep even though they sit in the slot's
         directory; pass an empty tuple to archive the transcript too, which is
         what a direct-mode clip-range edit has to do.
+
+        The mechanics live in `LocalRevisionArchive`
+        (`ports.RevisionArchiver`) so `MomentService` shares one implementation
+        without a facade callback.
         """
-        index = int(slot or 1)
-        keep = self.RENDER_ARCHIVE_PRESERVED if preserve is None else tuple(preserve)
-        paths = []
-        if index != 1:
-            root = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
-                                        f"output_{index:02d}")
-            if root.is_dir():
-                for child in sorted(root.iterdir()):
-                    if child.name in keep:
-                        continue
-                    paths.append(
-                        f"{RESULTS_DIRNAME}/render/output_{index:02d}/{child.name}")
-            return paths
-        root = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render")
-        if root.is_dir():
-            for child in sorted(root.iterdir()):
-                name = child.name
-                if (child.is_dir() and name.startswith("output_")
-                        and name[len("output_"):].isdigit()):
-                    continue                      # another slot's Short
-                if name in keep:
-                    continue
-                paths.append(f"{RESULTS_DIRNAME}/render/{name}")
-        paths.append(render_review_module.RENDER_REVIEW_ARTIFACT)
-        # A publish intent authorises ONE upload of ONE exact video hash, and
-        # `create_publish_intent` reads slot 1's manifest -- so the intent belongs
-        # to slot 1 and must not outlive slot 1's render.
-        paths.append(ARTIFACTS["publish_intent"])
-        return paths
+        return self.revision_archive.render_slot_archive_paths(
+            slot, preserve=preserve)
 
     def render_profile_impact(self, slot: int = 1) -> dict:
         """What saving a new profile WOULD archive. Pure read, changes nothing.
@@ -1007,21 +865,15 @@ class PipelineService:
         }
 
     # --------------------------------------------------------- clip bounds
+    # Moment selection + clip-bounds ownership lives in
+    # `application.services.MomentService` (Milestone 11); these methods keep
+    # the public facade contract and delegate.
     def clip_bounds_relative(self, slot: int = 1) -> str:
-        index = self.require_slot(slot)
-        return f"results/clip_bounds/output_{index:02d}.json"
+        return self.moment.clip_bounds_relative(slot)
 
     def selected_moment(self, slot: int = 1) -> dict:
         """The analysed moment this slot renders, or {} when none is chosen."""
-        selection = self.load_artifact("moment_selection", slot=slot)
-        hot = self.load_artifact("hot_moments")
-        if selection["problem"] or hot["problem"]:
-            return {}
-        rank = (selection["data"] or {}).get("selected_moment_rank")
-        for moment in ((hot["data"] or {}).get("hot_moments") or []):
-            if moment.get("rank") == rank:
-                return moment
-        return {}
+        return self.moment.selected_moment(slot)
 
     def clip_bounds(self, slot: int = 1) -> dict:
         """This slot's edited clip range, falling back to the analysed moment.
@@ -1031,62 +883,15 @@ class PipelineService:
         Short's edit silently move another's -- the leak `PER_SLOT_ARTIFACTS`
         exists to stop.
         """
-        moment = self.selected_moment(slot)
-        default_start = moment.get("source_start_sec")
-        default_end = moment.get("source_end_sec")
-        loaded = self.load_artifact_path(self.clip_bounds_relative(slot))
-        if isinstance(loaded, dict) and loaded.get("source_end_sec") is not None:
-            return {
-                "source_start_sec": float(loaded["source_start_sec"]),
-                "source_end_sec": float(loaded["source_end_sec"]),
-                "edited": True,
-                "moment_start_sec": default_start,
-                "moment_end_sec": default_end,
-                "updated_at": loaded.get("updated_at"),
-                "updated_by": loaded.get("updated_by"),
-            }
-        return {
-            "source_start_sec": default_start,
-            "source_end_sec": default_end,
-            "edited": False,
-            "moment_start_sec": default_start,
-            "moment_end_sec": default_end,
-            "updated_at": None, "updated_by": None,
-        }
+        return self.moment.clip_bounds(slot)
 
     def clip_bounds_override(self, slot: int = 1):
         """What `_run_render` passes down -- `None` when nothing was edited."""
-        bounds = self.clip_bounds(slot)
-        if not bounds["edited"]:
-            return None
-        return {"source_start_sec": bounds["source_start_sec"],
-                "source_end_sec": bounds["source_end_sec"]}
+        return self.moment.clip_bounds_override(slot)
 
     def source_duration_sec(self):
-        """How long the source video is, in seconds, or None.
-
-        Read from `source_assessment.source.duration_sec` -- the value ffprobe
-        actually measured in Phase 0. `hot_moments.source` does NOT carry a
-        duration (it records paths and the analysis window), so reading it there
-        silently yielded `None`, and a timeline whose scale is `None` collapses
-        to zero width: every clip band rendered as a sliver at the far left.
-        """
-        assessment = self.load_artifact("source_assessment")
-        duration = ((assessment["data"] or {}).get("source") or {}).get("duration_sec")
-        if duration:
-            return float(duration)
-        # An older project may predate the assessment artifact; measuring the
-        # file is still better than drawing a broken timeline.
-        try:
-            _ffmpeg, ffprobe = self.binaries()
-            info, _note = render_utils.probe_media(str(self.source_path()), ffprobe)
-        except Exception:                              # noqa: BLE001
-            return None
-        raw = ((info or {}).get("format") or {}).get("duration")
-        try:
-            return round(float(raw), 3) if raw else None
-        except (TypeError, ValueError):
-            return None
+        """How long the source video is, in seconds, or None."""
+        return self.source.get_duration()
 
     def clip_bounds_view(self, slot: int = 1) -> dict:
         """Everything the single-clip editor needs, decided on the server.
@@ -1097,55 +902,7 @@ class PipelineService:
         analysis clip is already cropped and absolute source seconds mean
         something different in it.
         """
-        try:
-            slot = self.require_slot(slot)
-        # Rendered on EVERY page load, including a project with no plan yet.
-        # A panel that cannot open must say so, never break the page.
-        except (PipelineServiceError, ArtifactProblem):
-            return {"available": False, "slot": int(slot or 1),
-                    "reason": "bu slot planda tanimli degil"}
-        moment = self.selected_moment(slot)
-        if not moment:
-            return {"available": False, "slot": slot,
-                    "reason": "once bir moment secilmeli"}
-        source = ((self.load_artifact("hot_moments")["data"] or {})
-                  .get("source") or {})
-        raw_path = source.get("raw_video_path")
-        # A project can reach this screen with its source file gone (moved,
-        # archived, restored onto another machine). That is a reason to say
-        # the range cannot be edited -- not a reason to break the whole page.
-        try:
-            project_source = self.source_path()
-        except (PipelineServiceError, ArtifactProblem):
-            project_source = None
-        editable = bool(project_source and Path(project_source).is_file()) \
-            or bool(raw_path and Path(raw_path).is_file())
-        bounds = self.clip_bounds(slot)
-        pipeline_mode = (self.load_artifact("processing_plan")["data"] or {}) \
-            .get("pipeline_mode")
-        return {
-            "available": True,
-            "slot": slot,
-            "bounds": bounds,
-            "source_duration_sec": self.source_duration_sec(),
-            "moment_rank": moment.get("rank"),
-            # The editor plays the SOURCE, not a rendered clip, and it plays it
-            # by byte range -- so dragging a handle costs no FFmpeg run. The
-            # server names the path; the browser never builds one.
-            "source_media_path": ((self.load_artifact("project")["data"] or {})
-                                  .get("source") or {}).get("stored_path"),
-            "editable": editable,
-            "not_editable_reason": ("" if editable else
-                                    "Orijinal kaynak video diskte bulunamadi; "
-                                    "klip araligi yalnizca orijinal kaynakla "
-                                    "duzenlenebilir."),
-            # Said before the drag, not after: in direct mode the captions come
-            # from this range, so moving it means the transcript has to be
-            # produced and read again.
-            "transcript_will_be_invalidated": pipeline_mode == "original_audio_subtitles",
-            "min_duration_sec": scene_editor.MIN_CLIP_DURATION_SEC,
-            "not_uploaded": True,
-        }
+        return self.moment.clip_bounds_view(slot)
 
     def save_clip_bounds(self, *, start: float, end: float, actor: str = "console",
                          slot: int = 1) -> dict:
@@ -1156,89 +913,12 @@ class PipelineService:
         will be spoken. Narrated mode keeps its script, voice and subtitles --
         the narration does not change because the picture underneath moved.
         """
-        slot = self.require_slot(slot)
-        moment = self.selected_moment(slot)
-        if not moment:
-            raise PipelineServiceError(
-                "Once bir moment secilmeli: duzenlenecek bir klip yok.")
-        # The measured source length. Reading it from `hot_moments.source` --
-        # which has no duration field -- yielded None, and a None upper bound
-        # means NO upper bound: an operator could drag the clip past the end of
-        # the file and only find out when ffmpeg failed.
-        source_duration = self.source_duration_sec()
-        clip = scene_editor.EDLClip(
-            clip_id=f"slot_{slot:02d}",
-            source_path=str(self.source_path()),
-            source_start_sec=float(moment.get("source_start_sec") or 0.0),
-            source_end_sec=float(moment.get("source_end_sec") or 0.0),
-        )
-        try:
-            edited = scene_editor.set_clip_source_bounds(
-                clip, start, end,
-                float(source_duration) if source_duration else None)
-        except ValueError as exc:
-            raise PipelineServiceError(str(exc)) from exc
-
-        previous = self.clip_bounds(slot)
-        unchanged = (abs(previous["source_start_sec"] - edited.source_start_sec) < 1e-6
-                     and abs(previous["source_end_sec"] - edited.source_end_sec) < 1e-6)
-        if unchanged:
-            return {"slot": slot, "bounds": previous, "unchanged": True,
-                    "archived": None, "transcript_invalidated": False,
-                    "not_uploaded": True}
-
-        pipeline_mode = (self.load_artifact("processing_plan")["data"] or {}) \
-            .get("pipeline_mode")
-        is_direct = pipeline_mode == "original_audio_subtitles"
-        if is_direct:
-            # The caption text was transcribed from the OLD range and a human
-            # approved THAT text. Keeping it would burn in words that are no
-            # longer spoken -- the exact failure the transcript gate exists for.
-            #
-            # Dropped from `preserve` rather than appended: for slots 2+ the
-            # transcript lives INSIDE the slot directory, so a slot-1-shaped
-            # path would name a file that is not there and archive nothing.
-            preserve = tuple(name for name in self.RENDER_ARCHIVE_PRESERVED
-                             if name != "moment_transcript.json")
-            paths = self._render_slot_archive_paths(slot, preserve=preserve)
-            paths = paths + [self.artifact_relative("moment_transcript", slot)]
-        else:
-            paths = self._render_slot_archive_paths(slot)
-        archived = self._archive_revision(
-            paths, action="clip_bounds_edited", actor=actor, target="render")
-
-        atomic_write_json(
-            self.storage.resolve(self.ownership, self.clip_bounds_relative(slot),
-                                 create_parent=True),
-            {"artifact_type": "clip_bounds", "schema_version": 1,
-             "output_slot": slot, "not_uploaded": True,
-             "source_start_sec": edited.source_start_sec,
-             "source_end_sec": edited.source_end_sec,
-             "moment_start_sec": moment.get("source_start_sec"),
-             "moment_end_sec": moment.get("source_end_sec"),
-             "updated_at": _now_iso(),
-             "updated_by": str(actor or "console")[:120]})
-
-        self.audit.record("clip_bounds.saved", actor=actor,
-                          artifact=self.clip_bounds_relative(slot),
-                          detail={"slot": slot,
-                                  "source_start_sec": edited.source_start_sec,
-                                  "source_end_sec": edited.source_end_sec,
-                                  "transcript_invalidated": is_direct,
-                                  "revision_id": (archived or {}).get("revision_id")})
-        return {"slot": slot, "bounds": self.clip_bounds(slot), "unchanged": False,
-                "archived": archived, "transcript_invalidated": is_direct,
-                "not_uploaded": True}
+        return self.moment.save_clip_bounds(
+            start=start, end=end, actor=actor, slot=slot)
 
     def reset_clip_bounds(self, *, actor: str = "console", slot: int = 1) -> dict:
         """Snap back to the range the analysis chose."""
-        slot = self.require_slot(slot)
-        moment = self.selected_moment(slot)
-        if not moment:
-            raise PipelineServiceError("Once bir moment secilmeli.")
-        return self.save_clip_bounds(
-            start=float(moment["source_start_sec"]),
-            end=float(moment["source_end_sec"]), actor=actor, slot=slot)
+        return self.moment.reset_clip_bounds(actor=actor, slot=slot)
 
     def render_profile_view(self, slot: int = 1) -> dict:
         """Everything the Render Studio panel needs, decided on the server.
@@ -1610,47 +1290,9 @@ class PipelineService:
     def update_script_text(self, *, script_text: str, updated_by: str,
                            notes: str = "") -> dict:
         """Human-edit a generated script and archive audio/render descendants."""
-        clean = str(script_text or "").strip()
-        who = str(updated_by or "").strip()
-        if not who:
-            raise PipelineServiceError("scripti duzenleyen kisi zorunlu")
-        if not clean:
-            raise PipelineServiceError("script metni bos olamaz")
-        if len(clean) > 20000:
-            raise PipelineServiceError("script metni en fazla 20000 karakter olabilir")
-        loaded = self.load_artifact("selected_script", required=True)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        artifact = loaded["data"]
-        old_hash = approval.content_hash_for("script", artifact)
-        if clean == artifact.get("script_text"):
-            return artifact
-        downstream = tuple(path for path in REWIND_PATHS["voice"])
-        revision = self._archive_revision(
-            downstream, action="script_edit", actor=who, target="script")
-        artifact["script_text"] = clean
-        artifact["status"] = "review_required"
-        artifact["status_reason"] = (
-            "script insan tarafindan duzenlendi; yeniden inceleme ve onay bekleniyor")
-        artifact["human_approval"] = {
-            "approved": False, "approved_by": None, "approved_at": None,
-            "notes": None, "approved_content_sha256": None,
-        }
-        artifact.setdefault("manual_edits", []).insert(0, {
-            "updated_by": who[:120], "updated_at": _now_iso(),
-            "notes": str(notes or "").strip()[:1000] or None,
-            "previous_script_sha256": old_hash,
-            "revision_id": revision["revision_id"],
-        })
-        artifact["manual_edits"] = artifact["manual_edits"][:50]
-        self.write_artifact("selected_script", artifact, actor=who)
-        self.audit.record("script.updated", actor=who,
-                          artifact=ARTIFACTS["selected_script"], detail={
-                              "previous_script_sha256": old_hash,
-                              "revision_id": revision["revision_id"],
-                              "downstream_archived": revision["moved_paths"],
-                          })
-        return artifact
+        return self.script.update_script_text(
+            script_text=script_text, updated_by=updated_by, notes=notes)
+
 
     def subtitle_view(self, slot: int = 1) -> dict:
         """Editable narrated-caption rows, preferring saved human revisions."""
@@ -1736,121 +1378,25 @@ class PipelineService:
                     "render_archived": revision["moved_paths"]})
         return self.subtitle_view(slot)
 
+    # Source media is owned by `application.services.SourceService`; these
+    # methods keep the public facade contract and delegate.
+    # See `docs/architecture/SOURCE_SERVICE.md`.
     def register_source_video(self, *, filename: str, payload: bytes,
                               registered_by: str, track: bool = False) -> dict:
-        """Store an uploaded source video inside the project namespace.
-
-        The display filename is sanitized (never trusted as a path) and the stored
-        name is prefixed with a generated id, so two uploads called `video.mp4`
-        cannot collide or overwrite each other.
-        """
-        tracker = (self.tracker("upload") if track else progress_module.NullTracker())
-        tracker.start("Yukleme basladi")
-        try:
-            return self._register_source_video_stream(
-                tracker, filename=filename, stream=io.BytesIO(payload),
-                content_length=len(payload), registered_by=registered_by)
-        except Exception as exc:  # noqa: BLE001
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
+        """Store an uploaded source video inside the project namespace."""
+        return self.source.store_upload(filename=filename, payload=payload,
+                                        registered_by=registered_by, track=track)
 
     def register_source_video_stream(self, *, filename: str, stream,
                                      content_length: int, registered_by: str,
                                      track: bool = True) -> dict:
         """Stream a large local upload to disk without buffering it in RAM."""
-        tracker = (self.tracker("upload") if track else progress_module.NullTracker())
-        tracker.start("Yukleme basladi")
-        try:
-            return self._register_source_video_stream(
-                tracker, filename=filename, stream=stream,
-                content_length=content_length, registered_by=registered_by)
-        except Exception as exc:  # noqa: BLE001
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
-
-    def _register_source_video_stream(self, tracker, *, filename, stream,
-                                      content_length, registered_by) -> dict:
-        try:
-            expected = int(content_length)
-        except (TypeError, ValueError) as exc:
-            raise PipelineServiceError("yukleme boyutu gecersiz") from exc
-        if expected <= 0:
-            raise PipelineServiceError("bos dosya yuklenemez")
-        display = safe_filename(filename, default="source")
-        extension = Path(display).suffix.lower()
-        if extension not in SUPPORTED_SOURCE_VIDEO_EXTENSIONS:
-            supported = ", ".join(sorted(SUPPORTED_SOURCE_VIDEO_EXTENSIONS))
-            raise PipelineServiceError(
-                f"desteklenmeyen kaynak video uzantisi: {extension or '(yok)'}; "
-                f"desteklenenler: {supported}"
-            )
-        stored_name = f"{new_id('source')}__{display}"
-        path = self.storage.resolve(self.ownership, SOURCE_DIRNAME, stored_name,
-                                     create_parent=True)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # ``stored_name`` already contains a fresh source id, so this temporary
-        # name is collision-free without expanding the closed public id catalog.
-        partial = path.with_name(f".{path.name}.part")
-        digest = hashlib.sha256()
-        received = 0
-        tracker.stage("receive", f"{display} aliniyor ve diske yaziliyor")
-        tracker.count(0, expected, unit="bayt", message=f"0/{expected} bayt")
-        try:
-            with open(partial, "xb") as output:
-                while received < expected:
-                    chunk = stream.read(min(8 * 1024 * 1024, expected - received))
-                    if not chunk:
-                        raise PipelineServiceError(
-                            f"yukleme yarida kesildi ({received}/{expected} bayt)")
-                    output.write(chunk)
-                    digest.update(chunk)
-                    received += len(chunk)
-                    tracker.count(received, expected, unit="bayt",
-                                  message=f"{received}/{expected} bayt")
-                output.flush()
-                os.fsync(output.fileno())
-            tracker.stage("store", f"{display} atomik olarak etkinlestiriliyor")
-            os.replace(partial, path)
-        except BaseException:
-            try:
-                partial.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        tracker.stage("fingerprint", "Parmak izi hesaplaniyor")
-
-        project = self.load_artifact("project")
-        record = project["data"] or self.create_project(title=display, created_by=registered_by)
-        record["source"] = {
-            "display_name": display,
-            "stored_path": self.relative(path),
-            "size_bytes": received,
-            "container_extension": extension,
-            "content_sha256": digest.hexdigest(),
-            "fingerprint_sha256": source_strategy.source_fingerprint_sha256(path),
-            "registered_at": _now_iso(),
-            "registered_by": str(registered_by)[:120],
-        }
-        record["status_reason"] = "kaynak video kaydedildi; Faz 0 degerlendirmesi bekleniyor"
-        self.write_artifact("project", record, actor=registered_by)
-        self.audit.record("source.registered", actor=registered_by,
-                          detail={"display_name": display, "size_bytes": received})
-        tracker.finish(message=f"{display} ({received} bayt) kaydedildi")
-        return record
+        return self.source.store_upload_stream(
+            filename=filename, stream=stream, content_length=content_length,
+            registered_by=registered_by, track=track)
 
     def source_path(self) -> Path:
-        project = self.load_artifact("project", required=True)
-        if project["problem"]:
-            raise ArtifactProblem(project["problem"])
-        source = (project["data"] or {}).get("source")
-        if not source or not source.get("stored_path"):
-            raise PipelineServiceError("bu projede kayitli bir kaynak video yok")
-        path = self.storage.resolve(self.ownership, source["stored_path"])
-        if not path.is_file():
-            raise ArtifactProblem(
-                f"kaynak video manifestte var ama diskte yok: {source['stored_path']}"
-            )
-        return path
+        return self.source.get_source_path()
 
     # ------------------------------------------------- phase -1: trend ingest
     def discover_source_candidates(self, *, terms=None, manual_urls=None,
@@ -1998,29 +1544,11 @@ class PipelineService:
                                   registered_by: str) -> dict:
         """Point the project at a downloaded file.
 
-        Deliberately does NOT read the file into memory (an ingest can be
-        gigabytes); the fingerprint uses the same sampled digest Phase 0 relies
-        on, and `content_sha256` is left None rather than faked.
+        Reached only after the rights gate above has passed and the ingest
+        manifest was written; the attachment itself is `SourceService`'s job.
         """
-        project = self.load_artifact("project")
-        record = project["data"] or self.create_project(
-            title=manifest.get("title") or "Indirilen kaynak", created_by=registered_by)
-        record["source"] = {
-            "display_name": safe_filename(stored.name, default="source.mp4"),
-            "stored_path": self.relative(stored),
-            "size_bytes": manifest.get("filesize_bytes"),
-            "content_sha256": None,
-            "fingerprint_sha256": source_strategy.source_fingerprint_sha256(stored),
-            "registered_at": _now_iso(),
-            "registered_by": str(registered_by)[:120],
-            "origin": "trend_ingest",
-            "candidate_url": manifest.get("candidate_url"),
-            "license_type": (manifest.get("rights") or {}).get("license_type"),
-        }
-        record["status_reason"] = (
-            "kaynak indirildi ve projeye baglandi; Faz 0 degerlendirmesi bekleniyor")
-        self.write_artifact("project", record, actor=registered_by)
-        return record
+        return self.source.attach_downloaded_source(
+            stored, manifest, registered_by=registered_by)
 
     def ingest_state(self) -> dict:
         """View model for the Trend Radar / rights screens."""
@@ -2043,344 +1571,85 @@ class PipelineService:
             "rights_notice": trend_ingest.CONTENT_ID_RISK_NOTICE,
         }
 
-    # ------------------------------------------------- publication metadata
+    # ----------------------------------------------------- publication
+    # Publication orchestration is owned by
+    # `application.services.PublishService`; these methods keep the public
+    # facade contract and delegate. Publication policy (private-first,
+    # one-use intents, visibility binding) stays canonical in
+    # `local_pipeline.publish`; the YouTube wire protocol stays in
+    # `local_pipeline.publish_youtube`. See docs/architecture/PUBLISH_SERVICE.md.
     def run_metadata_generation(self, *, job_id=None, actor="console") -> dict:
-        tracker = self.tracker("metadata_generation", job_id=job_id)
-        tracker.start("Metadata uretimi basladi")
-        try:
-            return self._run_metadata_generation(tracker, job_id=job_id, actor=actor)
-        except Exception as exc:  # noqa: BLE001
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
-
-    def _run_metadata_generation(self, tracker, *, job_id, actor) -> dict:
-        tracker.stage("preparation", "Kaynak metin toplaniyor")
-        script = self.load_artifact("selected_script")["data"] or {}
-        hot = self.load_artifact("hot_moments")["data"] or {}
-        plan_decision = ((self.load_artifact("processing_plan")["data"] or {})
-                         .get("decision") or {})
-        ingest = self.load_artifact("ingest_manifest")["data"]
-
-        script_text = script.get("script_text") or ""
-        transcript_excerpt = ""
-        if not script_text:
-            # `direct_clip_series` produces no script, so the transcript of the
-            # analyzed clip is the only honest input.
-            segments = (hot.get("transcript") or {}).get("segments") or []
-            transcript_excerpt = " ".join(
-                str(segment.get("text") or "") for segment in segments[:80]).strip()
-        if not script_text and not transcript_excerpt:
-            raise PipelineServiceError(
-                "metadata uretimi icin script veya transcript gerekli; once analiz "
-                "veya script fazini calistir. Alternatif olarak metadatayi elle yazabilirsin.")
-
-        client = self._build_google_client()
-        if client is None:
-            raise PipelineServiceError(
-                "Gemini kimlik bilgisi yok; metadata uretilemez. Metadatayi elle "
-                "yazabilirsin. " + google_ai.credential_help_text("google_api"))
-
-        tracker.stage("request", "Gemini yaniti bekleniyor")
-        artifact = metadata_studio.generate_metadata(
-            script_text=script_text, transcript_excerpt=transcript_excerpt,
-            source_title=(ingest or {}).get("title") or "",
-            target_language=plan_decision.get("content_language") or "tr-TR",
-            is_short=True, theory_angle=plan_decision.get("theory_angle") or "",
-            client=client,
-        )
-        tracker.stage("attribution", "Kaynak atfi uygulaniyor")
-        artifact = metadata_studio.apply_attribution(artifact, ingest)
-        self.write_artifact("publication_metadata", artifact, job_id=job_id, actor=actor)
-        self.audit.record("provider.call", actor=actor, job_id=job_id,
-                          detail={"phase": "metadata_generation",
-                                  "provider": artifact.get("provider"),
-                                  "model": artifact.get("model")})
-        if artifact.get("status") in ("failed", "insufficient_data"):
-            tracker.fail(artifact.get("status_reason") or "metadata uretilemedi")
-        else:
-            tracker.finish(message=f"{len(artifact['title_variants'])} baslik varyanti")
-        return artifact
+        return self.publish.generate_metadata(job_id=job_id, actor=actor)
 
     def write_manual_metadata(self, *, title: str, description: str = "", tags=None,
                               actor="console") -> dict:
-        plan_decision = ((self.load_artifact("processing_plan")["data"] or {})
-                         .get("decision") or {})
-        artifact = metadata_studio.build_manual_metadata(
-            title=title, description=description, tags=tags or [],
-            language=plan_decision.get("content_language") or "tr-TR",
-        )
-        artifact = metadata_studio.apply_attribution(
-            artifact, self.load_artifact("ingest_manifest")["data"])
-        self.write_artifact("publication_metadata", artifact, actor=actor)
-        return artifact
+        return self.publish.write_manual_metadata(
+            title=title, description=description, tags=tags, actor=actor)
 
     def select_publication_metadata(self, *, title_index: int, description=None,
-                                    tags=None, category_id=None, actor="console") -> dict:
-        loaded = self.load_artifact("publication_metadata", required=True)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        artifact = metadata_studio.select_metadata(
-            loaded["data"], title_index, description_override=description,
-            tags_override=tags, category_id=category_id)
-        self.write_artifact("publication_metadata", artifact, actor=actor)
-        return artifact
+                                    tags=None, category_id=None,
+                                    actor="console") -> dict:
+        return self.publish.select_metadata(
+            title_index=title_index, description=description, tags=tags,
+            category_id=category_id, actor=actor)
 
-    def approve_publication_metadata(self, *, reviewed_sha256: str, approved_by: str,
-                                     notes: str = "") -> dict:
-        loaded = self.load_artifact("publication_metadata", required=True)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        try:
-            approved = metadata_studio.approve_metadata(
-                loaded["data"], reviewed_sha256, approved_by, notes)
-        except ValueError as exc:
-            self.audit.record("approval.rejected", actor=approved_by,
-                              artifact=ARTIFACTS["publication_metadata"],
-                              detail={"kind": "publication_metadata", "reason": str(exc)})
-            raise PipelineServiceError(str(exc)) from None
-        relative = self.write_artifact("publication_metadata", approved, actor=approved_by)
-        self.audit.record("approval.granted", actor=approved_by, artifact=relative,
-                          detail={"kind": "publication_metadata",
-                                  "approved_content_sha256":
-                                      approved["metadata_approval"]["approved_selection_sha256"]})
-        return approved
+    def approve_publication_metadata(self, *, reviewed_sha256: str,
+                                     approved_by: str, notes: str = "") -> dict:
+        return self.publish.approve_metadata(
+            reviewed_sha256=reviewed_sha256, approved_by=approved_by, notes=notes)
 
-    # ------------------------------------------------------------- publish
     def youtube_provider(self):
-        """Build the YouTube provider. Constructing it reads no secret value and
-        performs no network call."""
-        if self._youtube_provider is None:
-            token_path = self.storage.resolve(
-                self.ownership, RUNTIME_DIRNAME, "youtube_oauth_token.json",
-                create_parent=True)
-            self._youtube_provider = publish_youtube.YouTubeProvider(
-                token_store=publish_youtube.OAuthTokenStore(path=token_path))
-        return self._youtube_provider
+        """The publication provider (lazy; reads no secret, makes no call)."""
+        return self.publish.provider()
 
     def publish_credential_state(self) -> dict:
-        try:
-            return self.youtube_provider().describe_credential_state()
-        except Exception as exc:  # noqa: BLE001 - a settings panel must not crash
-            return {"platform": publish_module.PLATFORM_YOUTUBE, "configured": False,
-                    "authorized": False, "client_secrets_error": str(exc)}
+        return self.publish.credential_state()
 
     def youtube_authorization_url(self, *, redirect_uri: str, state: str = "") -> str:
-        return self.youtube_provider().authorization_url(redirect_uri, state=state)
+        return self.publish.authorization_url(redirect_uri=redirect_uri, state=state)
 
     def complete_youtube_authorization(self, *, code: str, redirect_uri: str,
-                                      actor="console") -> dict:
-        state = self.youtube_provider().complete_authorization(code, redirect_uri)
-        # `state` carries only channel identity and scopes -- never a token.
-        self.audit.record("artifact.written", actor=actor,
-                          detail={"youtube_authorized": bool(state.get("authorized")),
-                                  "channel_id": state.get("channel_id")})
-        return state
+                                       actor="console") -> dict:
+        return self.publish.complete_authorization(
+            code=code, redirect_uri=redirect_uri, actor=actor)
 
     def create_publish_intent(self, *, platform=publish_module.PLATFORM_YOUTUBE,
                               visibility=publish_module.VISIBILITY_PRIVATE,
                               publish_at=None, made_for_kids=False,
                               account_ref="", actor="console") -> dict:
-        render = self.load_artifact("render_manifest", required=True)
-        metadata = self.load_artifact("publication_metadata", required=True)
-        for loaded in (render, metadata):
-            if loaded["problem"]:
-                raise ArtifactProblem(loaded["problem"])
-
-        # The render's own hash check is not enough: an upstream approval may have
-        # been revoked since. `approval_chain` is the console's authority on that.
-        chain = self.approval_chain()
-        render_state = chain.get("render") or {}
-        if not render_state.get("effective_valid"):
-            raise PipelineServiceError(
-                "YAYIN ENGELLI: render onayi gecerli degil -- "
-                + (render_state.get("reason") or "once Render Studio'da final onayi ver"))
-
-        target = publish_module.PublishTarget(
-            platform=platform, account_ref=account_ref, visibility=visibility,
-            publish_at=publish_at, made_for_kids=made_for_kids)
-        intent = publish_module.build_publish_intent(
-            render["data"], metadata["data"], target,
-            ingest_manifest=self.load_artifact("ingest_manifest")["data"])
-        relative = self.write_artifact("publish_intent", intent, actor=actor)
-        self.audit.record("artifact.written", actor=actor, artifact=relative,
-                          detail={"platform": platform,
-                                  "requested_visibility": visibility,
-                                  "initial_visibility": publish_module.INITIAL_PRIVACY})
-        return intent
+        return self.publish.create_intent(
+            platform=platform, visibility=visibility, publish_at=publish_at,
+            made_for_kids=made_for_kids, account_ref=account_ref, actor=actor)
 
     def approve_publish_intent(self, *, reviewed_sha256: str, approved_by: str,
                                notes: str = "") -> dict:
-        loaded = self.load_artifact("publish_intent", required=True)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        try:
-            approved = publish_module.approve_publish_intent(
-                loaded["data"], reviewed_sha256, approved_by, notes)
-        except ValueError as exc:
-            self.audit.record("approval.rejected", actor=approved_by,
-                              artifact=ARTIFACTS["publish_intent"],
-                              detail={"kind": "publish_intent", "reason": str(exc)})
-            raise PipelineServiceError(str(exc)) from None
-        relative = self.write_artifact("publish_intent", approved, actor=approved_by)
-        self.audit.record("approval.granted", actor=approved_by, artifact=relative,
-                          detail={"kind": "publish_intent",
-                                  "authorizes": "single private upload"})
-        return approved
+        return self.publish.approve_intent(
+            reviewed_sha256=reviewed_sha256, approved_by=approved_by, notes=notes)
 
     def run_publish_upload(self, *, job_id=None, actor="console") -> dict:
-        tracker = self.tracker("publish_upload", job_id=job_id)
-        tracker.start("Private yukleme basladi")
-        try:
-            return self._run_publish_upload(tracker, job_id=job_id, actor=actor)
-        except Exception as exc:  # noqa: BLE001
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
+        return self.publish.run_upload(job_id=job_id, actor=actor)
 
-    def _run_publish_upload(self, tracker, *, job_id, actor) -> dict:
-        tracker.stage("preparation", "Yayin onayi dogrulaniyor")
-        loaded = self.load_artifact("publish_intent", required=True)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        intent = loaded["data"]
+    def approve_publish_visibility(self, *, target_visibility: str,
+                                   reviewed_remote_id: str, approved_by: str,
+                                   publish_at=None, notes: str = "") -> dict:
+        return self.publish.approve_visibility(
+            target_visibility=target_visibility,
+            reviewed_remote_id=reviewed_remote_id, approved_by=approved_by,
+            publish_at=publish_at, notes=notes)
 
-        existing = self.load_artifact("publish_manifest")["data"]
-        if existing and (existing.get("upload") or {}).get("remote_id"):
-            raise PipelineServiceError(
-                "Bu proje icin zaten bir yukleme yapilmis "
-                f"(id={existing['upload']['remote_id']}). Yeniden yayin icin yeni bir "
-                "yayin niyeti olusturup onaylaman gerekir.")
-
-        # The intent stores a namespace-relative path for display; the uploader
-        # needs the real file, resolved through the storage guard.
-        intent_for_upload = dict(intent)
-        intent_for_upload["source_video_path"] = str(
-            self.storage.resolve(self.ownership, ARTIFACTS["render_manifest"]).parent
-            / Path(intent["source_video_path"]).name
-        ) if not Path(intent["source_video_path"]).is_absolute() else intent["source_video_path"]
-
-        def progress(sent, total):
-            tracker.stage("upload", f"{sent}/{total} bayt gonderildi")
-
-        tracker.stage("upload", "YouTube resumable oturumu aciliyor")
-        manifest = publish_module.execute_private_upload(
-            intent_for_upload, provider=self.youtube_provider(),
-            ingest_manifest=self.load_artifact("ingest_manifest")["data"],
-            uploaded_by=actor, progress_callback=progress,
-        )
-        tracker.stage("write", "Yayin manifesti yaziliyor")
-        self.write_artifact("publish_manifest", manifest, job_id=job_id, actor=actor)
-
-        # One intent authorizes exactly one upload; mark it spent either way.
-        intent["upload_performed"] = True
-        intent["upload_attempted_at"] = _now_iso()
-        self.write_artifact("publish_intent", intent, job_id=job_id, actor=actor)
-
-        self.audit.record("provider.call", actor=actor, job_id=job_id,
-                          detail={"phase": "publish_upload",
-                                  "platform": manifest.get("platform"),
-                                  "status": manifest["upload"].get("status"),
-                                  "quota_units_estimated":
-                                      manifest["upload"].get("quota_units_estimated")})
-        if manifest["upload"].get("status") == "failed":
-            tracker.fail(manifest["upload"].get("error")
-                         or manifest["upload"].get("status_reason") or "yukleme basarisiz")
-        else:
-            tracker.finish(message="Video PRIVATE olarak yuklendi; gorunurluk onayi bekliyor")
-        return manifest
-
-    def approve_publish_visibility(self, *, target_visibility: str, reviewed_remote_id: str,
-                                   approved_by: str, publish_at=None, notes: str = "") -> dict:
-        loaded = self.load_artifact("publish_manifest", required=True)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        try:
-            approved = publish_module.approve_visibility(
-                loaded["data"], target_visibility, reviewed_remote_id, approved_by,
-                publish_at=publish_at, notes=notes)
-        except ValueError as exc:
-            self.audit.record("approval.rejected", actor=approved_by,
-                              artifact=ARTIFACTS["publish_manifest"],
-                              detail={"kind": "visibility", "reason": str(exc)})
-            raise PipelineServiceError(str(exc)) from None
-        relative = self.write_artifact("publish_manifest", approved, actor=approved_by)
-        self.audit.record("approval.granted", actor=approved_by, artifact=relative,
-                          detail={"kind": "visibility",
-                                  "target_visibility": target_visibility,
-                                  "publish_at": publish_at})
-        return approved
-
-    def run_visibility_change(self, *, actor="console") -> dict:
-        loaded = self.load_artifact("publish_manifest", required=True)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        updated = publish_module.execute_visibility_change(
-            loaded["data"], provider=self.youtube_provider())
-        relative = self.write_artifact("publish_manifest", updated, actor=actor)
-        self.audit.record("provider.call", actor=actor, artifact=relative,
-                          detail={"phase": "visibility_change",
-                                  "visibility": updated.get("current_visibility")})
-        return updated
+    def run_visibility_change(self, *, job_id=None, actor="console") -> dict:
+        return self.publish.apply_visibility(job_id=job_id, actor=actor)
 
     def publish_state(self) -> dict:
         """View model for the publish screen: what is ready, what is blocking."""
-        render = self.load_artifact("render_manifest")
-        metadata = self.load_artifact("publication_metadata")
-        intent = self.load_artifact("publish_intent")
-        manifest = self.load_artifact("publish_manifest")
-        ingest = self.load_artifact("ingest_manifest")
-
-        preconditions = publish_module.validate_publish_preconditions(
-            render["data"] or {}, metadata["data"], ingest["data"])
-        intent_state = (publish_module.check_publish_intent_approval(intent["data"])
-                        if intent["data"] else
-                        {"approved": False, "valid": False,
-                         "reason": "yayin niyeti olusturulmadi"})
-        return {
-            "credential": self.publish_credential_state(),
-            "preconditions": preconditions,
-            "publishable": not preconditions,
-            "metadata": metadata["data"],
-            "metadata_problem": metadata["problem"],
-            "intent": intent["data"],
-            "intent_problem": intent["problem"],
-            "intent_approval": intent_state,
-            "manifest": manifest["data"],
-            "manifest_problem": manifest["problem"],
-            "initial_visibility": publish_module.INITIAL_PRIVACY,
-            "visibility_values": list(publish_module.VISIBILITY_VALUES),
-            "planned_platforms": list(publish_module.PLANNED_PLATFORMS),
-            "registered_platforms": [publish_module.PLATFORM_YOUTUBE],
-        }
+        return self.publish.publish_state()
 
     # ------------------------------------------------------------- phase 0
+    # Phase 0 (assessment + processing plan) is owned by
+    # `application.services.AnalysisService`; these methods keep the public
+    # facade contract and delegate. See `docs/architecture/ANALYSIS_SERVICE.md`.
     def run_source_assessment(self, *, job_id=None, actor="console") -> dict:
-        tracker = self.tracker("source_assessment", job_id=job_id)
-        tracker.start("Kaynak degerlendirme basladi")
-        try:
-            return self._run_source_assessment(tracker, job_id=job_id, actor=actor)
-        except Exception as exc:  # noqa: BLE001 - record, then re-raise unchanged
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
-
-    def _run_source_assessment(self, tracker, *, job_id, actor) -> dict:
-        tracker.stage("probe", "Medya akislari okunuyor")
-        source = self.source_path()
-        ffmpeg_bin, ffprobe_bin = self.binaries()
-        hot = self.load_artifact("hot_moments")
-        tracker.stage("scoring", "Mod skorlari hesaplaniyor")
-        assessment = source_strategy.assess_source(
-            source, ffmpeg_bin, ffprobe_bin,
-            hot_moments_data=hot["data"] if hot["data"] else None,
-            google_credential_configured=self.secrets.reference("google_api").configured,
-            probe_fn=self._probe_fn,
-        )
-        tracker.stage("write", "Degerlendirme yaziliyor")
-        relative = self.write_artifact("source_assessment", assessment, job_id=job_id, actor=actor)
-        self.audit.record("assessment.created", actor=actor, job_id=job_id, artifact=relative,
-                          detail={"recommended_mode": assessment["recommended_mode"],
-                                   "auto_selected": assessment["auto_selected"]})
-        tracker.finish(message=f"Oneri: {assessment['recommended_mode']}")
-        return assessment
+        return self.analysis.assess_source(job_id=job_id, actor=actor)
 
     def create_processing_plan(self, *, mode: str, selected_by: str, output_count=None,
                                target_duration_sec=None, moment_ranks=None, theory_angle="",
@@ -2388,160 +1657,44 @@ class PipelineService:
                                render_config=None, notes="",
                                content_language=None,
                                narration_preset=None) -> dict:
-        assessment = self.load_artifact("source_assessment", required=True)
-        if assessment["problem"]:
-            raise ArtifactProblem(assessment["problem"])
-        render_root = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
-                                            create_parent=True)
-        plan = source_strategy.build_processing_plan(
-            assessment["data"], mode, selected_by, output_count=output_count,
+        return self.analysis.create_processing_plan(
+            mode=mode, selected_by=selected_by, output_count=output_count,
             target_duration_sec=target_duration_sec, moment_ranks=moment_ranks,
             theory_angle=theory_angle, theory_angle_auto=theory_angle_auto,
-            render_config=render_config,
+            render_config=render_config, notes=notes,
             content_language=content_language,
-            narration_preset=narration_preset,
-            render_root=render_root, notes=notes,
-        )
-        # Store namespace-relative output dirs so the artifact never carries the
-        # operator's absolute filesystem layout.
-        for slot in plan["outputs"]:
-            for field in ("output_dir", "render_manifest_path", "final_video_path"):
-                slot[field] = self.relative(slot[field])
-        relative = self.write_artifact("processing_plan", plan, actor=selected_by)
-        self.audit.record("plan.created", actor=selected_by, artifact=relative,
-                          detail={"mode": mode, "output_count": plan["decision"]["output_count"],
-                                   "followed_recommendation": plan["followed_recommendation"]})
-        return plan
+            narration_preset=narration_preset)
 
     def update_processing_plan(self, *, updated_by: str, mode=None, selected_by=None,
                                output_count=None, target_duration_sec=None,
                                moment_ranks=None, theory_angle=None,
-                           theory_angle_auto=None,
+                               theory_angle_auto=None,
                                render_config=None, notes=None,
                                content_language=None,
                                narration_preset=None) -> dict:
-        """Rebuild an existing plan from editable, validated Phase 0 fields.
-
-        A plan edit is intentionally not an in-place JSON patch. Rebuilding via
-        ``source_strategy.build_processing_plan`` re-applies every canonical
-        validation, regenerates output slots, and resets human approval. The
-        previous approval remains visible in the append-only audit trail, but
-        can never authorize the edited decision.
-        """
-        assessment = self.load_artifact("source_assessment", required=True)
-        current = self.load_artifact("processing_plan", required=True)
-        if assessment["problem"]:
-            raise ArtifactProblem(assessment["problem"])
-        if current["problem"]:
-            raise ArtifactProblem(current["problem"])
-        if not current["data"]:
-            raise PipelineServiceError("duzenlenecek isleme plani bulunamadi")
-
-        old_plan = current["data"]
-        old_decision = old_plan.get("decision") or {}
-        actor = str(updated_by or "").strip()
-        if not actor:
-            raise PipelineServiceError("plani duzenleyen kisi bos olamaz")
-
-        chosen_mode = mode or old_decision.get("mode")
-        chosen_by = (str(selected_by).strip() if selected_by is not None
-                     else str(old_plan.get("selected_by") or actor).strip())
-        chosen_count = (output_count if output_count is not None
-                        else old_decision.get("output_count"))
-        chosen_duration = (target_duration_sec if target_duration_sec is not None
-                           else old_decision.get("target_duration_sec"))
-        chosen_ranks = (moment_ranks if moment_ranks is not None
-                        else old_decision.get("moment_ranks") or [])
-        chosen_angle = (theory_angle if theory_angle is not None
-                        else old_decision.get("theory_angle") or "")
-        chosen_auto_angle = (bool(theory_angle_auto) if theory_angle_auto is not None
-                             else bool(old_decision.get("theory_angle_auto")))
-        # Typing an angle is an explicit choice to stop deriving one; keeping
-        # both would hit the server's "not both" refusal on every later edit.
-        if chosen_angle and chosen_auto_angle and theory_angle:
-            chosen_auto_angle = False
-        if chosen_auto_angle:
-            chosen_angle = ""
-        chosen_notes = notes if notes is not None else old_plan.get("notes") or ""
-        chosen_language = (content_language if content_language is not None
-                           else old_decision.get("content_language"))
-        chosen_preset = (narration_preset if narration_preset is not None
-                         else (old_decision.get("narration") or {}).get("preset"))
-
-        # Partial render edits preserve settings the current UI does not expose.
-        chosen_render = dict(old_decision.get("render") or {})
-        if render_config is not None:
-            if not isinstance(render_config, dict):
-                raise PipelineServiceError("render_config JSON nesnesi olmali")
-            chosen_render.update(render_config)
-
-        render_root = self.storage.resolve(
-            self.ownership, RESULTS_DIRNAME, "render", create_parent=True)
-        rebuilt = source_strategy.build_processing_plan(
-            assessment["data"], chosen_mode, chosen_by,
-            output_count=chosen_count,
-            target_duration_sec=chosen_duration,
-            moment_ranks=chosen_ranks,
-            theory_angle=chosen_angle,
-            content_language=chosen_language,
-            narration_preset=chosen_preset,
-            render_config=chosen_render,
-            narration_config=None,
-            render_root=render_root,
-            notes=chosen_notes,
-            selected_at=old_plan.get("selected_at"),
-        )
-        for slot in rebuilt["outputs"]:
-            for field in ("output_dir", "render_manifest_path", "final_video_path"):
-                slot[field] = self.relative(slot[field])
-
-        old_hash = approval.content_hash_for("processing_plan", old_plan)
-        new_hash = approval.content_hash_for("processing_plan", rebuilt)
-        rebuilt["revision"] = int(old_plan.get("revision") or 1) + 1
-        rebuilt["updated_by"] = actor[:120]
-        rebuilt["updated_at"] = _now_iso()
-        relative = self.write_artifact("processing_plan", rebuilt, actor=actor)
-
-        old_approval = old_plan.get("human_approval") or {}
-        if old_approval.get("approved"):
-            self.audit.record(
-                "approval.invalidated", actor=actor, artifact=relative,
-                detail={"kind": "processing_plan", "reason": "plan edited",
-                        "previous_approved_content_sha256":
-                            old_approval.get("approved_content_sha256")},
-            )
-        self.audit.record(
-            "plan.updated", actor=actor, artifact=relative,
-            detail={"previous_mode": old_decision.get("mode"),
-                    "mode": chosen_mode,
-                    "decision_changed": old_hash != new_hash,
-                    "revision": rebuilt["revision"]},
-        )
-        return rebuilt
+        """Rebuild an existing plan from editable, validated Phase 0 fields."""
+        return self.analysis.update_processing_plan(
+            updated_by=updated_by, mode=mode, selected_by=selected_by,
+            output_count=output_count, target_duration_sec=target_duration_sec,
+            moment_ranks=moment_ranks, theory_angle=theory_angle,
+            theory_angle_auto=theory_angle_auto, render_config=render_config,
+            notes=notes, content_language=content_language,
+            narration_preset=narration_preset)
 
     def describe_plan_review(self) -> dict:
-        plan = self.load_artifact("processing_plan")
-        if plan["problem"]:
-            raise ArtifactProblem(plan["problem"])
-        if not plan["data"]:
-            return {"present": False}
-        info = approval.describe_for_review("processing_plan", plan["data"])
-        assessment = self.load_artifact("source_assessment")
-        errors = source_strategy.validate_processing_plan(
-            plan["data"], assessment=assessment["data"] if assessment["data"] else None,
-        )
-        return {"present": True, "review": info, "staleness": errors, "plan": plan["data"]}
+        return self.analysis.describe_plan_review()
 
     # ------------------------------------------------------------- approvals
-    APPROVAL_ARTIFACTS = {
-        "processing_plan": "processing_plan",
-        "script": "selected_script",
-        "voiceover": "selected_voiceover",
-        "transcript": "moment_transcript",
-        "render": "render_manifest",
-    }
+    # The registry lives in `application.approval_catalog` so `ApprovalService`
+    # and this facade agree on which artifacts the content-approval gate
+    # covers. Publication approvals are deliberately NOT in it (Invariant F).
+    APPROVAL_ARTIFACTS = _APPROVAL_ARTIFACTS
 
     # ------------------------------------------------------- render review
+    # The READ side of every checklist (state, digests, paths) is owned by the
+    # review gate so the approval precondition and the UI can never disagree.
+    # The MUTATION methods below stay here for now; they reuse the gate so the
+    # "bound to the current digest" rule has one implementation.
     def render_review_relative(self, slot: int = 1) -> str:
         """Where THIS slot's checklist lives.
 
@@ -2550,11 +1703,7 @@ class PipelineService:
         gate of a slot 2 nobody has watched -- the exact failure the checklist
         exists to prevent.
         """
-        index = int(slot or 1)
-        if index == 1:
-            return render_review_module.RENDER_REVIEW_ARTIFACT
-        name = render_review_module.RENDER_REVIEW_ARTIFACT.rsplit("/", 1)[-1]
-        return f"{RESULTS_DIRNAME}/render/output_{index:02d}/{name}"
+        return self._review_gate.render_review_relative(slot)
 
     def render_video_digest(self, slot: int = 1):
         """SHA-256 of the render currently on disk, or None.
@@ -2562,24 +1711,10 @@ class PipelineService:
         The SAME digest the approval gate binds to, so a checklist entry and an
         approval can never disagree about which video was reviewed.
         """
-        loaded = self.load_artifact("render_manifest", slot=slot)
-        if not loaded["data"] or loaded["problem"]:
-            return None
-        try:
-            return approval.content_hash_for("render", loaded["data"])
-        except ValueError:
-            return None
+        return self._review_gate.render_video_digest(slot)
 
     def render_review_state(self, slot: int = 1) -> dict:
-        review = self.load_artifact_path(self.render_review_relative(slot))
-        technical = render_review_module.technical_summary(
-            self.load_artifact("render_manifest", slot=slot)["data"])
-        state = render_review_module.evaluate(
-            review, self.render_video_digest(slot), self.ownership,
-            current_snapshot=technical)
-        state["technical"] = technical
-        state["slot"] = int(slot or 1)
-        return state
+        return self._review_gate.render_review_state(slot)
 
     def _save_render_review(self, review: dict, slot: int = 1) -> dict:
         path = self.storage.resolve(self.ownership, self.render_review_relative(slot),
@@ -2588,10 +1723,7 @@ class PipelineService:
         return review
 
     def _load_or_new_review(self, slot: int = 1) -> dict:
-        existing = self.load_artifact_path(self.render_review_relative(slot))
-        if isinstance(existing, dict):
-            return existing
-        return render_review_module.new_review(self.ownership, self.render_video_digest(slot))
+        return self._review_gate.load_or_new_render_review(slot)
 
     def set_render_review_item(self, key: str, *, checked: bool, reviewed_by: str,
                                 note: str = "", slot: int = 1) -> dict:
@@ -2682,47 +1814,10 @@ class PipelineService:
         The SAME digest the approval gate binds to, so a checklist entry and an
         approval can never disagree about which audio was listened to.
         """
-        loaded = self.load_artifact("selected_voiceover")
-        if not loaded["data"] or loaded["problem"]:
-            return None
-        try:
-            return approval.content_hash_for("voiceover", loaded["data"])
-        except ValueError:
-            return None
+        return self._review_gate.voice_audio_digest()
 
     def voice_review_state(self) -> dict:
-        review = self.load_artifact_path(voice_review_module.VOICE_REVIEW_ARTIFACT)
-        decision = ((self.load_artifact("processing_plan")["data"] or {})
-                    .get("decision") or {})
-        voiceover = self.load_artifact("selected_voiceover")["data"]
-        script = self.load_artifact("selected_script")["data"]
-        technical = voice_review_module.technical_summary(voiceover, script)
-        state = voice_review_module.evaluate(
-            review, self.voice_audio_digest(), self.ownership,
-            content_language=decision.get("content_language"),
-            narration_preset=(decision.get("narration") or {}).get("preset"),
-            current_snapshot=technical)
-        state["technical"] = technical
-        # The exact words being spoken, so the listener can follow along instead
-        # of judging "does this sound right" from memory.
-        state["script_text"] = (script or {}).get("script_text")
-        state["script_status"] = (script or {}).get("status")
-        state["audio_relative_path"] = (voiceover or {}).get("audio_path_relative")
-        # A voiceover produced BEFORE a language change is not merely stale, it
-        # is in the wrong language -- said plainly rather than left to the ear.
-        spoken = (voiceover or {}).get("language_code")
-        planned = decision.get("content_language")
-        state["language_mismatch"] = bool(spoken and planned and spoken != planned)
-        state["spoken_language"] = spoken
-        state["planned_language"] = planned
-        state["planned_voice"] = (decision.get("narration") or {}).get("voice")
-        state["spoken_voice"] = (voiceover or {}).get("voice_id")
-        # A preset switch makes existing audio the wrong DELIVERY, not merely
-        # stale -- named here so the panel can say which.
-        state["preset_mismatch"] = bool(
-            state["planned_voice"] and state["spoken_voice"]
-            and state["planned_voice"] != state["spoken_voice"])
-        return state
+        return self._review_gate.voice_review_state()
 
     def _save_voice_review(self, review: dict) -> dict:
         path = self.storage.resolve(self.ownership,
@@ -2732,37 +1827,15 @@ class PipelineService:
         return review
 
     def _load_or_new_voice_review(self) -> dict:
-        existing = self.load_artifact_path(voice_review_module.VOICE_REVIEW_ARTIFACT)
-        if isinstance(existing, dict):
-            return existing
-        return voice_review_module.new_review(self.ownership, self.voice_audio_digest())
+        return self._review_gate.load_or_new_voice_review()
 
     # ------------------------------------------------- copyright review
     def source_fingerprint(self):
-        """The digest the copyright answers are bound to.
-
-        Deliberately the SOURCE fingerprint, not a render: the question is about
-        the material that was taken, so swapping the source has to reset the
-        answers even if every later artifact still looks fine.
-        """
-        project = self.load_artifact("project")["data"] or {}
-        return ((project.get("source") or {}).get("fingerprint_sha256")) or None
+        """The digest the copyright answers are bound to."""
+        return self._review_gate.source_fingerprint()
 
     def copyright_review_state(self) -> dict:
-        review = self.load_artifact_path(
-            copyright_review_module.COPYRIGHT_REVIEW_ARTIFACT)
-        state = copyright_review_module.evaluate(
-            review, self.source_fingerprint(), self.ownership)
-        project = self.load_artifact("project")["data"] or {}
-        source = project.get("source") or {}
-        # Shown next to the questions so the operator answers about THIS file
-        # rather than whichever source they last had open.
-        state["source"] = {
-            "display_name": source.get("display_name"),
-            "registered_at": source.get("registered_at"),
-            "license_type": source.get("license_type"),
-        }
-        return state
+        return self._review_gate.copyright_review_state()
 
     def _save_copyright_review(self, review: dict) -> dict:
         path = self.storage.resolve(
@@ -2772,12 +1845,7 @@ class PipelineService:
         return review
 
     def _load_or_new_copyright_review(self) -> dict:
-        existing = self.load_artifact_path(
-            copyright_review_module.COPYRIGHT_REVIEW_ARTIFACT)
-        if isinstance(existing, dict):
-            return existing
-        return copyright_review_module.new_review(self.ownership,
-                                                  self.source_fingerprint())
+        return self._review_gate.load_or_new_copyright_review()
 
     def set_copyright_review_item(self, key: str, *, checked: bool,
                                   reviewed_by: str, note: str = "") -> dict:
@@ -2864,73 +1932,13 @@ class PipelineService:
         user's echoed hash straight to `approval.approve_artifact`, which
         re-derives the digest from current content.
         """
-        if kind not in self.APPROVAL_ARTIFACTS:
-            raise PipelineServiceError(f"bilinmeyen onay turu: {kind!r}")
-        key = self.APPROVAL_ARTIFACTS[kind]
-        slot = self.require_slot(slot) if key in PER_SLOT_ARTIFACTS else 1
-        loaded = self.load_artifact(key, required=True, slot=slot)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        if kind == "processing_plan":
-            # The earliest gate in the pipeline, and the only one that asks
-            # about the SOURCE rather than something this project produced.
-            # Placed here so a project with no basis for its footage is stopped
-            # before any analysis or render time is spent on it.
-            rights = self.copyright_review_state()
-            if not rights["complete"] or rights["open_revision"]:
-                raise PipelineServiceError(
-                    "ONAY REDDEDILDI: "
-                    + (rights["blocker"] or "telif kontrol listesi tamamlanmadi"))
-        if kind in ("render", "voiceover"):
-            # The hash proves the reviewer saw (or heard) the bytes; the
-            # checklist proves they checked the things that actually go wrong.
-            # This ADDS to the canonical gate, it does not replace it.
-            state = (self.render_review_state(slot) if kind == "render"
-                     else self.voice_review_state())
-            if not state["complete"] or state["open_revision"]:
-                raise PipelineServiceError(
-                    "ONAY REDDEDILDI: "
-                    + (state["blocker"] or "insan inceleme listesi tamamlanmadi"))
-        try:
-            approved = approval.approve_artifact(
-                loaded["data"], kind, reviewed_sha256, approved_by, notes)
-        except ValueError as exc:
-            self.audit.record("approval.rejected", actor=approved_by,
-                              artifact=self.artifact_relative(key, slot),
-                              detail={"kind": kind, "reason": str(exc), "slot": slot})
-            raise PipelineServiceError(str(exc)) from None
-        relative = self.write_artifact(key, approved, actor=approved_by, slot=slot)
-        self.audit.record("approval.granted", actor=approved_by, artifact=relative,
-                          detail={"kind": kind, "slot": slot,
-                                   "approved_content_sha256":
-                                       approved["human_approval"]["approved_content_sha256"]})
-        return approved
+        return self.approval.approve(
+            kind, reviewed_sha256=reviewed_sha256, approved_by=approved_by,
+            notes=notes, slot=slot)
 
     def approval_state(self, kind: str, slot: int = 1) -> dict:
         """Live approval validity, re-derived from current content every time."""
-        key = self.APPROVAL_ARTIFACTS[kind]
-        slot = int(slot or 1) if key in PER_SLOT_ARTIFACTS else 1
-        loaded = self.load_artifact(key, slot=slot)
-        if loaded["problem"]:
-            return {"kind": kind, "slot": slot, "present": True, "valid": False,
-                    "approved": False, "reason": loaded["problem"]}
-        if not loaded["data"]:
-            return {"kind": kind, "slot": slot, "present": False, "valid": False,
-                    "approved": False, "reason": "artefakt henuz uretilmedi"}
-        state = approval.check_approval(loaded["data"], kind)
-        try:
-            review = approval.describe_for_review(kind, loaded["data"])
-        except Exception as exc:  # noqa: BLE001 - review must never crash the page
-            review = {"reviewable": False, "blocker": str(exc), "content_sha256": None}
-        return {
-            "kind": kind, "slot": slot, "present": True,
-            "status": loaded["data"].get("status"),
-            "approved": state["approved"], "valid": state["valid"], "reason": state["reason"],
-            "content_sha256": review.get("content_sha256"),
-            "reviewable": review.get("reviewable"),
-            "blocker": review.get("blocker"),
-            "blocking_conditions": review.get("blocking_conditions") or [],
-        }
+        return self.approval.state(kind, slot)
 
     def approval_chain(self, slot: int = 1) -> dict:
         """Approval validity INCLUDING upstream dependencies.
@@ -2957,91 +1965,7 @@ class PipelineService:
         the audit trail all stay exactly as they were -- this only reports that an
         approval no longer binds.
         """
-        plan_loaded = self.load_artifact("processing_plan")
-        plan = plan_loaded["data"] or {}
-        mode = (plan.get("decision") or {}).get("mode")
-        chain = ["processing_plan"]
-        if mode == source_strategy.MODE_NARRATED_THEORY:
-            chain += ["script", "voiceover"]
-        else:
-            # The caption text of a clip Short is as much a human decision as a
-            # narrated script is, so it belongs in the chain: correcting a word
-            # after approving the render must invalidate that render.
-            chain.append("transcript")
-        chain.append("render")
-
-        upstream_problems: list = []
-
-        # The moment selection is upstream of everything after the plan even
-        # though it is not an approvable "kind": a stale selection means the
-        # script/render were built from a moment that no longer exists.
-        selection = self.load_artifact("moment_selection", slot=slot)
-        hot = self.load_artifact("hot_moments")
-        selection_problem = None
-        if selection["problem"]:
-            selection_problem = f"moment_selection: {selection['problem']}"
-        elif selection["data"] and hot["data"]:
-            errors = video_analysis.validate_moment_selection(
-                selection["data"], hot["data"], require_preview=False)
-            if errors:
-                selection_problem = f"moment_selection bayat: {errors}"
-
-        states = {}
-        for kind in chain:
-            state = self.approval_state(kind, slot)
-            problems = list(upstream_problems)
-            if kind != "processing_plan" and selection_problem:
-                problems.append(selection_problem)
-            state["upstream_invalid"] = problems
-            state["effective_valid"] = bool(state.get("valid")) and not problems
-            if state.get("approved") and problems and state.get("valid"):
-                state["reason"] = (
-                    "Kendi icerigi degismedi ama YUKARI-AKIS degisti, bu yuzden bu onay "
-                    "artik gecerli sayilmiyor: " + "; ".join(problems)
-                )
-            # A render built from an older transcript revision is stale even when
-            # nothing upstream still holds an INVALID approval: editing a
-            # transcript clears its approval outright, so there is no
-            # "approved but no longer valid" upstream state left to notice, and
-            # a render approved before the edit would otherwise keep looking fine.
-            if kind == "render":
-                drift = self._render_transcript_drift(slot)
-                if drift:
-                    problems = list(problems) + [drift]
-                    state["upstream_invalid"] = problems
-                    state["effective_valid"] = False
-            states[kind] = state
-            if state.get("present") and not state.get("effective_valid") \
-                    and state.get("approved"):
-                upstream_problems.append(f"{kind} onayi gecersiz")
-            elif kind == "processing_plan" and not state.get("valid"):
-                upstream_problems.append("processing_plan onayi gecerli degil")
-
-        for kind in self.APPROVAL_ARTIFACTS:
-            states.setdefault(kind, {**self.approval_state(kind, slot),
-                                      "upstream_invalid": [], "effective_valid": False,
-                                      "in_chain": False})
-            states[kind].setdefault("in_chain", kind in chain)
-        return states
-
-    def _render_transcript_drift(self, slot: int):
-        """Message when the rendered video predates the current transcript.
-
-        Compares the digest the manifest recorded at render time with the
-        transcript's digest now. Manifests written before that digest existed
-        carry none and are NOT reported: claiming drift we cannot actually
-        observe would be worse than staying quiet about it.
-        """
-        manifest = self.load_artifact("render_manifest", slot=slot)["data"] or {}
-        recorded = (manifest.get("subtitles") or {}).get("transcript_content_sha256")
-        if not recorded:
-            return None
-        current = render_utils._transcript_digest(
-            self.load_artifact("moment_transcript", slot=slot)["data"] or {})
-        if current and current != recorded:
-            return ("transcript: render bu altyazi revizyonundan once uretildi; "
-                    "video guncel metni yansitmiyor")
-        return None
+        return self.approval.chain(slot)
 
     def invalidated_approvals(self) -> list:
         """Approvals that were granted but no longer bind -- their own content or
@@ -3053,73 +1977,30 @@ class PipelineService:
         Reported, never deleted: the audit trail of the original approval stays
         intact even after it stops being valid.
         """
-        stale = []
-        seen = set()
-        for index in self.slot_indexes():
-            for kind, state in self.approval_chain(index).items():
-                if not (state.get("approved") and not state.get("effective_valid")):
-                    continue
-                # Project-wide approvals (plan, script, voiceover) are identical
-                # for every slot; reporting them once per Short would turn one
-                # stale plan into N identical warnings.
-                marker = (kind, state.get("slot") if kind == "render" else None)
-                if marker in seen:
-                    continue
-                seen.add(marker)
-                stale.append(state)
-        return stale
+        return self.approval.invalidated()
 
     # ------------------------------------------------------------- phase gate
+    # Plan-derived eligibility + slot scope are owned by
+    # `application.services.WorkflowGate` (Milestone 9); these methods keep the
+    # public facade contract and delegate.
     def plan_gate(self, phase: str) -> tuple:
-        plan = self.load_artifact("processing_plan")
-        if plan["problem"]:
-            return False, plan["problem"]
-        return source_strategy.plan_allows_phase(plan["data"], phase)
+        return self.workflow_gate.plan_gate(phase)
 
     def require_phase(self, phase: str) -> None:
-        allowed, reason = self.plan_gate(phase)
-        if not allowed:
-            raise PipelineServiceError(reason)
+        self.workflow_gate.require_phase(phase)
 
     # ------------------------------------------------------------ output slots
     def slot_count(self) -> int:
-        """How many Shorts the APPROVED plan asks for (1 when there is no plan).
-
-        Read from `outputs` rather than `decision.output_count` so the slots the
-        engine walks are exactly the slots the plan describes, directories
-        included.
-        """
-        plan = self.load_artifact("processing_plan")["data"] or {}
-        slots = plan.get("outputs") or []
-        return max(1, len(slots))
+        return self.workflow_gate.slot_count()
 
     def slot_indexes(self) -> list:
-        return list(range(1, self.slot_count() + 1))
+        return self.workflow_gate.slot_indexes()
 
     def require_slot(self, slot: int) -> int:
-        """Reject a slot the approved plan does not define.
-
-        Without this an out-of-range slot would quietly create
-        `results/render/output_47/` and render a Short nobody planned -- outside
-        every count the plan, the batch board and the approval chain reason about.
-        """
-        try:
-            index = int(slot)
-        except (TypeError, ValueError):
-            raise PipelineServiceError(f"gecersiz cikti yuvasi: {slot!r}") from None
-        total = self.slot_count()
-        if not 1 <= index <= total:
-            raise PipelineServiceError(
-                f"cikti yuvasi {index} bu planda yok (plan {total} cikti tanimliyor)")
-        return index
+        return self.workflow_gate.require_slot(slot)
 
     def slot_moment_rank(self, slot: int):
-        """The moment rank this slot's plan entry pre-assigned, or None."""
-        plan = self.load_artifact("processing_plan")["data"] or {}
-        for entry in (plan.get("outputs") or []):
-            if int(entry.get("index") or 0) == int(slot):
-                return entry.get("moment_rank")
-        return None
+        return self.workflow_gate.slot_moment_rank(slot)
 
     # ------------------------------------------------------------ pipeline
     def run_video_analysis(self, *, clip_start_sec=0, clip_duration_sec=240,
@@ -3127,127 +2008,33 @@ class PipelineService:
                            custom_start_min=None, analysis_scope="window",
                            whisper_model_size="small", scene_detector="content",
                            top_n=5, job_id=None, actor="console") -> dict:
-        self.require_phase("video_analysis")
-        # The two scopes genuinely have different stages. Declaring the real ones
-        # keeps the panel honest: a window run must not display a "region" stage
-        # it will never enter, and a full scan must not be described as a single
-        # clip extraction.
-        tracker = self.tracker(
-            "video_analysis", job_id=job_id,
-            stages=FULL_SOURCE_ANALYSIS_STAGES if analysis_scope == "full_source" else None)
-        tracker.start("Video analizi basladi")
-        try:
-            assessment = self.load_artifact("source_assessment", required=True)
-            source_duration = (((assessment.get("data") or {}).get("source") or {})
-                               .get("duration_sec"))
-            if analysis_scope == "full_source":
-                return self._run_full_source_analysis(
-                    tracker, source_duration_sec=source_duration,
-                    whisper_model_size=whisper_model_size, scene_detector=scene_detector,
-                    top_n=top_n, job_id=job_id, actor=actor)
-            if analysis_scope != "window":
-                raise PipelineServiceError(
-                    f"bilinmeyen analiz kapsami: {analysis_scope!r} "
-                    "(beklenen: window, full_source)")
-            clip_start_sec, clip_duration_sec = video_analysis.resolve_analysis_range(
-                source_duration_sec=source_duration,
-                focus_region=focus_region,
-                clip_duration_min=clip_duration_min,
-                custom_start_min=custom_start_min,
-                clip_start_sec=clip_start_sec,
-                clip_duration_sec=clip_duration_sec,
-            )
-            return self._run_video_analysis(
-                tracker, clip_start_sec=clip_start_sec, clip_duration_sec=clip_duration_sec,
-                focus_region=focus_region, clip_duration_min=clip_duration_min,
-                custom_start_min=custom_start_min,
-                whisper_model_size=whisper_model_size, scene_detector=scene_detector,
-                top_n=top_n, job_id=job_id, actor=actor)
-        except Exception as exc:  # noqa: BLE001
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
+        """Phase 1 video analysis -> `hot_moments`. Delegate.
 
-    def _run_full_source_analysis(self, tracker, *, source_duration_sec,
-                                  whisper_model_size, scene_detector, top_n,
-                                  job_id, actor) -> dict:
-        """Scan the WHOLE source instead of one window.
-
-        A batch of N Shorts cut from one 240-second window would be N variations
-        of the same scene. Producing N genuinely different Shorts from a feature
-        film requires candidates from the whole film, which is what this scope is
-        for.
+        The orchestration (gate, progress, source resolution, engine call,
+        artifact write) lives in `application.services.VideoAnalysisService`;
+        the signature is unchanged so job dispatch, notebooks and verify
+        scripts keep working.
         """
-        if not source_duration_sec:
-            raise PipelineServiceError(
-                "Tam kaynak taramasi icin video suresi bilinmiyor; once kaynak "
-                "degerlendirmesini calistir.")
-        source = self.source_path()
-        ffmpeg_bin, _ = self.binaries()
-        runtime_dir = self.storage.resolve(self.ownership, RUNTIME_DIRNAME, create_parent=True)
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        preview_dir = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "moment_previews",
-                                            create_parent=True)
-        data = video_analysis.run_full_source_analysis(
-            ffmpeg_bin, source, runtime_dir,
-            source_duration_sec=float(source_duration_sec),
+        return self.video_analysis.run_analysis(
+            clip_start_sec=clip_start_sec, clip_duration_sec=clip_duration_sec,
+            focus_region=focus_region, clip_duration_min=clip_duration_min,
+            custom_start_min=custom_start_min, analysis_scope=analysis_scope,
             whisper_model_size=whisper_model_size, scene_detector=scene_detector,
-            top_n=top_n, preview_dir=preview_dir, progress=tracker,
-        )
-        self.write_artifact("hot_moments", data, job_id=job_id, actor=actor)
-        tracker.finish(
-            message=f"{len(data.get('hot_moments') or [])} aday moment "
-                    f"({(data.get('full_source_scan') or {}).get('regions_scanned', 0)} bolge)")
-        return data
-
-    def _run_video_analysis(self, tracker, *, clip_start_sec, clip_duration_sec,
-                            focus_region, clip_duration_min, custom_start_min,
-                            whisper_model_size, scene_detector, top_n, job_id, actor) -> dict:
-        source = self.source_path()
-        ffmpeg_bin, _ = self.binaries()
-        runtime_dir = self.storage.resolve(self.ownership, RUNTIME_DIRNAME, create_parent=True)
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        preview_dir = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "moment_previews",
-                                            create_parent=True)
-        data = video_analysis.run_video_analysis(
-            ffmpeg_bin, source, runtime_dir, clip_start_sec=clip_start_sec,
-            clip_duration_sec=clip_duration_sec, whisper_model_size=whisper_model_size,
-            scene_detector=scene_detector, top_n=top_n, preview_dir=preview_dir,
-            progress=tracker, adaptive_candidate_windows=True,
-        )
-        data["analysis_scope"] = "window"
-        if focus_region:
-            data.setdefault("candidate_request", {}).update({
-                "focus_region": focus_region,
-                "clip_duration_min": float(clip_duration_min),
-                "custom_start_min": (float(custom_start_min)
-                                     if focus_region == "custom" else None),
-                "resolved_start_sec": clip_start_sec,
-                "resolved_duration_sec": clip_duration_sec,
-            })
-        self.write_artifact("hot_moments", data, job_id=job_id, actor=actor)
-        tracker.finish(message=f"{len(data.get('hot_moments') or [])} aday moment")
-        return data
+            top_n=top_n, job_id=job_id, actor=actor)
 
     def record_moment_selection(self, *, selected_rank: int, reviewed_by: str,
                                 rejected_ranks=None, notes: str = "",
                                 require_preview: bool = True, slot: int = 1) -> dict:
-        self.require_phase("moment_selection")
-        self.require_slot(slot)
-        hot = self.load_artifact("hot_moments", required=True)
-        if hot["problem"]:
-            raise ArtifactProblem(hot["problem"])
-        taken = self.moment_rank_owner(selected_rank, slot)
-        if taken is not None:
-            raise PipelineServiceError(
-                f"rank {selected_rank} zaten {taken}. cikti yuvasi icin secilmis; "
-                "her Short farkli bir moment kullanmali")
-        selection = video_analysis.build_moment_selection(
-            hot["data"], selected_moment_rank=selected_rank, reviewed_by=reviewed_by,
-            rejected_moment_ranks=rejected_ranks, review_notes=notes,
-            require_preview=require_preview,
-        )
-        self.write_artifact("moment_selection", selection, actor=reviewed_by, slot=slot)
-        return selection
+        """Phase 2 moment selection -> `moment_selection`. Delegate.
+
+        The gate, rank-ownership check and canonical selection build live in
+        `application.services.MomentService` (Milestone 11); the signature is
+        unchanged so API routes, notebooks and verify scripts keep working.
+        """
+        return self.moment.record_moment_selection(
+            selected_rank=selected_rank, reviewed_by=reviewed_by,
+            rejected_ranks=rejected_ranks, notes=notes,
+            require_preview=require_preview, slot=slot)
 
     def moment_rank_owner(self, rank: int, slot: int):
         """Index of another slot that already selected `rank`, or None.
@@ -3256,13 +2043,7 @@ class PipelineService:
         rather than an intent, and it is invisible until both Shorts are rendered
         and watched. It is rejected at selection time, where the fix is one click.
         """
-        for other in self.slot_indexes():
-            if int(other) == int(slot):
-                continue
-            existing = self.load_artifact("moment_selection", slot=other)["data"]
-            if existing and existing.get("selected_moment_rank") == int(rank):
-                return int(other)
-        return None
+        return self.moment.moment_rank_owner(rank, slot)
 
     def run_script_generation(self, *, job_id=None, actor="console",
                               enable_google_model_fallback: bool = True,
@@ -3271,74 +2052,12 @@ class PipelineService:
         """Defaults keep the normal Route A behaviour. The three knobs exist so a
         deliberate single-call validation can pin the request to exactly one
         model, one attempt, zero retries."""
-        self.require_phase("script_generation")
-        tracker = self.tracker("script_generation", job_id=job_id)
-        tracker.start("Script uretimi basladi")
-        try:
-            return self._run_script_generation(
-                tracker, job_id=job_id, actor=actor,
-                enable_google_model_fallback=enable_google_model_fallback,
-                max_google_model_attempts=max_google_model_attempts,
-                max_google_transient_retries=max_google_transient_retries)
-        except Exception as exc:  # noqa: BLE001
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
-
-    def _run_script_generation(self, tracker, *, job_id, actor,
-                               enable_google_model_fallback,
-                               max_google_model_attempts,
-                               max_google_transient_retries) -> dict:
-        tracker.stage("preparation", "Moment secimi dogrulaniyor")
-        hot = self.load_artifact("hot_moments", required=True)
-        selection = self.load_artifact("moment_selection", required=True)
-        for loaded in (hot, selection):
-            if loaded["problem"]:
-                raise ArtifactProblem(loaded["problem"])
-        errors = video_analysis.validate_moment_selection(
-            selection["data"], hot["data"], require_preview=True)
-        if errors:
-            raise PipelineServiceError(f"moment secimi gecersiz/bayat: {errors}")
-
-        plan = self.load_artifact("processing_plan")["data"] or {}
-        decision = plan.get("decision") or {}
-        google_client = self._build_google_client()
-        tracker.stage("request", "Gemini yaniti bekleniyor")
-        result = script_generation.run_script_generation(
-            hot["data"], self.relative(self.path("hot_moments")),
-            selected_moment_rank=selection["data"]["selected_moment_rank"],
-            google_client=google_client,
-            openai_client=self._call(self._openai_client_factory),
-            anthropic_client=self._call(self._anthropic_client_factory),
-            target_duration_sec=decision.get("target_duration_sec", 60),
-            moment_approved=True, moment_approved_by=selection["data"]["reviewed_by"],
-            script_provider="google", allow_provider_fallback=False,
-            content_language=decision.get("content_language"),
-            theory_angle=decision.get("theory_angle") or "",
-            derive_theory_angle=bool(decision.get("theory_angle_auto")),
+        return self.script.run_script_generation(
+            job_id=job_id, actor=actor,
             enable_google_model_fallback=enable_google_model_fallback,
             max_google_model_attempts=max_google_model_attempts,
-            max_google_transient_retries=max_google_transient_retries,
-        )
-        tracker.stage("parse", "Yanit ayristirildi")
-        # A derived angle is the one the script was actually written to, so it
-        # wins over the plan's empty field. Which of the two it is stays visible
-        # in `theory_angle_source`.
-        result["theory_angle"] = (result.get("theory_angle")
-                                  or decision.get("theory_angle"))
-        result["theory_angle_auto"] = bool(decision.get("theory_angle_auto"))
-        result["content_language"] = decision.get("content_language")
-        tracker.stage("write", "Script artefakti yaziliyor")
-        self.write_artifact("selected_script", result, job_id=job_id, actor=actor)
-        self.audit.record("provider.call", actor=actor, job_id=job_id,
-                          detail={"phase": "script_generation",
-                                   "provider": result.get("provider"),
-                                   "model": result.get("model")})
-        if result.get("status") == "failed":
-            tracker.fail(result.get("status_reason") or "script uretilemedi")
-        else:
-            tracker.finish(message=f"{result.get('model') or 'model'} · "
-                                   f"{len(result.get('script_text') or '')} karakter")
-        return result
+            max_google_transient_retries=max_google_transient_retries)
+
 
     def run_tts(self, *, voice="Kore", language_code="tr-TR", narration_direction="",
                 job_id=None, actor="console",
@@ -3465,433 +2184,45 @@ class PipelineService:
         return self.glossary_view()
 
     # ----------------------------------------------------- transcript edits
-    def _transcript_artifact(self, slot: int) -> tuple:
-        """The slot's transcript upgraded to the revision-aware shape.
-
-        Upgrading on READ rather than migrating on disk is what keeps projects
-        that predate revisions working: nothing is rewritten until the user
-        actually edits, and an untouched old project stays byte-identical.
-        """
-        loaded = self.load_artifact("moment_transcript", required=True, slot=slot)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        return transcript_edit.ensure_v2(loaded["data"] or {}), loaded
-
+    # ----------------------------------------------------- transcript edits
+    # Transcript lifecycle lives in `application.services.TranscriptService`
+    # (Milestone 12). The methods below are compatibility delegates; the
+    # private helpers (_transcript_artifact, _apply_transcript_corrections,
+    # _archive_replaced_transcript, _record_glossary_suggestions_from_edit)
+    # moved with it.
     def transcript_segments(self, slot: int = 1) -> list:
-        artifact, _ = self._transcript_artifact(slot)
-        return transcript_edit.build_segments(
-            artifact,
-            low_confidence_threshold=render_utils.LOW_CONFIDENCE_WORD_THRESHOLD)
+        return self.transcript.transcript_segments(slot)
 
     def save_transcript_edits(self, *, segments=None, full_text=None,
                               edited_by: str, slot: int = 1) -> dict:
-        """Persist a human edit as a NEW REVISION over the same timings.
-
-        Exactly one of `segments` or `full_text` is accepted. Both paths end in
-        the same per-segment application, so the whole-transcript textarea
-        cannot take a shortcut that the row editor does not.
-        """
-        slot = self.require_slot(slot)
-        if (segments is None) == (full_text is None):
-            raise PipelineServiceError(
-                "ya segment listesi ya da tam metin verilmeli (ikisi birden degil)")
-        artifact, _loaded = self._transcript_artifact(slot)
-        previous_sha = transcript_edit.content_sha256(artifact)
-
-        if full_text is not None:
-            pairs = transcript_edit.parse_full_text(
-                artifact, full_text,
-                low_confidence_threshold=render_utils.LOW_CONFIDENCE_WORD_THRESHOLD)
-        else:
-            pairs = []
-            for item in (segments or []):
-                identifier = str((item or {}).get("id") or "").strip()
-                if not identifier:
-                    raise PipelineServiceError("segment id'si eksik")
-                pairs.append((identifier, (item or {}).get("text")))
-
-        problems = transcript_edit.validate_segment_texts(pairs)
-        if problems:
-            raise PipelineServiceError("; ".join(problems[:6]))
-
-        applied = transcript_edit.apply_segment_texts(artifact, pairs)
-        if not applied["changed_segment_ids"]:
-            # Nothing changed: writing a revision would claim an edit that did
-            # not happen and would drop a still-valid approval.
-            return self.transcript_view(slot)
-
-        rebuilt = render_utils.build_moment_transcript_artifact(
-            applied["words"], applied["cues"],
-            source=artifact.get("source"), language=artifact.get("language"),
-            moment_rank=artifact.get("moment_rank"),
-            moment_selection_sha256=artifact.get("moment_selection_sha256"),
-            whisper_model_size=artifact.get("whisper_model_size"),
-            initial_prompt_used=artifact.get("initial_prompt_used"),
-            corrections=artifact.get("corrections"),
-            asr=artifact.get("asr"),
-            revisions=artifact.get("revisions"),
-            edited_segment_ids=artifact.get("edited_segment_ids"),
-            glossary_context=artifact.get("glossary_context"))
-        rebuilt = transcript_edit.append_revision(
-            rebuilt, actor=edited_by,
-            kind=("full_text_edit" if full_text is not None else "segment_edit"),
-            previous_sha256=previous_sha,
-            changed_segment_ids=applied["changed_segment_ids"])
-
-        relative = self.write_artifact("moment_transcript", rebuilt,
-                                       actor=edited_by, slot=slot)
-        # Identifiers and counts only -- never the transcript text. A caption is
-        # the user's content and the audit log is not where it should be copied.
-        self.audit.record(
-            "artifact.written", actor=edited_by, artifact=relative,
-            detail={"slot": slot, "revision": rebuilt.get("revision"),
-                    "changed_segments": applied["changed_segment_ids"],
-                    "changed_count": len(applied["changed_segment_ids"]),
-                    "edit_kind": ("full_text" if full_text is not None else "segment")})
-
-        # A manual fix is also vocabulary: offer to remember the new spelling so
-        # the NEXT transcription gets it right at recognition time.
-        self._record_glossary_suggestions_from_edit(
-            artifact, rebuilt, applied["changed_segment_ids"], actor=edited_by)
-        return self.transcript_view(slot)
+        return self.transcript.save_transcript_edits(
+            segments=segments, full_text=full_text, edited_by=edited_by,
+            slot=slot)
 
     def set_transcript_exclusions(self, *, segment_ids, excluded: bool,
                                   actor: str, slot: int = 1) -> dict:
-        """Keep selected vocals reviewable while excluding them from captions."""
-        slot = self.require_slot(slot)
-        artifact, _loaded = self._transcript_artifact(slot)
-        previous_sha = transcript_edit.content_sha256(artifact)
-        try:
-            applied = transcript_edit.apply_segment_exclusions(
-                artifact, segment_ids, excluded=excluded)
-        except transcript_edit.TranscriptEditError as exc:
-            raise PipelineServiceError(str(exc)) from exc
-        if not applied["changed_segment_ids"]:
-            return self.transcript_view(slot)
-        rebuilt = render_utils.build_moment_transcript_artifact(
-            applied["words"], applied["cues"],
-            source=artifact.get("source"), language=artifact.get("language"),
-            moment_rank=artifact.get("moment_rank"),
-            moment_selection_sha256=artifact.get("moment_selection_sha256"),
-            whisper_model_size=artifact.get("whisper_model_size"),
-            initial_prompt_used=artifact.get("initial_prompt_used"),
-            corrections=artifact.get("corrections"), asr=artifact.get("asr"),
-            revisions=artifact.get("revisions"),
-            edited_segment_ids=artifact.get("edited_segment_ids"),
-            glossary_context=artifact.get("glossary_context"))
-        rebuilt = transcript_edit.append_revision(
-            rebuilt, actor=actor,
-            kind=("subtitle_exclusion" if excluded else "subtitle_inclusion"),
-            previous_sha256=previous_sha,
-            changed_segment_ids=applied["changed_segment_ids"])
-        relative = self.write_artifact("moment_transcript", rebuilt,
-                                       actor=actor, slot=slot)
-        self.audit.record(
-            "artifact.written", actor=actor, artifact=relative,
-            detail={"slot": slot, "caption_excluded": bool(excluded),
-                    "changed_segments": applied["changed_segment_ids"]})
-        return self.transcript_view(slot)
-
-    def _record_glossary_suggestions_from_edit(self, before, after, changed_ids,
-                                               *, actor: str) -> None:
-        threshold = render_utils.LOW_CONFIDENCE_WORD_THRESHOLD
-        old_map = {segment["id"]: segment["text"] for segment in
-                   transcript_edit.build_segments(before, low_confidence_threshold=threshold)}
-        new_map = {segment["id"]: segment["text"] for segment in
-                   transcript_edit.build_segments(after, low_confidence_threshold=threshold)}
-        record = self.glossary()
-        proposals = []
-        for identifier in changed_ids:
-            old_tokens = str(old_map.get(identifier, "")).split()
-            new_tokens = str(new_map.get(identifier, "")).split()
-            # Word-for-word replacements are the ones that name something; a
-            # wholesale rewrite is a sentence fix, not a proper noun.
-            if old_tokens and len(old_tokens) == len(new_tokens):
-                # ADJACENT changed words are ONE name, not several. Suggesting
-                # them separately turned "Steelers Rider!" -> "Sheepstealer's
-                # rider" into the term "Sheepstealer's", losing the half that
-                # makes it a name -- and "rider" alone is dropped as an ordinary
-                # lowercase word, so the phrase the human actually taught was
-                # never offered back.
-                changed = [index for index, (old_token, new_token)
-                           in enumerate(zip(old_tokens, new_tokens))
-                           if old_token != new_token]
-                for run in _contiguous_runs(changed):
-                    start, stop = run[0], run[-1] + 1
-                    proposals.extend(glossary_module.suggest_terms_from_correction(
-                        " ".join(old_tokens[start:stop]),
-                        " ".join(new_tokens[start:stop]), record))
-            elif new_tokens:
-                proposals.extend(glossary_module.suggest_terms_from_correction(
-                    " ".join(old_tokens), " ".join(new_tokens), record))
-        if not proposals:
-            return
-        record = glossary_module.record_suggestions(record, proposals, actor=actor)
-        self.write_artifact("glossary", record, actor=actor)
+        return self.transcript.set_transcript_exclusions(
+            segment_ids=segment_ids, excluded=excluded, actor=actor, slot=slot)
 
     def restore_transcript_from_asr(self, *, actor: str, slot: int = 1) -> dict:
-        """Put the recogniser's own output back as the current content.
-
-        Possible only because `asr` was never overwritten. Recorded as a
-        revision like any other edit, so the history shows the revert instead of
-        looking like the manual work never happened.
-        """
-        slot = self.require_slot(slot)
-        artifact, _ = self._transcript_artifact(slot)
-        raw = artifact.get("asr") or {}
-        if not (raw.get("words") or raw.get("cues")):
-            raise PipelineServiceError("bu transkript icin saklanmis ham ASR ciktisi yok")
-        previous_sha = transcript_edit.content_sha256(artifact)
-        rebuilt = render_utils.build_moment_transcript_artifact(
-            [dict(word) for word in (raw.get("words") or [])],
-            [dict(cue) for cue in (raw.get("cues") or [])],
-            source=artifact.get("source"), language=artifact.get("language"),
-            moment_rank=artifact.get("moment_rank"),
-            moment_selection_sha256=artifact.get("moment_selection_sha256"),
-            whisper_model_size=artifact.get("whisper_model_size"),
-            initial_prompt_used=artifact.get("initial_prompt_used"),
-            corrections=[], asr=raw, revisions=artifact.get("revisions"),
-            edited_segment_ids=[], glossary_context=artifact.get("glossary_context"))
-        rebuilt = transcript_edit.append_revision(
-            rebuilt, actor=actor, kind="restore_asr",
-            previous_sha256=previous_sha, changed_segment_ids=[])
-        relative = self.write_artifact("moment_transcript", rebuilt, actor=actor, slot=slot)
-        self.audit.record("artifact.written", actor=actor, artifact=relative,
-                          detail={"slot": slot, "revision": rebuilt.get("revision"),
-                                  "edit_kind": "restore_asr"})
-        return self.transcript_view(slot)
+        return self.transcript.restore_transcript_from_asr(actor=actor, slot=slot)
 
     def transcript_view(self, slot: int = 1) -> dict:
-        """A curated slice for the caption screen.
-
-        The raw artifact carries every word with its timings; dumping that into
-        the page would bury the two things a reviewer needs -- the text, and
-        which words the recogniser was unsure about.
-        """
-        slot = int(slot or 1)
-        loaded = self.load_artifact("moment_transcript", slot=slot)
-        data = loaded["data"] or {}
-        allowed, gate_reason = self.plan_gate("transcript")
-        state = self.approval_state("transcript", slot) if data else {}
-        selection = self.load_artifact("moment_selection", slot=slot)["data"] or {}
-        upgraded = transcript_edit.ensure_v2(data) if data else {}
-        segments = (transcript_edit.build_segments(
-            upgraded, low_confidence_threshold=render_utils.LOW_CONFIDENCE_WORD_THRESHOLD)
-            if data else [])
-        suggestions = (glossary_module.suggest_for_text(
-            upgraded.get("text") or "", self.glossary(),
-            low_confidence_terms=[w.get("text") for w in
-                                  (upgraded.get("low_confidence_words") or [])])
-            if data else [])
-        return {
-            "slot": slot,
-            "available": bool(data),
-            **transcript_edit.revision_summary(upgraded),
-            "problem": loaded["problem"],
-            "phase_allowed": bool(allowed),
-            "phase_reason": gate_reason,
-            "moment_rank": data.get("moment_rank") or selection.get("selected_moment_rank"),
-            "status": data.get("status"),
-            "status_reason": data.get("status_reason"),
-            "language": data.get("language"),
-            "whisper_model_size": data.get("whisper_model_size"),
-            "source": data.get("source"),
-            "text": data.get("text"),
-            "word_count": data.get("word_count"),
-            "cue_count": data.get("cue_count"),
-            "excluded_cue_count": sum(
-                bool(cue.get("excluded_from_subtitles"))
-                for cue in (data.get("cues") or [])),
-            "has_speech": data.get("has_speech"),
-            "average_word_probability": data.get("average_word_probability"),
-            "low_confidence_words": data.get("low_confidence_words") or [],
-            "low_confidence_count": data.get("low_confidence_count"),
-            "corrections": data.get("corrections") or [],
-            # The whole transcript, in order, one editable row per caption line.
-            # A summary was all this screen used to show, so a misheard proper
-            # noun could not be seen -- let alone fixed -- before it was burned
-            # into the video.
-            "segments": segments,
-            "full_text": transcript_edit.segments_to_text(segments),
-            "limits": {"max_segment_chars": transcript_edit.MAX_SEGMENT_CHARS,
-                       "max_total_chars": transcript_edit.MAX_TOTAL_CHARS},
-            "glossary": self.glossary_view(),
-            "glossary_context": data.get("glossary_context") or {},
-            "suggestions": suggestions,
-            # Words carry the highlight timings, so the page can show the caption
-            # the way it will actually appear, with unsure words marked.
-            "words": [
-                {"text": w.get("text"), "start_sec": w.get("start"),
-                 "probability": w.get("probability"),
-                 "low_confidence": float(w.get("probability") or 0.0)
-                                   < render_utils.LOW_CONFIDENCE_WORD_THRESHOLD,
-                 "corrected": bool(w.get("corrected"))}
-                for w in (data.get("words") or [])[:2000]
-            ],
-            "approval": state,
-        }
+        return self.transcript.transcript_view(slot)
 
     def run_transcript(self, *, subtitle_whisper_model_size="small",
                        subtitle_language="auto", caption_theme="auto",
                        job_id=None, actor="console", slot=1) -> dict:
-        """Transcribe the selected moment's ORIGINAL audio for human review.
+        return self.transcript.run_transcript(
+            subtitle_whisper_model_size=subtitle_whisper_model_size,
+            subtitle_language=subtitle_language, caption_theme=caption_theme,
+            job_id=job_id, actor=actor, slot=slot)
 
-        This is `direct_clip_series`'s caption step. It calls no provider: the
-        text is what the source already says, recognised locally. Existing
-        corrections are carried over, because re-running the recognition should
-        not silently discard the names a human already fixed.
-        """
-        self.require_phase("transcript")
-        slot = self.require_slot(slot)
-        tracker = self.tracker("transcript", job_id=job_id)
-        tracker.start("Transkript uretimi basladi")
-        try:
-            hot = self.load_artifact("hot_moments", required=True)
-            selection = self.load_artifact("moment_selection", required=True, slot=slot)
-            for loaded in (hot, selection):
-                if loaded["problem"]:
-                    raise ArtifactProblem(loaded["problem"])
-            previous = self.load_artifact("moment_transcript", slot=slot)["data"] or {}
-            runtime_dir = self.storage.resolve(self.ownership, RUNTIME_DIRNAME,
-                                               create_parent=True)
-            artifact = render_utils.run_moment_transcription(
-                hot["data"], selection["data"], runtime_dir,
-                subtitle_whisper_model_size=subtitle_whisper_model_size,
-                subtitle_language=subtitle_language, caption_theme=caption_theme,
-                source_video_path_override=str(self.source_path()),
-                glossary=self.glossary(),
-                progress=tracker)
-            carried = [
-                {"from": item.get("from"), "to": item.get("to")}
-                for item in (previous.get("corrections") or [])
-                if item.get("from") and item.get("to")
-            ]
-            if carried:
-                artifact = self._apply_transcript_corrections(artifact, carried)
-                tracker.note(f"{len(carried)} onceki duzeltme yeniden uygulandi")
-            # Word-level corrections survive a re-run, but SEGMENT-level manual
-            # work does not: the new recognition has its own words, timings and
-            # segment boundaries, so a hand-rewritten line cannot be replayed
-            # onto it honestly. Dropping it silently is the one thing that must
-            # not happen, so the previous artifact is archived into
-            # revisions/<id>/ first and the new one records what was set aside
-            # and where to find it.
-            artifact = self._archive_replaced_transcript(
-                previous, artifact, slot=slot, actor=actor, tracker=tracker)
-            self.write_artifact("moment_transcript", artifact, job_id=job_id,
-                                actor=actor, slot=slot)
-            # Audited only once the replacement is safely on disk. Archiving
-            # MOVES the old file, so anything that raises between the move and
-            # the write would leave the slot with no transcript at all -- which
-            # is exactly the silent loss this whole branch exists to prevent.
-            replaced = artifact.get("replaced_manual_edit")
-            if replaced:
-                self.audit.record(
-                    "transcript.manual_edits_archived", actor=actor, job_id=job_id,
-                    detail={"slot": slot, "revision_id": replaced["revision_id"],
-                            "edited_segment_ids": replaced["edited_segment_ids"]})
-            tracker.finish(message=(f"{artifact['word_count']} kelime, inceleme bekliyor"
-                                    if artifact["has_speech"] else "konusma yok"))
-            return artifact
-        except Exception as exc:  # noqa: BLE001
-            tracker.fail(f"{type(exc).__name__}: {exc}")
-            raise
+    def set_transcript_corrections(self, *, corrections, edited_by: str,
+                                   slot: int = 1) -> dict:
+        return self.transcript.set_transcript_corrections(
+            corrections=corrections, edited_by=edited_by, slot=slot)
 
-    def _archive_replaced_transcript(self, previous, artifact, *, slot, actor,
-                                      tracker=None) -> dict:
-        """Preserve a hand-edited transcript that a re-run is about to replace.
-
-        Returns the new artifact, annotated with `replaced_manual_edit` when
-        something was archived. A previous pass that only ever held recogniser
-        output is replaced without ceremony -- there is no human work to lose.
-        """
-        edited_ids = list((previous or {}).get("edited_segment_ids") or [])
-        history = list((previous or {}).get("revisions") or [])
-        if not edited_ids and not history:
-            return artifact
-        revision = self._archive_revision(
-            [self.artifact_relative("moment_transcript", slot)],
-            action="retranscribe", actor=actor, target=f"transcript_slot_{slot}")
-        record = dict(artifact)
-        record["replaced_manual_edit"] = {
-            "revision_id": revision["revision_id"],
-            "archived_path": f"revisions/{revision['revision_id']}/",
-            "edited_segment_ids": edited_ids,
-            "revision_count": len(history),
-            "previous_content_sha256": transcript_edit.content_sha256(
-                transcript_edit.ensure_v2(previous)),
-            "note": ("Yeniden transkripsiyon elle duzenlenmis segmentleri "
-                      "TASIMAZ; onceki surum arsivlendi ve geri alinabilir."),
-        }
-        if tracker is not None:
-            tracker.note(
-                f"{len(edited_ids)} elle duzenlenmis segment tasinmadi; onceki surum "
-                f"revisions/{revision['revision_id']}/ altina arsivlendi")
-        return record
-
-    def _apply_transcript_corrections(self, artifact: dict, corrections) -> dict:
-        """Re-derive the corrected text from the ORIGINAL recognition.
-
-        Corrections are always applied to the untouched recognition rather than
-        on top of a previous pass, so removing a correction really removes it
-        instead of leaving its effect baked in.
-        """
-        base_words = [
-            {k: v for k, v in word.items() if k != "corrected"}
-            for word in (artifact.get("words") or [])
-        ]
-        # The v2 fields have to be carried through. Rebuilding without `asr`
-        # makes the builder seed a FRESH snapshot from the already-corrected
-        # words, so "restore the raw recognition" would hand back the
-        # corrections instead of what was actually heard -- and the revision
-        # history, the edited-segment set and the glossary context would vanish
-        # with it. Every other caller passes these; this one did not.
-        rebuilt = render_utils.build_moment_transcript_artifact(
-            base_words, artifact.get("cues") or [],
-            source=artifact.get("source"), language=artifact.get("language"),
-            moment_rank=artifact.get("moment_rank"),
-            moment_selection_sha256=artifact.get("moment_selection_sha256"),
-            whisper_model_size=artifact.get("whisper_model_size"),
-            initial_prompt_used=artifact.get("initial_prompt_used"),
-            corrections=corrections, asr=artifact.get("asr"),
-            revisions=artifact.get("revisions"),
-            edited_segment_ids=artifact.get("edited_segment_ids"),
-            glossary_context=artifact.get("glossary_context"))
-        return rebuilt
-
-    def set_transcript_corrections(self, *, corrections, edited_by: str, slot: int = 1) -> dict:
-        """Replace this slot's correction list and re-derive the caption text.
-
-        Any existing approval is dropped by construction: the approval hash
-        covers the words, so changed words cannot stay approved.
-        """
-        slot = self.require_slot(slot)
-        loaded = self.load_artifact("moment_transcript", required=True, slot=slot)
-        if loaded["problem"]:
-            raise ArtifactProblem(loaded["problem"])
-        cleaned = []
-        for item in (corrections or []):
-            source = str((item or {}).get("from") or "").strip()
-            target = str((item or {}).get("to") or "").strip()
-            if not source or not target:
-                continue
-            if len(source) > 80 or len(target) > 80:
-                raise PipelineServiceError("duzeltme kelimeleri 80 karakteri gecemez")
-            cleaned.append({"from": source, "to": target})
-        if len(cleaned) > 100:
-            raise PipelineServiceError("en fazla 100 duzeltme tanimlanabilir")
-        previous = transcript_edit.ensure_v2(loaded["data"])
-        artifact = self._apply_transcript_corrections(previous, cleaned)
-        # Recorded like any other edit, so the legacy word-level path shows up in
-        # the same history as the segment editor instead of changing the text
-        # invisibly.
-        artifact = transcript_edit.append_revision(
-            artifact, actor=edited_by, kind="corrections",
-            previous_sha256=transcript_edit.content_sha256(previous))
-        relative = self.write_artifact("moment_transcript", artifact, actor=edited_by, slot=slot)
-        self.audit.record("artifact.written", actor=edited_by, artifact=relative,
-                          detail={"corrections": len(cleaned), "slot": slot})
-        return artifact
 
     def run_render(self, *, render_mode="blurred_background", preview_mode=True,
                    subtitle_whisper_model_size="small", subtitle_language="auto",
@@ -4162,85 +2493,41 @@ class PipelineService:
         }
 
     # ------------------------------------------------------------- faz 2 scene editor
+    # EDL use cases are owned by `application.services.EditorService`; these
+    # methods keep the public facade contract and delegate.
     def build_edl(self, *, source_path: str | None = None,
                   source_duration: float, title: str = "", actor="console") -> dict:
-        if source_path is None:
-            source_path = str(self.source_path())
-        edl = scene_editor.build_edl(
-            source_path, source_duration, title=title,
-            width=1080, height=1920,
-        )
-        artifact = scene_editor.edl_to_artifact(edl)
-        relative = self.write_artifact("edl", artifact, actor=actor)
-        self.audit.record("edl.created", actor=actor, artifact=relative,
-                          detail={"title": title, "duration": source_duration})
-        return artifact
+        return self.editor.create_edl(source_path=source_path,
+                                      source_duration=source_duration,
+                                      title=title, actor=actor)
 
     def load_edl(self) -> scene_editor.EDL:
-        record = self.load_artifact("edl", required=True)
-        if record["problem"]:
-            raise ArtifactProblem(record["problem"])
-        return scene_editor.edl_from_artifact(record["data"])
+        return self.editor.load_edl()
 
     def update_edl_clip(self, clip_index: int, *, start=None, end=None,
                         crop=None, zoom=None, caption_style=None,
-                        add_b_roll=None, actor="console") -> dict:
-        edl = self.load_edl()
-        if clip_index < 0 or clip_index >= len(edl.clips):
-            raise PipelineServiceError(f"gecersiz klip indeksi: {clip_index}")
-        clip = edl.clips[clip_index]
-        if start is not None and end is not None:
-            clip = scene_editor.trim_clip(clip, start, end)
-        if crop is not None:
-            clip = scene_editor.crop_clip(clip, **crop)
-        if zoom is not None:
-            clip = scene_editor.zoom_clip(clip, **zoom)
-        if caption_style is not None:
-            clip = scene_editor.set_caption_style(clip, scene_editor.CaptionStyle(**caption_style))
-        if add_b_roll is not None:
-            clip = scene_editor.add_b_roll(clip, scene_editor.BRoll(**add_b_roll))
-        edl.clips[clip_index] = clip
-        artifact = scene_editor.edl_to_artifact(edl)
-        relative = self.write_artifact("edl", artifact, actor=actor)
-        self.audit.record("edl.updated", actor=actor, artifact=relative,
-                          detail={"clip_index": clip_index})
-        return artifact
+                        b_roll=None, add_b_roll=None, actor="console") -> dict:
+        return self.editor.update_clip(
+            clip_index, start=start, end=end, crop=crop, zoom=zoom,
+            caption_style=caption_style, b_roll=b_roll,
+            add_b_roll=add_b_roll, actor=actor)
 
     def set_edl_music(self, music_path: str, actor="console") -> dict:
-        edl = self.load_edl()
-        edl = scene_editor.set_music_track(edl, music_path)
-        artifact = scene_editor.edl_to_artifact(edl)
-        relative = self.write_artifact("edl", artifact, actor=actor)
-        self.audit.record("edl.music_set", actor=actor, artifact=relative,
-                          detail={"music_path": music_path})
-        return artifact
+        return self.editor.set_music(music_path, actor=actor)
 
     def build_edl_preview(self, output_name: str = "preview.mp4") -> list[str]:
-        edl = self.load_edl()
-        if not edl.is_valid():
-            raise PipelineServiceError("EDL gecerli degil")
-        render_dir = self.storage.resolve(self.ownership, RESULTS_DIRNAME, "render",
-                                          create_parent=True)
-        output = render_dir / output_name
-        return scene_editor.build_preview_command(edl, output)
+        return self.editor.build_preview_command(output_name)
 
     def add_edl_clip(self, *, source_path: str, source_start_sec: float = 0.0,
                      source_end_sec: float, actor="console") -> dict:
-        edl = self.load_edl()
-        new_clip = scene_editor.EDLClip(
-            clip_id=f"clip_{len(edl.clips)+1:03d}",
-            source_path=source_path,
-            source_start_sec=source_start_sec,
-            source_end_sec=source_end_sec,
-        )
-        edl = scene_editor.add_clip_to_edl(edl, new_clip)
-        artifact = scene_editor.edl_to_artifact(edl)
-        relative = self.write_artifact("edl", artifact, actor=actor)
-        self.audit.record("edl.clip_added", actor=actor, artifact=relative,
-                          detail={"clip_id": new_clip.clip_id})
-        return artifact
+        return self.editor.add_clip(source_path=source_path,
+                                    source_start_sec=source_start_sec,
+                                    source_end_sec=source_end_sec, actor=actor)
 
     def render_edl_preview(self, output_name: str = "preview.mp4") -> dict:
+        # Render EXECUTION stays in the facade until a RenderService exists: it
+        # resolves the ffmpeg binary and spawns a subprocess. The editor service
+        # owns only the deterministic command compilation (build_edl_preview).
         edl = self.load_edl()
         if not edl.is_valid():
             raise PipelineServiceError("EDL gecerli degil")
@@ -4249,6 +2536,13 @@ class PipelineService:
         output = render_dir / output_name
         ffmpeg_bin, _ = self.binaries()
         return scene_editor.render_preview(edl, output, ffmpeg_bin=ffmpeg_bin)
+
+    def request_edl_revision(self, *, notes: str, requested_by: str = "console") -> dict:
+        return self.editor.request_revision(notes=notes,
+                                            requested_by=requested_by)
+
+    def resolve_edl_revision(self, *, resolved_by: str = "console") -> dict:
+        return self.editor.resolve_revision(resolved_by=resolved_by)
 
     def _describe_media(self, path) -> dict:
         info = {"relative_path": None, "size_bytes": 0, "usable": False, "problem": None}

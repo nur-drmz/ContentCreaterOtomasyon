@@ -33,3 +33,9 @@ debug.log
 .console_data*/
 source_videos/
 cache/
+
+# Local console runtime namespace (project records, audit trails, progress)
+data/
+
+# Frontend dependencies
+node_modules/
