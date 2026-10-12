@@ -798,6 +798,7 @@ class ConsoleApi:
                 crop=payload.get("crop"),
                 zoom=payload.get("zoom"),
                 caption_style=payload.get("caption_style"),
+                b_roll=payload.get("b_roll"),
                 add_b_roll=payload.get("add_b_roll"),
                 actor=_header(headers, "x-actor") or payload.get("actor") or "console",
             )}
@@ -820,6 +821,14 @@ class ConsoleApi:
             return 200, service.render_edl_preview(
                 output_name=payload.get("output_name", "preview.mp4"),
             )
+
+        if rest == ["edl", "revision"] and method == "POST":
+            payload = _json_body(body)
+            return 200, {"edl": service.request_edl_revision(
+                notes=_required(payload, "notes"),
+                requested_by=_header(headers, "x-actor")
+                                 or payload.get("actor") or "console",
+            )}
 
         # ------------------------------------------------- trend ingest routes
         if rest == ["source-candidates"] and method == "POST":

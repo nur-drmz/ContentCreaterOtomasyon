@@ -95,6 +95,60 @@ def test_preview_filtergraph_multi_clip_and_broll():
     assert total_inputs == 3  # 2 clips + 1 broll
 
 
+def test_preview_filtergraph_labels_are_unique():
+    """Every clip needs its own pads; duplicates make ffmpeg reject the graph."""
+    edl = scene_editor.build_edl("source.mp4", 60.0)
+    edl = scene_editor.add_clip_to_edl(edl, scene_editor.EDLClip(
+        clip_id="clip_002", source_path="source.mp4",
+        source_start_sec=30.0, source_end_sec=45.0,
+    ))
+    graph, _ = scene_editor.build_preview_filtergraph(edl)
+    labels = [stmt.rsplit("[", 1)[-1].rstrip("]")
+              for stmt in graph.split(";")]
+    assert len(labels) == len(set(labels)), graph
+    assert "[framed]" not in graph
+
+
+def test_preview_filtergraph_normalises_streams_before_concat():
+    """concat refuses links whose SAR/fps/size differ across clips."""
+    edl = scene_editor.build_edl("source.mp4", 60.0)
+    edl.clips[0] = scene_editor.zoom_clip(edl.clips[0], scale=1.5)
+    edl = scene_editor.add_clip_to_edl(edl, scene_editor.EDLClip(
+        clip_id="clip_002", source_path="source.mp4",
+        source_start_sec=30.0, source_end_sec=45.0,
+    ))
+    graph, _ = scene_editor.build_preview_filtergraph(edl)
+    assert graph.count("setsar=1") == 2
+    assert graph.count(f"fps={scene_editor.PREVIEW_FPS}") == 2
+
+
+def test_preview_filtergraph_draws_caption_at_requested_position():
+    edl = scene_editor.build_edl("source.mp4", 60.0)
+    edl.clips[0] = scene_editor.set_caption_style(edl.clips[0], scene_editor.CaptionStyle(
+        position_x=0.25, position_y=0.4, word_color="&H0000FFFF",
+        font_size=48, alignment="left", border_width=3, shadow=True,
+        sample_text="Atolye",
+    ))
+    graph, _ = scene_editor.build_preview_filtergraph(edl)
+    assert "drawtext=text='Atolye'" in graph
+    assert "x=w*0.2500" in graph
+    assert "y=h*0.4000-text_h/2" in graph
+    assert "fontcolor=0xFFFF00" in graph
+    assert "fontsize=48" in graph
+    assert "borderw=3" in graph
+    assert "shadowx=2" in graph
+
+
+def test_preview_filtergraph_places_broll_at_requested_position():
+    edl = scene_editor.build_edl("source.mp4", 60.0)
+    edl.clips[0] = scene_editor.add_b_roll(edl.clips[0], scene_editor.BRoll(
+        media_path="broll.mp4", start_sec=0.0, duration_sec=4.0,
+        position_x=0.75, position_y=0.2,
+    ))
+    graph, _ = scene_editor.build_preview_filtergraph(edl)
+    assert "overlay=main_w*0.7500-overlay_w/2:main_h*0.2000-overlay_h/2" in graph
+
+
 def test_preview_command_built():
     edl = scene_editor.build_edl("source.mp4", 60.0)
     cmd = scene_editor.build_preview_command(edl, "preview.mp4")

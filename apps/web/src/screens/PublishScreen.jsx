@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-const API_ROOT = import.meta.env.VITE_API_ROOT || 'http://127.0.0.1:8000';
+const API_ROOT = import.meta.env.VITE_API_ROOT ?? '';
 
 export default function PublishScreen() {
   const [projectId, setProjectId] = useState('prj_1');

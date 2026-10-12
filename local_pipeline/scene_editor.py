@@ -59,10 +59,30 @@ class CaptionStyle:
     margin_v: int = 50
     word_color: str = "&H00FFFFFF"
     active_color: str = "&H0000FFFF"
+    position_x: float = 0.5
+    position_y: float = 0.9
+    outline_color: str = "&H00000000"
+    box_color: str = "&H00000000"
+    alignment: str = "center"
+    font: str = "DejaVu Sans"
+    shadow: bool = False
+    border_width: int = 0
+    uppercase: bool = False
+    sample_text: str = "Caption Ornegi"
 
     def is_valid(self) -> bool:
         presets = ("active_word_yellow", "classic_white", "lower_third")
-        return self.preset in presets
+        if self.preset not in presets:
+            return False
+        if not (0.0 <= self.position_x <= 1.0 and 0.0 <= self.position_y <= 1.0):
+            return False
+        if self.alignment not in ("left", "center", "right"):
+            return False
+        if not self.font:
+            return False
+        if self.border_width < 0:
+            return False
+        return True
 
 
 @dataclass
@@ -72,12 +92,16 @@ class BRoll:
     duration_sec: float = 0.0
     position: str = "overlay"  # overlay, split_screen
     opacity: float = 0.7
+    position_x: float = 0.5
+    position_y: float = 0.5
 
     def is_valid(self) -> bool:
         return (
             self.media_path
             and self.duration_sec > 0.0
             and 0.0 <= self.opacity <= 1.0
+            and 0.0 <= self.position_x <= 1.0
+            and 0.0 <= self.position_y <= 1.0
         )
 
 
@@ -194,6 +218,9 @@ def trim_clip(clip: EDLClip, start: float, end: float,
 
 
 MIN_CLIP_DURATION_SEC = 0.2
+
+#: Preview streams are forced to one frame rate; concat rejects a mismatch.
+PREVIEW_FPS = 30
 
 
 def set_clip_source_bounds(clip: EDLClip, start: float, end: float,
@@ -373,12 +400,31 @@ def _zoom_crop_to_filtergraph(clip: EDLClip, input_idx: int, width: int,
     return statement, out_pad[1:-1]
 
 
+def _ass_to_rgb(color: str) -> str:
+    """Convert an ASS-style &H00BBGGRR color into ffmpeg 0xRRGGBB."""
+    c = str(color or "&H00FFFFFF").strip().lstrip("&H").rstrip("&")
+    if len(c) == 6:
+        # BBGGRR -> RRGGBB
+        return f"0x{c[4:6]}{c[2:4]}{c[0:2]}"
+    if len(c) == 8:
+        # AABBGGRR -> RRGGBB
+        return f"0x{c[6:8]}{c[4:6]}{c[2:4]}"
+    return "0xFFFFFF"
+
+
+def _drawtext_x_expr(align: str, anchor_x: float) -> str:
+    if align == "left":
+        return f"w*{anchor_x:.4f}"
+    if align == "right":
+        return f"w*{anchor_x:.4f}-text_w"
+    return f"w*{anchor_x:.4f}-text_w/2"
+
+
 def build_preview_filtergraph(edl: EDL) -> tuple[str, int]:
     """Return an ffmpeg -filter_complex string for the EDL preview.
 
-    Supports multi-clip concatenation and B-roll picture-in-picture overlays.
-    Returns (filter_complex, total_input_count) so the caller can append all
-    media inputs in the right order.
+    Supports multi-clip concatenation, B-roll picture-in-picture overlays and
+    a sample caption with editable position, color and font.
     """
     if not edl.clips:
         raise ValueError("EDL'de klip yok")
@@ -394,17 +440,18 @@ def build_preview_filtergraph(edl: EDL) -> tuple[str, int]:
             clip, input_idx, edl.width, edl.height,
         )
         clip_statements.append(zoom_stmt)
-        vertical = build_vertical_filtergraph(edl.render_mode, edl.width, edl.height)
         framed_label = f"framed_{input_idx}"
-        clip_statements.append(
-            f"[{pre_label}]{vertical}[{framed_label}]"
-        )
+        clip_statements.append(build_vertical_filtergraph(
+            edl.render_mode, edl.width, edl.height,
+            in_label=pre_label,
+            out_label=framed_label,
+            label_suffix=f"_{input_idx}",
+        ))
 
         base_label = framed_label
         for b in clip.b_roll:
             if not b.is_valid():
                 raise ValueError(f"gecersiz B-roll: {b}")
-            # Overlay the B-roll at 70% opacity, centered, scaled to 30% width.
             ol_label = f"ol_{broll_input_idx}"
             stmt = (
                 f"[{broll_input_idx}:v]scale=iw*0.3:-2:flags=lanczos,"
@@ -412,15 +459,22 @@ def build_preview_filtergraph(edl: EDL) -> tuple[str, int]:
             )
             clip_statements.append(stmt)
             tmp_label = f"tmp_{input_idx}_{broll_input_idx}"
-            stmt = (
-                f"[{base_label}][{ol_label}]overlay="
-                f"(main_w-overlay_w)/2:(main_h-overlay_h)/2[{tmp_label}]"
-            )
+            ox = f"main_w*{b.position_x:.4f}-overlay_w/2"
+            oy = f"main_h*{b.position_y:.4f}-overlay_h/2"
+            stmt = f"[{base_label}][{ol_label}]overlay={ox}:{oy}[{tmp_label}]"
             clip_statements.append(stmt)
             base_label = tmp_label
             broll_input_idx += 1
 
-        framed_labels.append(base_label)
+        # concat refuses links whose size, SAR, pixel format or frame rate
+        # differ, and per-clip crop/zoom factors DO produce different SARs.
+        # Normalising here is what makes a multi-clip EDL renderable at all.
+        norm_label = f"norm_{input_idx}"
+        clip_statements.append(
+            f"[{base_label}]scale={edl.width}:{edl.height},setsar=1,"
+            f"fps={PREVIEW_FPS},format=yuv420p[{norm_label}]"
+        )
+        framed_labels.append(norm_label)
         input_idx += 1
 
     # Concatenate all finished clip streams.
@@ -428,7 +482,31 @@ def build_preview_filtergraph(edl: EDL) -> tuple[str, int]:
     concat_n = len(framed_labels)
     concat_stmt = f"{concat_inputs}concat=n={concat_n}:v=1:a=0[concatv]"
     clip_statements.append(concat_stmt)
-    clip_statements.append("[concatv]format=yuv420p[vout]")
+
+    caption = edl.clips[0].caption_style if edl.clips else None
+    if caption and caption.sample_text:
+        text = str(caption.sample_text).replace("'", r"\\'")
+        fc = _ass_to_rgb(caption.word_color)
+        oc = _ass_to_rgb(caption.outline_color)
+        bc = _ass_to_rgb(caption.box_color)
+        x_expr = _drawtext_x_expr(caption.alignment, caption.position_x)
+        y_expr = f"h*{caption.position_y:.4f}-text_h/2"
+        font = caption.font or "DejaVu Sans"
+        has_box = bool(caption.box_color and caption.box_color not in ("", "&H00000000"))
+        box_arg = "1" if has_box else "0"
+        parts = [
+            f"[concatv]format=yuv420p[vtmp]",
+            f"[vtmp]drawtext=text='{text}':x={x_expr}:y={y_expr}:font={font}:"
+            f"fontsize={caption.font_size}:fontcolor={fc}:box={box_arg}:boxcolor={bc}",
+        ]
+        if caption.border_width > 0:
+            parts[-1] += f":borderw={caption.border_width}:bordercolor={oc}"
+        if caption.shadow:
+            parts[-1] += ":shadowx=2:shadowy=2:shadowcolor=0x000000"
+        parts[-1] += "[vout]"
+        clip_statements.extend(parts)
+    else:
+        clip_statements.append("[concatv]format=yuv420p[vout]")
 
     return ";".join(clip_statements), broll_input_idx
 
